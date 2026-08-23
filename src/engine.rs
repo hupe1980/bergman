@@ -181,6 +181,23 @@ impl Bergman {
     /// `run` then executes it. That is what makes `bergman plan` a true preview
     /// rather than a separate code path that might disagree.
     pub async fn plan(&self) -> Result<MaintenancePlan> {
+        self.plan_where(|_| true).await
+    }
+
+    /// Plan only the tables named.
+    ///
+    /// What an event-driven cycle wants: reacting to one table's commit should
+    /// not rescan a catalog of thousands. Tables that are not in the catalog,
+    /// or that no rule matches, are simply absent from the plan.
+    pub async fn plan_tables(&self, tables: &[TableRef]) -> Result<MaintenancePlan> {
+        let wanted: std::collections::HashSet<&TableRef> = tables.iter().collect();
+        self.plan_where(|table| wanted.contains(table)).await
+    }
+
+    async fn plan_where(
+        &self,
+        keep: impl Fn(&TableRef) -> bool + Copy + Send + Sync,
+    ) -> Result<MaintenancePlan> {
         let now = Utc::now();
         let mut tables = Vec::new();
         let mut uneventful = Vec::new();
@@ -199,6 +216,10 @@ impl Bergman {
             // read, and asking twice would double the cost of every healthy
             // table, which is most of them.
             let outcomes: Vec<(TableRef, Outcome)> = stream::iter(discovered)
+                .filter(|d| {
+                    let wanted = keep(&d.table);
+                    async move { wanted }
+                })
                 .map(|d| async move {
                     let outcome = self.examine_for_plan(catalog, &d.table, now).await;
                     (d.table, outcome)
@@ -364,7 +385,9 @@ impl Bergman {
                 let result = OperationResult::Refused {
                     reason: "vetoed by observer".into(),
                 };
-                self.observer.operation_finished(ctx, &result).await;
+                self.observer
+                    .operation_finished(ctx, &result, started.elapsed())
+                    .await;
                 outcomes.push(OperationOutcome {
                     kind: operation.kind,
                     reason: operation.reason.clone(),
@@ -387,7 +410,9 @@ impl Bergman {
                     },
                 });
 
-            self.observer.operation_finished(ctx, &result).await;
+            self.observer
+                .operation_finished(ctx, &result, started.elapsed())
+                .await;
 
             outcomes.push(OperationOutcome {
                 kind: operation.kind,

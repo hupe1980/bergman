@@ -69,8 +69,14 @@ pub trait MaintenanceObserver: Send + Sync + std::fmt::Debug {
         true
     }
 
-    /// An operation finished.
-    async fn operation_finished(&self, _ctx: OperationContext<'_>, _result: &OperationResult) {}
+    /// An operation finished, and how long it took.
+    async fn operation_finished(
+        &self,
+        _ctx: OperationContext<'_>,
+        _result: &OperationResult,
+        _elapsed: std::time::Duration,
+    ) {
+    }
 
     /// Files are about to be deleted.
     ///
@@ -133,9 +139,14 @@ impl MaintenanceObserver for Observers {
         permitted
     }
 
-    async fn operation_finished(&self, ctx: OperationContext<'_>, result: &OperationResult) {
+    async fn operation_finished(
+        &self,
+        ctx: OperationContext<'_>,
+        result: &OperationResult,
+        elapsed: std::time::Duration,
+    ) {
         for o in &self.0 {
-            o.operation_finished(ctx, result).await;
+            o.operation_finished(ctx, result, elapsed).await;
         }
     }
 

@@ -95,10 +95,24 @@ enum Command {
         #[arg(long)]
         max_cycles: Option<u64>,
 
-        /// Serve `/metrics` and `/health` on this address.
+        /// Serve `/metrics`, `/health` and `/events` on this address.
         #[cfg(feature = "metrics")]
-        #[arg(long, env = "BERGMAN_METRICS_ADDR")]
-        metrics_addr: Option<std::net::SocketAddr>,
+        #[arg(long, env = "BERGMAN_LISTEN_ADDR", visible_alias = "metrics-addr")]
+        listen: Option<std::net::SocketAddr>,
+
+        /// React to `POST /events` as well as to the clock.
+        ///
+        /// Bergman carries no NATS or Kafka client: a maintenance engine that
+        /// dragged in a message broker would import the operational footprint
+        /// it exists to avoid. Bridge from whatever bus you already run.
+        #[cfg(feature = "metrics")]
+        #[arg(long, requires = "listen")]
+        events: bool,
+
+        /// How long to keep collecting notifications before acting on them.
+        #[cfg(feature = "metrics")]
+        #[arg(long, default_value = "30s", value_parser = parse_duration)]
+        debounce: std::time::Duration,
     },
 
     /// Policy inspection.
@@ -193,7 +207,11 @@ pub async fn main() -> Result<()> {
             interval,
             max_cycles,
             #[cfg(feature = "metrics")]
-            metrics_addr,
+            listen,
+            #[cfg(feature = "metrics")]
+            events,
+            #[cfg(feature = "metrics")]
+            debounce,
         } => {
             let daemon = crate::sched::Daemon::new(
                 Arc::new(bergman),
@@ -203,14 +221,26 @@ pub async fn main() -> Result<()> {
                 },
             )?;
 
-            // Served on the same runtime as the cycles, and stopped by the same
-            // signal. A metrics endpoint that outlived the work it describes
-            // would keep a pod "ready" after it stopped maintaining anything.
             #[cfg(feature = "metrics")]
-            let metrics_server = metrics_addr.map(|addr| {
+            let (sender, stream) = if events {
+                let (sender, stream) = crate::sched::channel(debounce);
+                (Some(sender), Some(stream))
+            } else {
+                (None, None)
+            };
+            #[cfg(not(feature = "metrics"))]
+            let stream = None;
+
+            // Served on the same runtime as the cycles, and stopped by the same
+            // signal. An endpoint that outlived the work it describes would keep
+            // a pod "ready" after it stopped maintaining anything.
+            #[cfg(feature = "metrics")]
+            let server = listen.map(|addr| {
                 let metrics = Arc::clone(&metrics);
                 tokio::spawn(async move {
-                    if let Err(e) = crate::obs::serve(addr, metrics, shutdown_signal()).await {
+                    if let Err(e) =
+                        crate::obs::serve(addr, metrics, sender, shutdown_signal()).await
+                    {
                         eprintln!("bergman: {e}");
                     }
                 })
@@ -218,7 +248,7 @@ pub async fn main() -> Result<()> {
 
             let format = cli.format;
             let completed = daemon
-                .run(
+                .run_with_events(
                     |cycle| match cycle.outcome {
                         Ok(report) => {
                             // Rendered as it happens rather than accumulated:
@@ -245,12 +275,13 @@ pub async fn main() -> Result<()> {
                             );
                         }
                     },
+                    stream,
                     shutdown_signal(),
                 )
                 .await?;
 
             #[cfg(feature = "metrics")]
-            if let Some(server) = metrics_server {
+            if let Some(server) = server {
                 server.abort();
             }
 

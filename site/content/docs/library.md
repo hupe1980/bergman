@@ -190,6 +190,34 @@ daemon
 over a ready timer, so a stop is noticed promptly rather than after several
 cycles.
 
+### Reacting to changes
+
+Bergman owns the trigger and the debounce; the transport stays yours. Whatever
+already receives events in your deployment — a NATS subscriber, a Kafka
+consumer, a webhook — calls `notify`:
+
+```rust
+use bergman::sched::channel;
+
+let (events, stream) = channel(Duration::from_secs(30));
+
+tokio::spawn(async move {
+    while let Some(msg) = subscription.next().await {
+        events.notify(table_from(msg));   // never blocks, never fails
+    }
+});
+
+daemon.run_with_events(on_cycle, Some(stream), shutdown_signal()).await?;
+```
+
+`notify` returns whether the notification was queued. A full queue drops rather
+than blocking: a maintenance engine must never be able to stall the thing
+notifying it, and the *n*-th notification for one table says nothing the first
+did not.
+
+`Bergman::plan_tables` is the same thing without a daemon — plan a named subset
+and run it.
+
 ## Errors
 
 One error type, and the most useful thing on it is what to *do*:

@@ -38,6 +38,7 @@ async fn a_record_names_the_rule_and_the_reason_that_produced_it() {
             &OperationResult::Succeeded {
                 detail: "58 snapshots expired".into(),
             },
+            std::time::Duration::from_secs(47),
         )
         .await;
 
@@ -52,6 +53,7 @@ async fn a_record_names_the_rule_and_the_reason_that_produced_it() {
     // an audit record unable to answer "why did this happen to my table?".
     assert_eq!(record.matched_rule, "prod.analytics.*");
     assert_eq!(record.reason, "oldest snapshot is 34d old (> 7d)");
+    assert_eq!(record.took, std::time::Duration::from_secs(47));
 }
 
 #[tokio::test]
@@ -127,6 +129,7 @@ async fn every_outcome_is_recorded_not_only_the_successes() {
                     reason: "small files",
                 },
                 outcome,
+                std::time::Duration::from_secs(1),
             )
             .await;
     }

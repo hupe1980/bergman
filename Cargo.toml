@@ -151,6 +151,7 @@ prometheus-client = { version = "0.24", optional = true }
 axum = { version = "0.8", default-features = false, features = [
     "http1",
     "tokio",
+    "json",
 ], optional = true }
 
 # CLI (optional)

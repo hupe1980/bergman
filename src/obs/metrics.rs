@@ -125,10 +125,17 @@ fn outcome_label(result: &OperationResult) -> &'static str {
 
 #[async_trait::async_trait]
 impl MaintenanceObserver for Metrics {
-    async fn operation_finished(&self, ctx: OperationContext<'_>, result: &OperationResult) {
-        self.operations
-            .get_or_create(&Self::labels(ctx, outcome_label(result)))
-            .inc();
+    async fn operation_finished(
+        &self,
+        ctx: OperationContext<'_>,
+        result: &OperationResult,
+        elapsed: std::time::Duration,
+    ) {
+        let labels = Self::labels(ctx, outcome_label(result));
+        self.operations.get_or_create(&labels).inc();
+        self.duration
+            .get_or_create(&labels)
+            .observe(elapsed.as_secs_f64());
     }
 
     async fn deleting_files(&self, ctx: OperationContext<'_>, paths: &[String]) {
@@ -141,26 +148,11 @@ impl MaintenanceObserver for Metrics {
     }
 }
 
-impl Metrics {
-    /// Record how long an operation took.
-    ///
-    /// Separate from the observer because a duration is the engine's to
-    /// measure — the observer is told what happened, not how long it ran.
-    pub fn record_duration(
-        &self,
-        ctx: OperationContext<'_>,
-        result: &OperationResult,
-        elapsed: std::time::Duration,
-    ) {
-        self.duration
-            .get_or_create(&Self::labels(ctx, outcome_label(result)))
-            .observe(elapsed.as_secs_f64());
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
     use crate::plan::OperationKind;
     use crate::policy::TableRef;
 
@@ -192,13 +184,21 @@ mod tests {
                 detail: "moved".into(),
             },
         ] {
-            metrics.operation_finished(ctx(&table), &result).await;
+            metrics
+                .operation_finished(ctx(&table), &result, Duration::from_secs(2))
+                .await;
         }
 
         let encoded = metrics.encode();
         assert!(encoded.contains(r#"outcome="succeeded""#), "{encoded}");
         assert!(encoded.contains(r#"outcome="failed""#), "{encoded}");
         assert!(encoded.contains(r#"outcome="conflicted""#), "{encoded}");
+        // Durations land in the histogram now rather than in a method nobody
+        // called.
+        assert!(
+            encoded.contains("bergman_operation_duration_seconds"),
+            "{encoded}"
+        );
     }
 
     #[tokio::test]
@@ -225,6 +225,7 @@ mod tests {
                 &OperationResult::Succeeded {
                     detail: "ok".into(),
                 },
+                Duration::from_secs(1),
             )
             .await;
 

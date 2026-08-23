@@ -10,8 +10,10 @@
 //! same thing a killed `run` leaves: files nothing references, which the orphan
 //! scanner reclaims. Restarting replans from the tables' current snapshots.
 
+mod event_stream;
 mod trigger;
 
+pub use event_stream::{EventStream, Events, channel};
 pub use trigger::{Trigger, TriggerSet};
 
 use std::sync::Arc;
@@ -84,7 +86,26 @@ impl Daemon {
     /// `on_cycle` is called after each one. Returning the report rather than
     /// logging it keeps this loop free of any opinion about output — the binary
     /// renders, an embedder does whatever it likes.
-    pub async fn run<F>(&self, mut on_cycle: F, shutdown: impl Future<Output = ()>) -> Result<u64>
+    pub async fn run<F>(&self, on_cycle: F, shutdown: impl Future<Output = ()>) -> Result<u64>
+    where
+        F: FnMut(Cycle),
+    {
+        self.run_with_events(on_cycle, None, shutdown).await
+    }
+
+    /// The same, reacting to changed tables as well as to the clock.
+    ///
+    /// An event-driven cycle plans only the tables it was told about, so
+    /// reacting to one commit does not rescan a catalog of thousands. Timers
+    /// still fire — events are an addition to the cadence, not a replacement,
+    /// because a notification can always be lost and a table that stops being
+    /// written still needs its snapshots expired.
+    pub async fn run_with_events<F>(
+        &self,
+        mut on_cycle: F,
+        mut events: Option<EventStream>,
+        shutdown: impl Future<Output = ()>,
+    ) -> Result<u64>
     where
         F: FnMut(Cycle),
     {
@@ -112,17 +133,36 @@ impl Daemon {
                 None => delay,
             };
 
-            tokio::select! {
+            // What woke us decides what the cycle covers: a timer plans the
+            // whole catalog, an event plans only what changed.
+            let scope = tokio::select! {
                 // Biased so that a shutdown that arrives while a timer is also
                 // ready wins. Otherwise a daemon on a short interval could take
                 // several cycles to notice it was asked to stop.
                 biased;
                 () = &mut shutdown => return Ok(completed),
-                () = tokio::time::sleep(delay) => {}
-            }
+                batch = next_batch(&mut events) => match batch {
+                    Some(tables) => Scope::Tables(tables),
+                    // Every sender is gone. The daemon keeps its cadence rather
+                    // than exiting: losing the event source is a reason to fall
+                    // back to polling, not to stop maintaining anything.
+                    None => {
+                        events = None;
+                        continue;
+                    }
+                },
+                () = tokio::time::sleep(delay) => Scope::Everything,
+            };
+
+            let trigger = match &scope {
+                Scope::Everything => trigger,
+                Scope::Tables(tables) => Trigger::Event {
+                    tables: tables.len(),
+                },
+            };
 
             completed += 1;
-            let outcome = self.cycle().await;
+            let outcome = self.cycle(&scope).await;
             on_cycle(Cycle {
                 number: completed,
                 trigger,
@@ -131,10 +171,32 @@ impl Daemon {
         }
     }
 
-    /// Plan and run once.
-    async fn cycle(&self) -> Result<RunReport> {
-        let plan = self.bergman.plan().await?;
+    /// Plan and run once, over whatever the trigger scoped it to.
+    async fn cycle(&self, scope: &Scope) -> Result<RunReport> {
+        let plan = match scope {
+            Scope::Everything => self.bergman.plan().await?,
+            Scope::Tables(tables) => self.bergman.plan_tables(tables).await?,
+        };
         self.bergman.run(&plan).await
+    }
+}
+
+/// What a cycle covers.
+enum Scope {
+    /// Every table the catalogs hold.
+    Everything,
+    /// Only these.
+    Tables(Vec<crate::policy::TableRef>),
+}
+
+/// Await the next batch, or never, when there is no event source.
+///
+/// `select!` needs a branch that can be polled either way; a `pending()` future
+/// is how the arm exists without firing.
+async fn next_batch(events: &mut Option<EventStream>) -> Option<Vec<crate::policy::TableRef>> {
+    match events {
+        Some(stream) => stream.next_batch().await,
+        None => std::future::pending().await,
     }
 }
 

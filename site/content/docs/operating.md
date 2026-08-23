@@ -92,6 +92,44 @@ containers:
       httpGet: { path: /health, port: metrics }
 ```
 
+### Reacting to commits
+
+A cron cadence is a guess: too slow and a streaming table stays fragmented for an
+hour, too fast and a quiet catalog is rescanned for nothing. The daemon can be
+told what changed instead:
+
+```bash
+bergman daemon --listen 0.0.0.0:9090 --events --debounce 30s
+```
+
+```bash
+curl -XPOST localhost:9090/events -H 'content-type: application/json' \
+  -d '{"catalog":"prod","namespace":["analytics"],"table":"events"}'
+```
+
+An event-driven cycle plans **only the tables it was told about**, so reacting to
+one commit does not rescan a catalog of thousands. Notifications within the
+debounce window collapse into one cycle — a writer committing every two seconds
+produces one cycle, not thirty.
+
+Timers still fire. Events are an addition to the cadence, not a replacement: a
+notification can always be lost, and a table that *stops* being written still
+needs its snapshots expired.
+
+> [!NOTE]
+> Bergman carries no NATS or Kafka client on purpose. Lakekeeper emits
+> `CloudEvents` to a broker, and dragging one into a maintenance engine would
+> import exactly the operational footprint the project exists to avoid — and
+> would put it in the default build, which almost nobody would use. Bridge from
+> whatever bus you already run; the endpoint needs four lines of anything.
+
+The endpoint accepts anything carrying a catalog, namespace and table, and
+ignores the rest of a `CloudEvents` envelope — validating fields Bergman has no
+use for would reject perfectly good notifications for reasons that do not matter
+to it.
+
+### Windows
+
 With a `maintenance_window` set, the daemon sleeps to the window's edge rather
 than waking every interval to find it shut — a daemon that logged "outside the
 window" sixty times a night is a daemon whose logs nobody reads.

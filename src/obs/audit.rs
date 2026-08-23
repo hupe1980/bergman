@@ -41,6 +41,9 @@ pub struct AuditRecord {
     pub reason: String,
     /// What happened.
     pub result: OperationResult,
+    /// How long the operation took.
+    #[serde(with = "humantime_serde", default)]
+    pub took: std::time::Duration,
     /// Files deleted, when this record describes a deletion.
     ///
     /// Written *before* the deletion runs. A crash halfway through then leaves
@@ -137,6 +140,7 @@ impl AuditRecord {
             matched_rule: ctx.matched_rule.to_string(),
             reason: ctx.reason.to_string(),
             result,
+            took: std::time::Duration::ZERO,
             deleted_files: Vec::new(),
         }
     }
@@ -144,8 +148,14 @@ impl AuditRecord {
 
 #[async_trait::async_trait]
 impl<S: AuditSink> super::MaintenanceObserver for AuditObserver<S> {
-    async fn operation_finished(&self, ctx: OperationContext<'_>, result: &OperationResult) {
-        let record = AuditRecord::from_context(ctx, result.clone());
+    async fn operation_finished(
+        &self,
+        ctx: OperationContext<'_>,
+        result: &OperationResult,
+        elapsed: std::time::Duration,
+    ) {
+        let mut record = AuditRecord::from_context(ctx, result.clone());
+        record.took = elapsed;
         if let Err(e) = self.sink.write(&record) {
             // An observer cannot fail an operation — it is a hook, not a gate.
             // Losing an audit record is still worth a loud event.
@@ -188,6 +198,7 @@ mod tests {
             result: OperationResult::Succeeded {
                 detail: "8 snapshots".into(),
             },
+            took: std::time::Duration::from_secs(3),
             deleted_files: vec![],
         })
         .unwrap();
@@ -219,6 +230,7 @@ mod tests {
                 result: OperationResult::NoOp {
                     detail: "nothing".into(),
                 },
+                took: std::time::Duration::ZERO,
                 deleted_files: vec![],
             })
             .unwrap();

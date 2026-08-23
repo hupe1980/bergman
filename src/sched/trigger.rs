@@ -26,6 +26,11 @@ pub enum Trigger {
         /// The rule pattern whose schedule fired.
         pattern: String,
     },
+    /// Tables were reported as changed.
+    Event {
+        /// How many, after the debounce window collapsed a burst.
+        tables: usize,
+    },
 }
 
 impl std::fmt::Display for Trigger {
@@ -33,6 +38,7 @@ impl std::fmt::Display for Trigger {
         match self {
             Trigger::Interval => f.write_str("interval"),
             Trigger::Schedule { pattern } => write!(f, "schedule for \"{pattern}\""),
+            Trigger::Event { tables } => write!(f, "{tables} changed tables"),
         }
     }
 }

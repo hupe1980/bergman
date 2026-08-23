@@ -81,5 +81,8 @@ there:
   current spec, which would mis-file rows.
 - **Non-Parquet writes.** Bergman reads Parquet, Avro and ORC but writes only
   Parquet, and refuses a table whose `write.format.default` is something else.
-- **Event triggers.** The daemon follows the schedules rules declare; it does
-  not yet react to catalog commit events.
+- **A NATS or Kafka client.** Lakekeeper emits `CloudEvents` to a broker;
+  Bergman accepts notifications over HTTP and leaves the bridge to you, because
+  a maintenance engine that dragged in a message broker would import the
+  operational footprint it exists to avoid. See
+  [Operating](@/docs/operating.md#reacting-to-commits).
