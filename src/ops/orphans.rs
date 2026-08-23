@@ -19,14 +19,12 @@
 //!    list. A commit lands between a scan and a delete far more often than
 //!    intuition suggests.
 
-use std::sync::Arc;
-
 use chrono::{DateTime, Utc};
-use iceberg::Catalog;
 use iceberg::table::Table;
 
 use crate::error::{Error, Result};
 use crate::obs::{MaintenanceObserver, OperationContext};
+use crate::ops::TableLoader;
 use crate::ops::reachability::{self, ReachableSet};
 use crate::ops::store::ObjectStore;
 use crate::plan::OperationResult;
@@ -57,7 +55,7 @@ pub struct OrphanOutcome {
 /// Scan for orphans, and delete them when policy allows.
 pub async fn run(
     table: &Table,
-    catalog: &Arc<dyn Catalog>,
+    loader: &dyn TableLoader,
     store: &dyn ObjectStore,
     settings: &EffectiveOrphans,
     observer: &dyn MaintenanceObserver,
@@ -167,8 +165,8 @@ pub async fn run(
 
     // Check 5. Listing a large table takes long enough for a writer to commit,
     // and any file that commit referenced is now live.
-    let fresh = catalog
-        .load_table(&crate::catalog::to_table_ident(table_ref)?)
+    let fresh = loader
+        .reload(&crate::catalog::to_table_ident(table_ref)?)
         .await?;
     let reachable_now = reachability::compute(table_ref, &fresh).await?;
 

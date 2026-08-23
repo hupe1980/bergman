@@ -102,6 +102,15 @@ impl TestTable {
         format!("file://{}", self.dir.path().display())
     }
 
+    /// A loader over this fixture's metadata.
+    pub fn loader(&self) -> FixtureLoader {
+        FixtureLoader {
+            committer: Arc::clone(&self.committer),
+            file_io: self.file_io.clone(),
+            location: self.location(),
+        }
+    }
+
     /// Write one Parquet data file holding these rows.
     pub async fn write_data_file(&self, rows: &[(i32, &str)]) -> Result<DataFile> {
         let table = self.table();
@@ -192,6 +201,31 @@ impl TestTable {
         self.committer
             .commit(&self.ident, requirements, updates)
             .await
+    }
+}
+
+/// Serves the fixture's current metadata as a table.
+///
+/// Orphan removal reloads the table between listing and deleting, and this is
+/// the whole of what it needs — one method rather than a catalog.
+#[derive(Debug)]
+pub struct FixtureLoader {
+    committer: Arc<InMemoryCommitter>,
+    file_io: FileIO,
+    location: String,
+}
+
+#[async_trait::async_trait]
+impl bergman::ops::TableLoader for FixtureLoader {
+    async fn reload(&self, ident: &TableIdent) -> Result<Table> {
+        Table::builder()
+            .identifier(ident.clone())
+            .metadata(self.committer.metadata())
+            .file_io(self.file_io.clone())
+            .runtime(iceberg::Runtime::try_current().expect("inside a tokio runtime"))
+            .metadata_location(format!("{}/metadata/v1.metadata.json", self.location))
+            .build()
+            .map_err(Into::into)
     }
 }
 

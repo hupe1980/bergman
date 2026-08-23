@@ -40,6 +40,14 @@ struct ConnectedCatalog {
     committer: Arc<dyn TableCommitter>,
 }
 
+/// What one table's examination concluded.
+enum Outcome {
+    /// There is work to do.
+    Work(Box<TablePlan>),
+    /// There is not, and this is why.
+    Nothing(UneventfulReason),
+}
+
 /// Builder for [`Bergman`].
 #[derive(Debug)]
 pub struct BergmanBuilder {
@@ -128,19 +136,42 @@ impl Bergman {
     /// wrong with my tables" without changing one.
     pub async fn inspect(&self) -> Result<Vec<TableHealth>> {
         let mut out = Vec::new();
+        let limit = self.policy.limits().max_parallel_tables.max(1);
+
         for catalog in &self.catalogs {
-            for discovered in crate::catalog::discover(&catalog.config, &catalog.client).await? {
-                match self.examine(catalog, &discovered.table).await {
-                    Ok((health, _)) => out.push(health),
+            let discovered = crate::catalog::discover(&catalog.config, &catalog.client).await?;
+
+            // Same bounded concurrency `plan` uses: this is the same burst of
+            // small metadata reads, and doing them one table at a time would
+            // make inspecting a large catalog take minutes for no reason.
+            let examined: Vec<(TableRef, Result<TableHealth>)> = stream::iter(discovered)
+                .map(|d| async move {
+                    let health = self
+                        .examine(catalog, &d.table)
+                        .await
+                        .map(|(health, _)| health);
+                    (d.table, health)
+                })
+                .buffer_unordered(limit)
+                .collect()
+                .await;
+
+            for (table, health) in examined {
+                match health {
+                    Ok(health) => out.push(health),
+                    // One unreadable table does not stop the sweep. A tool that
+                    // aborted on the first permission error would never finish
+                    // in a real deployment.
                     Err(e) => {
-                        // One unreadable table does not stop the sweep. A tool
-                        // that aborted on the first permission error would
-                        // never finish in a real deployment.
-                        tracing::warn!(table = %discovered.table, error = %e, "table could not be examined");
+                        tracing::warn!(%table, error = %e, "table could not be examined")
                     }
                 }
             }
         }
+
+        // Completion order is whatever the concurrency produced; sorting makes
+        // `bergman inspect` stable between runs.
+        out.sort_by(|a, b| a.table.cmp(&b.table));
         Ok(out)
     }
 
@@ -161,47 +192,32 @@ impl Bergman {
             // small metadata reads, and doing them one table at a time would
             // make a large catalog take minutes for no reason.
             let limit = self.policy.limits().max_parallel_tables.max(1);
-            let results: Vec<(TableRef, Result<Option<TablePlan>>)> = stream::iter(discovered)
+
+            // One pass. Each table is discovered once and examined at most
+            // once, and the same examination answers both "is there work?" and
+            // "if not, why not?" — the two questions are the same metadata
+            // read, and asking twice would double the cost of every healthy
+            // table, which is most of them.
+            let outcomes: Vec<(TableRef, Outcome)> = stream::iter(discovered)
                 .map(|d| async move {
-                    let outcome = self.plan_one(catalog, &d.table, now).await;
+                    let outcome = self.examine_for_plan(catalog, &d.table, now).await;
                     (d.table, outcome)
                 })
                 .buffer_unordered(limit)
                 .collect()
                 .await;
 
-            for (table, result) in results {
-                match result {
-                    Ok(Some(plan)) => tables.push(plan),
-                    Ok(None) => {} // Already recorded by `plan_one`.
-                    Err(e) => uneventful.push(Uneventful {
-                        table,
-                        reason: UneventfulReason::Failed {
-                            error: e.to_string(),
-                        },
-                    }),
+            for (table, outcome) in outcomes {
+                match outcome {
+                    Outcome::Work(plan) => tables.push(*plan),
+                    Outcome::Nothing(reason) => uneventful.push(Uneventful { table, reason }),
                 }
             }
         }
 
-        // Re-derive the uneventful entries deterministically rather than
-        // pushing them from inside the concurrent stream, so plan output is
-        // stable between runs and two plans can be diffed meaningfully.
-        for catalog in &self.catalogs {
-            for discovered in crate::catalog::discover(&catalog.config, &catalog.client).await? {
-                if tables.iter().any(|t| t.table == discovered.table)
-                    || uneventful.iter().any(|u| u.table == discovered.table)
-                {
-                    continue;
-                }
-                let reason = self.uneventful_reason(catalog, &discovered.table).await;
-                uneventful.push(Uneventful {
-                    table: discovered.table,
-                    reason,
-                });
-            }
-        }
-
+        // Sorted rather than left in completion order, so two plans of an
+        // unchanged catalog are identical and a diff between them reads as a
+        // change in the world.
         tables.sort_by(|a, b| a.table.cmp(&b.table));
         uneventful.sort_by(|a, b| a.table.cmp(&b.table));
 
@@ -456,25 +472,50 @@ impl Bergman {
         )?))
     }
 
-    async fn plan_one(
+    /// Decide what happens to one table, in one examination.
+    async fn examine_for_plan(
         &self,
         catalog: &ConnectedCatalog,
         table: &TableRef,
         now: chrono::DateTime<Utc>,
-    ) -> Result<Option<TablePlan>> {
-        let Decision::Maintain(_) = self.policy.decide(table, &HashMap::new()) else {
-            // Unmatched or skipped: no need to load the table at all, which is
-            // what keeps a policy scoped to one namespace cheap against a
-            // catalog holding thousands of tables.
-            return Ok(None);
+    ) -> Outcome {
+        // A first pass with no table properties: a table no rule matches needs
+        // no metadata read at all, which is what keeps a policy scoped to one
+        // namespace cheap against a catalog holding thousands of tables.
+        match self.policy.decide(table, &HashMap::new()) {
+            Decision::Unmatched => return Outcome::Nothing(UneventfulReason::Unmatched),
+            Decision::Skip { pattern } => {
+                return Outcome::Nothing(UneventfulReason::Skipped { pattern });
+            }
+            Decision::Maintain(_) => {}
+        }
+
+        let (health, decision) = match self.examine(catalog, table).await {
+            Ok(examined) => examined,
+            // One unreadable table does not stop the sweep, and the reason
+            // reaches the plan rather than only a log line.
+            Err(e) => {
+                return Outcome::Nothing(UneventfulReason::Failed {
+                    error: e.to_string(),
+                });
+            }
         };
 
-        let (health, effective) = self.examine(catalog, table).await?;
-        let Decision::Maintain(policy) = effective else {
-            return Ok(None);
+        if health.is_empty() {
+            return Outcome::Nothing(UneventfulReason::Empty);
+        }
+
+        // Re-decided with the table's own properties, which is the layer that
+        // can change a threshold — the first pass only established that some
+        // rule matches.
+        let Decision::Maintain(policy) = decision else {
+            return Outcome::Nothing(UneventfulReason::Healthy);
         };
 
-        Ok(plan_table(&health, &policy, now))
+        match plan_table(&health, &policy, now) {
+            Some(plan) => Outcome::Work(Box::new(plan)),
+            None => Outcome::Nothing(UneventfulReason::Healthy),
+        }
     }
 
     async fn examine(
@@ -496,26 +537,6 @@ impl Bergman {
 
         let health = crate::health::analyze(table_ref, &table, target, Utc::now()).await?;
         Ok((health, decision))
-    }
-
-    async fn uneventful_reason(
-        &self,
-        catalog: &ConnectedCatalog,
-        table: &TableRef,
-    ) -> UneventfulReason {
-        match self.policy.decide(table, &HashMap::new()) {
-            Decision::Unmatched => return UneventfulReason::Unmatched,
-            Decision::Skip { pattern } => return UneventfulReason::Skipped { pattern },
-            Decision::Maintain(_) => {}
-        }
-
-        match self.examine(catalog, table).await {
-            Ok((health, _)) if health.is_empty() => UneventfulReason::Empty,
-            Ok(_) => UneventfulReason::Healthy,
-            Err(e) => UneventfulReason::Failed {
-                error: e.to_string(),
-            },
-        }
     }
 
     async fn load(

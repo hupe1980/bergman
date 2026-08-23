@@ -13,7 +13,32 @@ pub mod orphans;
 pub mod reachability;
 pub mod store;
 
+use std::sync::Arc;
 use std::time::Duration;
+
+use async_trait::async_trait;
+use iceberg::TableIdent;
+use iceberg::table::Table;
+
+/// Loads a table's current state.
+///
+/// Narrower than [`iceberg::Catalog`] on purpose. Orphan removal needs exactly
+/// one thing from a catalog — the table as it is *now*, for the re-verification
+/// that runs between listing and deleting — and depending on the whole
+/// sixteen-method trait for that would make the most dangerous operation in the
+/// crate the hardest one to test.
+#[async_trait]
+pub trait TableLoader: Send + Sync + std::fmt::Debug {
+    /// Load the table as it currently stands.
+    async fn reload(&self, ident: &TableIdent) -> crate::error::Result<Table>;
+}
+
+#[async_trait]
+impl TableLoader for Arc<dyn iceberg::Catalog> {
+    async fn reload(&self, ident: &TableIdent) -> crate::error::Result<Table> {
+        self.load_table(ident).await.map_err(Into::into)
+    }
+}
 
 /// How many times a commit is retried before the operation gives up for this
 /// cycle.
