@@ -38,6 +38,14 @@ pub struct TableOutcome {
     pub matched_rule: String,
     /// What happened to each operation.
     pub operations: Vec<OperationOutcome>,
+    /// Work policy asked for that this table cannot receive, carried through
+    /// from its plan.
+    ///
+    /// A run report is what an operator actually reads, and a table whose
+    /// compaction rule can never apply must not look identical to one that was
+    /// simply healthy this cycle.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 /// What happened to one operation.
@@ -71,11 +79,6 @@ pub enum OperationResult {
     NoOp {
         /// Why there was nothing to do.
         detail: String,
-    },
-    /// It was planned but this build cannot perform it.
-    Blocked {
-        /// Why not.
-        reason: String,
     },
     /// It was declined for safety.
     Refused {
@@ -151,10 +154,17 @@ impl RunReport {
 
 impl fmt::Display for RunReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Tables that were actually acted on. An entry carrying only a note is
+        // an explanation, and counting it as a maintained table would overstate
+        // what the run did.
+        let acted_on = self
+            .tables
+            .iter()
+            .filter(|t| !t.operations.is_empty())
+            .count();
         write!(
             f,
-            "{} tables, {} operations succeeded",
-            self.tables.len(),
+            "{acted_on} tables, {} operations succeeded",
             self.succeeded_count()
         )?;
         if self.conflicted_count() > 0 {
@@ -182,6 +192,7 @@ mod tests {
             tables: vec![TableOutcome {
                 table: TableRef::new("prod", ["db"], "t"),
                 matched_rule: "prod.*".into(),
+                notes: Vec::new(),
                 operations: results
                     .into_iter()
                     .map(|result| OperationOutcome {

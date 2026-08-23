@@ -5,7 +5,7 @@ use comfy_table::{Cell, Table, presets};
 use crate::cli::Format;
 use crate::error::Result;
 use crate::health::TableHealth;
-use crate::plan::{Executability, MaintenancePlan, OperationResult, RunReport};
+use crate::plan::{MaintenancePlan, OperationResult, RunReport};
 use crate::policy::{Decision, TableRef};
 use crate::util::{human_bytes, human_duration};
 
@@ -101,7 +101,11 @@ pub fn plan(plan: &MaintenancePlan, format: Format) -> Result<()> {
         return Ok(());
     }
 
-    if plan.is_empty() {
+    // A plan with no operations and no notes is genuinely quiet. One with notes
+    // is not: those are the tables whose configured maintenance can never run,
+    // and printing "nothing to do" over them is exactly the silence the whole
+    // notes mechanism exists to prevent.
+    if plan.is_empty() && plan.notes().next().is_none() {
         println!("Nothing to do. {} tables examined.", plan.uneventful.len());
         return Ok(());
     }
@@ -114,15 +118,15 @@ pub fn plan(plan: &MaintenancePlan, format: Format) -> Result<()> {
             println!("  warning: {warning}");
         }
 
+        // Work the policy asked for that this table cannot receive. Printed
+        // whether or not anything else is planned, because a table that appears
+        // with no operations and no explanation reads as a healthy one.
+        for note in &table_plan.notes {
+            println!("  note: {note}");
+        }
+
         for op in &table_plan.operations {
-            let marker = match &op.executability {
-                Executability::Executable => "->",
-                // Visually distinct, because the difference between "this will
-                // happen" and "this is needed but will not happen" is the most
-                // important thing on the page.
-                Executability::Blocked { .. } => "!!",
-            };
-            println!("  {marker} {}", op.kind);
+            println!("  -> {}", op.kind);
             println!("     why: {}", op.reason);
 
             if op.estimate.input_files > 0 {
@@ -139,19 +143,16 @@ pub fn plan(plan: &MaintenancePlan, format: Format) -> Result<()> {
                     op.estimate.snapshots_removed
                 );
             }
-            if let Executability::Blocked { reason } = &op.executability {
-                println!("     BLOCKED: {reason}");
-            }
         }
     }
 
-    let blocked: usize = plan.operation_count() - plan.executable_count();
+    // Tables with work, not entries in the list: a table that appears only to
+    // explain why its policy cannot apply is not a table being maintained, and
+    // counting it as one would overstate what the cycle will do.
     println!(
-        "\n{} tables, {} operations ({} will run, {} blocked), {} to read",
-        plan.tables.len(),
+        "\n{} tables, {} operations, {} to read",
+        plan.tables.iter().filter(|t| t.has_work()).count(),
         plan.operation_count(),
-        plan.executable_count(),
-        blocked,
         human_bytes(plan.total_input_bytes()),
     );
     Ok(())
@@ -169,11 +170,13 @@ pub fn report(report: &RunReport, format: Format) -> Result<()> {
 
     for table_outcome in &report.tables {
         println!("\n{}", table_outcome.table);
+        for note in &table_outcome.notes {
+            println!("  note: {note}");
+        }
         for op in &table_outcome.operations {
             let (marker, detail) = match &op.result {
                 OperationResult::Succeeded { detail } => ("ok", detail.clone()),
                 OperationResult::NoOp { detail } => ("--", detail.clone()),
-                OperationResult::Blocked { reason } => ("!!", reason.clone()),
                 OperationResult::Refused { reason } => ("XX", reason.clone()),
                 OperationResult::Conflicted { detail } => ("<>", detail.clone()),
                 OperationResult::Failed { error } => ("XX", error.clone()),
@@ -207,6 +210,9 @@ pub fn explain(table: &TableRef, decision: &Decision, format: Format) -> Result<
             println!("{table}");
             println!("  matched rule: {}\n", policy.matched_rule);
 
+            // Every resolved setting, not a selection. The command exists to
+            // answer "why is it *that*", and a knob missing from the table is a
+            // knob whose answer the operator has to go and guess.
             let mut t = table_with_provenance();
             let c = &policy.compaction;
             add(
@@ -221,11 +227,33 @@ pub fn explain(table: &TableRef, decision: &Decision, format: Format) -> Result<
                 &human_bytes(c.target_file_size.value),
                 &c.target_file_size.from.to_string(),
             );
+            match &c.sort {
+                Some(sort) => add(
+                    &mut t,
+                    "compaction.sort",
+                    &sort
+                        .value
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    &sort.from.to_string(),
+                ),
+                // Absence is a resolved answer too, and the one an operator is
+                // most likely to be surprised by.
+                None => add(&mut t, "compaction.sort", "(unsorted)", "nothing asked"),
+            }
             add(
                 &mut t,
                 "compaction.trigger.small_file_ratio",
                 &format!("{:.2}", c.small_file_ratio.value),
                 &c.small_file_ratio.from.to_string(),
+            );
+            add(
+                &mut t,
+                "compaction.trigger.min_file_size_ratio",
+                &format!("{:.2}", c.min_file_size_ratio.value),
+                &c.min_file_size_ratio.from.to_string(),
             );
             add(
                 &mut t,
@@ -238,6 +266,30 @@ pub fn explain(table: &TableRef, decision: &Decision, format: Format) -> Result<
                 "compaction.trigger.delete_ratio",
                 &format!("{:.2}", c.delete_ratio.value),
                 &c.delete_ratio.from.to_string(),
+            );
+            add(
+                &mut t,
+                "compaction.trigger.min_file_age",
+                &human_duration(c.min_file_age.value),
+                &c.min_file_age.from.to_string(),
+            );
+            add(
+                &mut t,
+                "compaction.max_sort_memory",
+                &human_bytes(c.max_sort_memory.value),
+                &c.max_sort_memory.from.to_string(),
+            );
+            add(
+                &mut t,
+                "compaction.max_group_bytes",
+                &human_bytes(c.max_group_bytes.value),
+                &c.max_group_bytes.from.to_string(),
+            );
+            add(
+                &mut t,
+                "compaction.max_input_files",
+                &c.max_input_files.value.to_string(),
+                &c.max_input_files.from.to_string(),
             );
 
             let s = &policy.snapshots;
@@ -279,6 +331,12 @@ pub fn explain(table: &TableRef, decision: &Decision, format: Format) -> Result<
                 &human_bytes(m.target_size.value),
                 &m.target_size.from.to_string(),
             );
+            add(
+                &mut t,
+                "manifests.min_count_to_merge",
+                &m.min_count_to_merge.value.to_string(),
+                &m.min_count_to_merge.from.to_string(),
+            );
 
             let o = &policy.orphans;
             add(
@@ -290,7 +348,10 @@ pub fn explain(table: &TableRef, decision: &Decision, format: Format) -> Result<
             add(
                 &mut t,
                 "orphans.mode",
-                &format!("{:?}", o.mode.value),
+                match o.mode.value {
+                    crate::policy::OrphanMode::DryRun => "dry-run",
+                    crate::policy::OrphanMode::Delete => "delete",
+                },
                 &o.mode.from.to_string(),
             );
             add(
@@ -299,6 +360,21 @@ pub fn explain(table: &TableRef, decision: &Decision, format: Format) -> Result<
                 &human_duration(o.older_than.value),
                 &o.older_than.from.to_string(),
             );
+            add(
+                &mut t,
+                "orphans.min_interval",
+                &human_duration(o.min_interval.value),
+                &o.min_interval.from.to_string(),
+            );
+
+            if let Some(schedule) = &policy.schedule {
+                add(
+                    &mut t,
+                    "schedule",
+                    &schedule.value,
+                    &schedule.from.to_string(),
+                );
+            }
 
             println!("{t}");
 

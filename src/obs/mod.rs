@@ -20,7 +20,7 @@ pub use audit::{AuditObserver, AuditRecord, AuditSink, JsonlSink, NullSink};
 #[cfg(feature = "metrics")]
 pub use metrics::{Metrics, OperationLabels};
 #[cfg(feature = "metrics")]
-pub use serve::{router, serve};
+pub use serve::{EventToken, router, router_with_events, serve};
 
 use std::sync::Arc;
 

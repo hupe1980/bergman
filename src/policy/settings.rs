@@ -80,35 +80,67 @@ pub struct CompactionSettings {
     #[serde(default)]
     pub trigger: Option<CompactionTrigger>,
 
-    /// Sort output by these columns.
+    /// Sort output by these columns, ascending, nulls first.
     ///
-    /// A *global* sort within each partition, so output files carry tight
+    /// A *global* sort within each file group, so output files carry tight
     /// min/max bounds and a query with a predicate on these columns can skip
     /// whole files.
+    ///
+    /// Deliberately just names. Direction and null placement belong to the
+    /// table's own `sort-order`, which every Iceberg tool reads and which
+    /// Bergman honours when a rule says nothing (see
+    /// [`crate::policy::SortColumn`]) — a second place to express the same
+    /// thing would be a second source of truth for the physical layout of a
+    /// table, which is exactly what layering exists to avoid.
     #[serde(default)]
     pub sort: Option<Vec<String>>,
 
-    /// How much memory one partition's sort may use.
+    /// How much memory one file group's rewrite may use.
     ///
-    /// Sorting needs the whole file group in hand, and Bergman does not spill
-    /// to disk. A partition larger than this is refused with a named reason
-    /// rather than written unsorted, because a table whose metadata says
-    /// "sorted" and whose files are not is worse than one that failed loudly.
+    /// A real budget rather than an estimate: it becomes the executor's memory
+    /// pool, and the two operators that can want more than a batch at a time —
+    /// the sort, and the anti-join that applies equality deletes — **spill to
+    /// disk** when they reach it rather than failing.
     #[serde(default)]
     pub max_sort_memory: Option<u64>,
+
+    /// Most bytes one file group may read.
+    ///
+    /// A partition is not a unit of work. Bergman bin-packs a partition's
+    /// eligible files into groups bounded by this and by
+    /// [`CompactionSettings::max_input_files`], and each group commits on its
+    /// own — so one conflict costs one group rather than a partition, and a
+    /// partition larger than memory is still compactable.
+    ///
+    /// The equivalent of Spark's `max-file-group-size-bytes`.
+    #[serde(default)]
+    pub max_group_bytes: Option<u64>,
+
+    /// Most files one file group may read.
+    ///
+    /// The other shape of the same problem: a hundred thousand one-kilobyte
+    /// files fit any byte ceiling and still overwhelm a single pass.
+    #[serde(default)]
+    pub max_input_files: Option<usize>,
 }
 
 impl CompactionSettings {
     fn validate(&self, where_: &str) -> Result<()> {
-        if let Some(0) = self.target_file_size {
-            return Err(Error::policy(format!(
-                "{where_}: compaction.target_file_size must be greater than zero"
-            )));
+        for (name, value) in [
+            ("target_file_size", self.target_file_size),
+            ("max_sort_memory", self.max_sort_memory),
+            ("max_group_bytes", self.max_group_bytes),
+        ] {
+            if let Some(0) = value {
+                return Err(Error::policy(format!(
+                    "{where_}: compaction.{name} must be greater than zero"
+                )));
+            }
         }
-        if let Some(0) = self.max_sort_memory {
+        if let Some(1) = self.max_input_files {
             return Err(Error::policy(format!(
-                "{where_}: compaction.max_sort_memory must be greater than zero; \
-                 omit `sort` instead of setting a budget nothing can fit in"
+                "{where_}: compaction.max_input_files must be at least 2; \
+                 a group of one file would be read and written back unchanged"
             )));
         }
         if self.sort.as_ref().is_some_and(|s| s.is_empty()) {
@@ -154,6 +186,20 @@ pub struct CompactionTrigger {
     /// What counts as "small", as a fraction of the target file size.
     #[serde(default)]
     pub min_file_size_ratio: Option<f64>,
+
+    /// Leave a partition alone until its newest file is at least this old.
+    ///
+    /// The guard against fighting the writer for the hot partition. A streaming
+    /// target commits to one partition continuously, and a rewrite of that
+    /// partition loses its compare-and-swap to the very next micro-batch —
+    /// spending a full read and write of the data to achieve nothing, over and
+    /// over. Waiting for the partition to settle is strictly cheaper than
+    /// competing with the writer for it.
+    ///
+    /// A partition whose files carry no timestamp counts as settled: failing
+    /// the other way would leave such a table un-maintained forever.
+    #[serde(default, with = "humantime_serde::option")]
+    pub min_file_age: Option<Duration>,
 }
 
 impl CompactionTrigger {
@@ -271,6 +317,19 @@ pub struct OrphanSettings {
     /// Bounded below by [`MIN_ORPHAN_AGE`], which cannot be configured away.
     #[serde(default, with = "humantime_serde::option")]
     pub older_than: Option<Duration>,
+
+    /// Do not scan a table more often than this.
+    ///
+    /// Unlike every other operation, orphan removal cannot be triggered from
+    /// metadata: the only way to know whether a table has orphans is to list
+    /// its whole location, and that listing *is* the expensive part. Running it
+    /// on every cycle would make a five-minute cadence mean a full object-store
+    /// listing of every table every five minutes — which costs real money on S3
+    /// and finds nothing almost every time.
+    ///
+    /// So this operation is the one that is scheduled rather than triggered.
+    #[serde(default, with = "humantime_serde::option")]
+    pub min_interval: Option<Duration>,
 }
 
 impl OrphanSettings {
@@ -284,6 +343,15 @@ impl OrphanSettings {
                  unreferenced file is more likely a live write than garbage.",
                 age.as_secs(),
                 MIN_ORPHAN_AGE.as_secs()
+            )));
+        }
+        if let Some(interval) = self.min_interval
+            && interval.is_zero()
+        {
+            return Err(Error::policy(format!(
+                "{where_}: orphans.min_interval is 0, which lists the whole table location \
+                 on every cycle; that listing is the entire cost of orphan removal and it \
+                 finds nothing almost every time"
             )));
         }
         Ok(())

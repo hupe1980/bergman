@@ -1,9 +1,9 @@
 //! The engine: the public entry point the CLI and every embedder drive.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures::stream::{self, StreamExt};
 use iceberg::Catalog;
 use uuid::Uuid;
@@ -15,10 +15,10 @@ use crate::health::TableHealth;
 use crate::obs::{MaintenanceObserver, NoopObserver, OperationContext};
 use crate::ops::store::{ObjectStore, OpendalStore};
 use crate::plan::{
-    Executability, MaintenancePlan, OperationKind, OperationOutcome, OperationResult, RunReport,
+    MaintenancePlan, OperationKind, OperationOutcome, OperationResult, PlanContext, RunReport,
     TableOutcome, TablePlan, Uneventful, UneventfulReason, plan_table,
 };
-use crate::policy::{Config, Decision, Policy, TableRef};
+use crate::policy::{Config, Decision, Policy, TableFacts, TableRef};
 
 /// A configured maintenance engine.
 ///
@@ -29,6 +29,25 @@ pub struct Bergman {
     policy: Policy,
     catalogs: Vec<ConnectedCatalog>,
     observer: Arc<dyn MaintenanceObserver>,
+    /// When this process last scanned each table for orphans.
+    ///
+    /// Per-process on purpose; see [`PlanContext::last_orphan_scan`]. It is the
+    /// only mutable state the engine holds, it is an optimisation rather than a
+    /// correctness input, and losing it costs one extra listing.
+    orphan_scans: Mutex<HashMap<TableRef, DateTime<Utc>>>,
+    /// Every table location Bergman has examined, for the *cheap half* of
+    /// orphan removal's nested-table check (see [`crate::ops::orphans`], check
+    /// 5).
+    ///
+    /// Populated as tables are examined, which means it is structurally
+    /// incomplete: a table no rule matches, one a rule skips, one outside this
+    /// cycle's selection, or one that failed to load is simply absent — and a
+    /// deliberately-excluded table is exactly the one most likely to be nested
+    /// somewhere it should not be. That is why the check that has to hold is
+    /// [`crate::ops::orphans::nested_table_root`], which reads the listing the
+    /// scan is walking anyway and needs no ledger at all. This is a fast path
+    /// that can refuse before a single object is listed, nothing more.
+    locations: Mutex<HashMap<TableRef, String>>,
 }
 
 #[derive(Debug)]
@@ -38,6 +57,31 @@ struct ConnectedCatalog {
     /// Bergman's own commit path, for the operations `iceberg::Transaction`
     /// cannot express (see [`crate::commit`]).
     committer: Arc<dyn TableCommitter>,
+}
+
+/// Which of a catalog's tables a plan covers.
+///
+/// The three ways a cycle is scoped, and they are genuinely different: the
+/// daemon's own interval means everything, a rule's `schedule` means that
+/// rule's pattern, and an event means a named list. Naming them here keeps
+/// `plan_where` one function rather than three.
+enum Selection {
+    /// Every table the catalogs hold.
+    All,
+    /// Every table one pattern matches.
+    Matching(crate::policy::TableMatcher),
+    /// Exactly these.
+    Named(std::collections::HashSet<TableRef>),
+}
+
+impl Selection {
+    fn keep(&self, table: &TableRef) -> bool {
+        match self {
+            Self::All => true,
+            Self::Matching(matcher) => matcher.matches(table),
+            Self::Named(wanted) => wanted.contains(table),
+        }
+    }
 }
 
 /// What one table's examination concluded.
@@ -110,6 +154,8 @@ impl BergmanBuilder {
             policy,
             catalogs,
             observer: self.observer,
+            orphan_scans: Mutex::new(HashMap::new()),
+            locations: Mutex::new(HashMap::new()),
         })
     }
 }
@@ -135,6 +181,21 @@ impl Bergman {
     /// Useful before Bergman is trusted to write anything: it answers "what is
     /// wrong with my tables" without changing one.
     pub async fn inspect(&self) -> Result<Vec<TableHealth>> {
+        self.inspect_where(&Selection::All).await
+    }
+
+    /// Examine only the tables a pattern matches. Reads only.
+    ///
+    /// Scopes the *examination*, not the output. A table the pattern excludes
+    /// is never read at all, which is what makes "what is wrong with this one
+    /// namespace" cost a namespace's manifests rather than the warehouse's.
+    pub async fn inspect_matching(&self, pattern: &str) -> Result<Vec<TableHealth>> {
+        let matcher = crate::policy::TableMatcher::new(pattern)
+            .map_err(|e| Error::config(format!("{pattern:?}: {e}")))?;
+        self.inspect_where(&Selection::Matching(matcher)).await
+    }
+
+    async fn inspect_where(&self, selection: &Selection) -> Result<Vec<TableHealth>> {
         let mut out = Vec::new();
         let limit = self.policy.limits().max_parallel_tables.max(1);
 
@@ -145,6 +206,10 @@ impl Bergman {
             // small metadata reads, and doing them one table at a time would
             // make inspecting a large catalog take minutes for no reason.
             let examined: Vec<(TableRef, Result<TableHealth>)> = stream::iter(discovered)
+                .filter(|d| {
+                    let wanted = selection.keep(&d.table);
+                    async move { wanted }
+                })
                 .map(|d| async move {
                     let health = self
                         .examine(catalog, &d.table)
@@ -175,13 +240,41 @@ impl Bergman {
         Ok(out)
     }
 
+    /// Every table the configured catalogs hold.
+    ///
+    /// Discovery only — no table's metadata is read. That is the difference
+    /// between this and [`Bergman::inspect`], and it is the whole point:
+    /// answering "which tables does my policy match" should cost a catalog
+    /// listing, not a manifest walk of every table in the warehouse.
+    pub async fn tables(&self) -> Result<Vec<TableRef>> {
+        let mut out = Vec::new();
+        for catalog in &self.catalogs {
+            let discovered = crate::catalog::discover(&catalog.config, &catalog.client).await?;
+            out.extend(discovered.into_iter().map(|d| d.table));
+        }
+        out.sort();
+        Ok(out)
+    }
+
     /// Build a maintenance plan. Reads only.
     ///
     /// `plan` and [`Bergman::run`] build the identical plan through this method;
     /// `run` then executes it. That is what makes `bergman plan` a true preview
     /// rather than a separate code path that might disagree.
     pub async fn plan(&self) -> Result<MaintenancePlan> {
-        self.plan_where(|_| true).await
+        self.plan_where(&Selection::All).await
+    }
+
+    /// Plan only the tables a pattern matches.
+    ///
+    /// What a rule's `schedule` means: a rule asking to be evaluated every five
+    /// minutes should cost five-minute evaluation of *its* tables, not of the
+    /// whole catalog. Without this, one aggressive schedule would set the
+    /// cadence for every table a deployment holds.
+    pub async fn plan_matching(&self, pattern: &str) -> Result<MaintenancePlan> {
+        let matcher = crate::policy::TableMatcher::new(pattern)
+            .map_err(|e| Error::policy(format!("{pattern:?}: {e}")))?;
+        self.plan_where(&Selection::Matching(matcher)).await
     }
 
     /// Plan only the tables named.
@@ -190,14 +283,11 @@ impl Bergman {
     /// not rescan a catalog of thousands. Tables that are not in the catalog,
     /// or that no rule matches, are simply absent from the plan.
     pub async fn plan_tables(&self, tables: &[TableRef]) -> Result<MaintenancePlan> {
-        let wanted: std::collections::HashSet<&TableRef> = tables.iter().collect();
-        self.plan_where(|table| wanted.contains(table)).await
+        let wanted = Selection::Named(tables.iter().cloned().collect());
+        self.plan_where(&wanted).await
     }
 
-    async fn plan_where(
-        &self,
-        keep: impl Fn(&TableRef) -> bool + Copy + Send + Sync,
-    ) -> Result<MaintenancePlan> {
+    async fn plan_where(&self, selection: &Selection) -> Result<MaintenancePlan> {
         let now = Utc::now();
         let mut tables = Vec::new();
         let mut uneventful = Vec::new();
@@ -217,7 +307,7 @@ impl Bergman {
             // table, which is most of them.
             let outcomes: Vec<(TableRef, Outcome)> = stream::iter(discovered)
                 .filter(|d| {
-                    let wanted = keep(&d.table);
+                    let wanted = selection.keep(&d.table);
                     async move { wanted }
                 })
                 .map(|d| async move {
@@ -287,35 +377,58 @@ impl Bergman {
             });
         }
 
-        let mut outcomes = Vec::new();
+        // Tables are maintained concurrently, bounded by `max_parallel_tables`.
+        // Operations *within* a table stay strictly ordered — compact, then
+        // rewrite manifests, then expire, then remove orphans — because that
+        // ordering is a correctness property, not a preference (see
+        // `OperationKind`). Two different tables share nothing but the object
+        // store, so nothing is serialised between them.
+        let limit = self.policy.limits().max_parallel_tables.max(1);
+        let run_id = run_id.as_str();
+        let mut outcomes: Vec<TableOutcome> = stream::iter(&plan.tables)
+            .map(|table_plan| async move {
+                let catalog = self.catalog_for(&table_plan.table)?;
+                self.observer.table_started(&table_plan.table).await;
 
-        for table_plan in &plan.tables {
-            let Some(catalog) = self.catalog_for(&table_plan.table) else {
-                continue;
-            };
+                let operations = self
+                    .run_table(catalog, table_plan, run_id)
+                    .await
+                    .unwrap_or_else(|e| {
+                        // The table could not be loaded at all, so no operation
+                        // ran. Reporting it against the first operation the plan
+                        // named — rather than an arbitrary one — keeps the
+                        // failure attached to something the operator recognises.
+                        let kind = table_plan
+                            .operations
+                            .first()
+                            .map_or(OperationKind::ExpireSnapshots, |op| op.kind);
+                        vec![OperationOutcome {
+                            kind,
+                            reason: "table could not be loaded".into(),
+                            result: OperationResult::Failed {
+                                error: e.to_string(),
+                            },
+                            duration: std::time::Duration::ZERO,
+                        }]
+                    });
 
-            self.observer.table_started(&table_plan.table).await;
+                Some(TableOutcome {
+                    table: table_plan.table.clone(),
+                    matched_rule: table_plan.policy.matched_rule.clone(),
+                    operations,
+                    notes: table_plan.notes.clone(),
+                })
+            })
+            .buffer_unordered(limit)
+            // A table the plan names but no configured catalog holds. It cannot
+            // be maintained and it is not a failure of this run.
+            .filter_map(|outcome| async move { outcome })
+            .collect()
+            .await;
 
-            let operations = self
-                .run_table(catalog, table_plan, &run_id)
-                .await
-                .unwrap_or_else(|e| {
-                    vec![OperationOutcome {
-                        kind: OperationKind::ExpireSnapshots,
-                        reason: "table could not be loaded".into(),
-                        result: OperationResult::Failed {
-                            error: e.to_string(),
-                        },
-                        duration: std::time::Duration::ZERO,
-                    }]
-                });
-
-            outcomes.push(TableOutcome {
-                table: table_plan.table.clone(),
-                matched_rule: table_plan.policy.matched_rule.clone(),
-                operations,
-            });
-        }
+        // Completion order is whatever the concurrency produced; sorting makes
+        // one run's report comparable with the next.
+        outcomes.sort_by(|a, b| a.table.cmp(&b.table));
 
         Ok(RunReport {
             started_at,
@@ -333,15 +446,15 @@ impl Bergman {
             .catalog_for(table)
             .ok_or_else(|| Error::config(format!("no catalog named {:?}", table.catalog)))?;
 
-        let properties = match self.load(catalog, table).await {
-            Ok(loaded) => loaded.metadata().properties().clone(),
+        let facts = match self.load(catalog, table).await {
+            Ok(loaded) => TableFacts::from_metadata(loaded.metadata()),
             // Explaining a table that cannot be loaded is still useful: the
             // rule and defaults layers resolve without it, and saying so beats
             // refusing to answer.
-            Err(_) => HashMap::new(),
+            Err(_) => TableFacts::unknown(),
         };
 
-        Ok(self.policy.decide(table, &properties))
+        Ok(self.policy.decide(table, &facts))
     }
 
     async fn run_table(
@@ -355,21 +468,6 @@ impl Bergman {
 
         for operation in &table_plan.operations {
             let started = std::time::Instant::now();
-
-            // A blocked operation is reported, never attempted. It stays in the
-            // report because the table's need is real even when Bergman cannot
-            // meet it.
-            if let Executability::Blocked { reason } = &operation.executability {
-                outcomes.push(OperationOutcome {
-                    kind: operation.kind,
-                    reason: operation.reason.clone(),
-                    result: OperationResult::Blocked {
-                        reason: reason.clone(),
-                    },
-                    duration: started.elapsed(),
-                });
-                continue;
-            }
 
             // The approval gate. An observer that says no turns the operation
             // into a refusal, which is reported and needs attention.
@@ -431,59 +529,78 @@ impl Bergman {
         table: &iceberg::table::Table,
         table_plan: &TablePlan,
         ctx: OperationContext<'_>,
+        #[cfg_attr(not(feature = "compaction"), allow(unused_variables))]
         targets: &[crate::health::PartitionKey],
     ) -> Result<OperationResult> {
         let now = Utc::now();
+        let ident = crate::catalog::to_table_ident(&table_plan.table)?;
+        let env = crate::ops::OpEnv {
+            table,
+            ident: &ident,
+            loader: &catalog.client,
+            committer: catalog.committer.as_ref(),
+            observer: self.observer.as_ref(),
+            ctx,
+            now,
+            max_deletes_per_run: self.policy.limits().max_deletes_per_run,
+        };
+
         match ctx.kind {
             OperationKind::ExpireSnapshots => {
-                crate::ops::expire::run(
-                    table,
-                    &catalog.client,
-                    &table_plan.policy.snapshots,
-                    self.observer.as_ref(),
-                    ctx,
-                    now,
-                )
-                .await
+                crate::ops::expire::run(&env, &catalog.client, &table_plan.policy.snapshots).await
             }
             OperationKind::RemoveOrphans => {
                 let store = self.object_store(catalog, table)?;
+                let siblings = self.other_locations(&table_plan.table);
+
+                // Recorded before the scan rather than after: a scan that
+                // failed halfway through still listed the location, which is
+                // the cost the cadence exists to bound.
+                self.orphan_scans
+                    .lock()
+                    .expect("orphan scan ledger")
+                    .insert(table_plan.table.clone(), now);
+
                 crate::ops::orphans::run(
-                    table,
-                    &catalog.client,
+                    &env,
                     store.as_ref(),
                     &table_plan.policy.orphans,
-                    self.observer.as_ref(),
-                    ctx,
-                    now,
+                    &siblings,
                 )
                 .await
             }
             OperationKind::RewriteManifests => {
-                crate::ops::manifests::run(
-                    table,
-                    &crate::catalog::to_table_ident(&table_plan.table)?,
-                    catalog.committer.as_ref(),
-                    &table_plan.policy.manifests,
-                    ctx,
-                )
-                .await
+                crate::ops::manifests::run(&env, &table_plan.policy.manifests).await
             }
+            // Exactly the partitions the plan named, so `run` rewrites what
+            // `plan` displayed rather than re-deciding.
+            #[cfg(feature = "compaction")]
             OperationKind::Compact => {
-                crate::ops::compact::run(
-                    table,
-                    &crate::catalog::to_table_ident(&table_plan.table)?,
-                    catalog.committer.as_ref(),
-                    &table_plan.policy.compaction,
-                    // Exactly the partitions the plan named, so `run` rewrites
-                    // what `plan` displayed rather than re-deciding.
-                    targets,
-                    self.observer.as_ref(),
-                    ctx,
-                )
-                .await
+                crate::ops::compact::run(&env, &table_plan.policy.compaction, targets).await
             }
+
+            // Planning stays feature-independent: it is pure, and the plan is a
+            // true description of what the table needs whether or not this
+            // build can act on it. Reporting the gap here — rather than
+            // silently omitting the operation — keeps `plan` honest and tells
+            // the operator exactly which feature to rebuild with.
+            #[cfg(not(feature = "compaction"))]
+            OperationKind::Compact => Ok(OperationResult::Refused {
+                reason: "this build has no compaction; rebuild with --features compaction"
+                    .to_string(),
+            }),
         }
+    }
+
+    /// Every other table's location, for orphan removal's nested-table check.
+    fn other_locations(&self, table: &TableRef) -> Vec<String> {
+        self.locations
+            .lock()
+            .expect("location ledger")
+            .iter()
+            .filter(|(known, _)| *known != table)
+            .map(|(_, location)| location.clone())
+            .collect()
     }
 
     fn object_store(
@@ -507,7 +624,7 @@ impl Bergman {
         // A first pass with no table properties: a table no rule matches needs
         // no metadata read at all, which is what keeps a policy scoped to one
         // namespace cheap against a catalog holding thousands of tables.
-        match self.policy.decide(table, &HashMap::new()) {
+        match self.policy.decide(table, &TableFacts::unknown()) {
             Decision::Unmatched => return Outcome::Nothing(UneventfulReason::Unmatched),
             Decision::Skip { pattern } => {
                 return Outcome::Nothing(UneventfulReason::Skipped { pattern });
@@ -526,10 +643,6 @@ impl Bergman {
             }
         };
 
-        if health.is_empty() {
-            return Outcome::Nothing(UneventfulReason::Empty);
-        }
-
         // Re-decided with the table's own properties, which is the layer that
         // can change a threshold — the first pass only established that some
         // rule matches.
@@ -537,8 +650,21 @@ impl Bergman {
             return Outcome::Nothing(UneventfulReason::Healthy);
         };
 
-        match plan_table(&health, &policy, now) {
+        let context = PlanContext {
+            last_orphan_scan: self
+                .orphan_scans
+                .lock()
+                .expect("orphan scan ledger")
+                .get(table)
+                .copied(),
+        };
+
+        match plan_table(&health, &policy, context, now) {
             Some(plan) => Outcome::Work(Box::new(plan)),
+            // A table with nothing planned is either empty or fine, and those
+            // are different situations: "no rule fired" invites a look at the
+            // thresholds, "never written to" does not.
+            None if health.is_empty() => Outcome::Nothing(UneventfulReason::Empty),
             None => Outcome::Nothing(UneventfulReason::Healthy),
         }
     }
@@ -549,7 +675,9 @@ impl Bergman {
         table_ref: &TableRef,
     ) -> Result<(TableHealth, Decision)> {
         let table = self.load(catalog, table_ref).await?;
-        let decision = self.policy.decide(table_ref, table.metadata().properties());
+        let decision = self
+            .policy
+            .decide(table_ref, &TableFacts::from_metadata(table.metadata()));
 
         // The manifest target size decides which manifests count as
         // undersized, and it comes from the resolved policy — so a table judged
@@ -561,6 +689,16 @@ impl Bergman {
         };
 
         let health = crate::health::analyze(table_ref, &table, target, Utc::now()).await?;
+
+        // Remembered so orphan removal can refuse a table that another table
+        // lives inside (see `crate::ops::orphans`, check 5). Recorded here
+        // rather than in a separate pass, because every table Bergman will ever
+        // maintain comes through this function first.
+        self.locations
+            .lock()
+            .expect("location ledger")
+            .insert(table_ref.clone(), health.location.clone());
+
         Ok((health, decision))
     }
 

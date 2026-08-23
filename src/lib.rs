@@ -1,8 +1,8 @@
 //! # Bergman — a Rust-native maintenance engine for Apache Iceberg
 //!
-//! Bergman plans and executes Iceberg table maintenance — snapshot expiration,
-//! manifest optimization, orphan-file cleanup, and (as upstream support lands)
-//! compaction — with no Spark, no Trino, and no JVM.
+//! Bergman plans and executes Iceberg table maintenance — compaction, snapshot
+//! expiration, manifest optimization and orphan-file cleanup — with no Spark,
+//! no Trino, and no JVM.
 //!
 //! This crate is **library-first**. The `bergman` binary is a thin consumer of
 //! the API below, which is the contract: anything the CLI can do, an embedder
@@ -60,8 +60,19 @@
 //! expressed through it. Bergman builds those commits from upstream's public
 //! writers and delivers them itself — see [`commit`].
 //!
-//! Not implemented: the sort stage of compaction (output is bin-packed),
-//! z-order, and daemon mode.
+//! ## Not implemented
+//!
+//! Z-order and other space-filling clustering — a global sort within a file
+//! group works, and it spills, so a group is never too large to sort;
+//! **rewriting an Iceberg format v3 table**, whose row lineage a rewrite cannot
+//! preserve (expiration and orphan removal still run — see
+//! [`commit::authoring_refusal`]); rewriting across a partition-spec change;
+//! writing anything but Parquet; `OpenTelemetry` export (the library emits
+//! [`tracing`], which an embedder's subscriber can export); and catalog
+//! protocols other than REST.
+//!
+//! Each of these is *refused with a named reason* rather than attempted, and
+//! the refusal reaches [`MaintenancePlan`] rather than only a log line.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

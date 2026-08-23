@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 
 use crate::error::{Error, Result};
+use crate::ops::delete::FileDeleter;
 
 /// One object in a store.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,14 +32,25 @@ pub struct ObjectMeta {
     pub last_modified: Option<DateTime<Utc>>,
 }
 
-/// Listing and deletion over an object store.
-#[async_trait::async_trait]
-pub trait ObjectStore: Send + Sync + std::fmt::Debug {
-    /// Recursively list everything under a prefix.
-    async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>>;
+/// A listing in progress.
+///
+/// A stream rather than a `Vec`, because the caller's whole purpose is to throw
+/// almost all of it away: a healthy table's listing is overwhelmingly files its
+/// metadata already reaches. Materializing it first would hold every object
+/// under a table location in memory at once, which for a large table is
+/// millions of entries and hundreds of megabytes — spent to produce, usually,
+/// an empty answer.
+pub type Listing<'a> = futures::stream::BoxStream<'a, Result<ObjectMeta>>;
 
-    /// Delete one object.
-    async fn delete(&self, path: &str) -> Result<()>;
+/// Listing over an object store, and — through [`FileDeleter`] — deletion.
+///
+/// Deletion is inherited rather than declared, so that an object store is
+/// usable wherever the shared deleter is (see [`crate::ops::delete`]) without
+/// the two traits growing separate `delete` methods that could drift.
+#[async_trait::async_trait]
+pub trait ObjectStore: FileDeleter + std::fmt::Debug {
+    /// Recursively list everything under a prefix.
+    async fn list<'a>(&'a self, prefix: &str) -> Result<Listing<'a>>;
 }
 
 /// An [`ObjectStore`] backed by `OpenDAL`.
@@ -91,42 +103,57 @@ impl OpendalStore {
 
 #[async_trait::async_trait]
 impl ObjectStore for OpendalStore {
-    async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
+    async fn list<'a>(&'a self, prefix: &str) -> Result<Listing<'a>> {
+        use futures::StreamExt;
+
         let (_, _, key) = split_location(prefix)?;
         // A recursive listing of a *directory*: the trailing slash is what
         // stops `…/events` from also returning `…/events_archive`, which is the
         // same prefix hazard the containment check guards.
         let key = format!("{}/", key.trim_end_matches('/'));
 
-        let entries = self
+        let lister = self
             .operator
-            .list_with(&key)
+            .lister_with(&key)
             .recursive(true)
             .await
             .map_err(|e| Error::Storage(Box::new(to_iceberg_error(e))))?;
 
-        let mut out = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let meta = entry.metadata();
-            // Directory markers are not files; deleting one deletes nothing and
-            // on some stores errors.
-            if meta.is_dir() {
-                continue;
-            }
-            out.push(ObjectMeta {
-                path: format!("{}/{}", self.prefix, entry.path().trim_start_matches('/')),
-                size: meta.content_length(),
-                // OpenDAL times are `jiff`-backed; `SystemTime` is the common
-                // currency between it and chrono, and both conversions are
-                // infallible.
-                last_modified: meta
-                    .last_modified()
-                    .map(|t| std::time::SystemTime::from(t).into()),
-            });
-        }
-        Ok(out)
+        let path_prefix = self.prefix.clone();
+        Ok(lister
+            .filter_map(move |entry| {
+                let path_prefix = path_prefix.clone();
+                async move {
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(e) => {
+                            return Some(Err(Error::Storage(Box::new(to_iceberg_error(e)))));
+                        }
+                    };
+                    let meta = entry.metadata();
+                    // Directory markers are not files; deleting one deletes
+                    // nothing and on some stores errors.
+                    if meta.is_dir() {
+                        return None;
+                    }
+                    Some(Ok(ObjectMeta {
+                        path: format!("{path_prefix}/{}", entry.path().trim_start_matches('/')),
+                        size: meta.content_length(),
+                        // OpenDAL times are `jiff`-backed; `SystemTime` is the
+                        // common currency between it and chrono, and both
+                        // conversions are infallible.
+                        last_modified: meta
+                            .last_modified()
+                            .map(|t| std::time::SystemTime::from(t).into()),
+                    }))
+                }
+            })
+            .boxed())
     }
+}
 
+#[async_trait::async_trait]
+impl FileDeleter for OpendalStore {
     async fn delete(&self, path: &str) -> Result<()> {
         let (_, _, key) = split_location(path)?;
         self.operator
@@ -271,17 +298,25 @@ impl InMemoryStore {
 
 #[async_trait::async_trait]
 impl ObjectStore for InMemoryStore {
-    async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
-        Ok(self
+    async fn list<'a>(&'a self, prefix: &str) -> Result<Listing<'a>> {
+        use futures::StreamExt;
+
+        let matched: Vec<Result<ObjectMeta>> = self
             .objects
             .lock()
             .unwrap()
             .iter()
             .filter(|o| crate::ops::reachability::is_inside(prefix, &o.path))
             .cloned()
-            .collect())
-    }
+            .map(Ok)
+            .collect();
 
+        Ok(futures::stream::iter(matched).boxed())
+    }
+}
+
+#[async_trait::async_trait]
+impl FileDeleter for InMemoryStore {
     async fn delete(&self, path: &str) -> Result<()> {
         let normalized = crate::ops::reachability::normalize(path);
         self.objects
@@ -356,11 +391,19 @@ mod tests {
 
     #[tokio::test]
     async fn in_memory_store_lists_by_containment_not_string_prefix() {
+        use futures::TryStreamExt;
+
         let store = InMemoryStore::new();
         store.insert("s3://b/wh/events/data/a.parquet", 10, None);
         store.insert("s3://b/wh/events_archive/b.parquet", 10, None);
 
-        let listed = store.list("s3://b/wh/events").await.unwrap();
+        let listed: Vec<ObjectMeta> = store
+            .list("s3://b/wh/events")
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].path, "s3://b/wh/events/data/a.parquet");
     }

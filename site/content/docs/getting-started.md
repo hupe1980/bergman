@@ -98,7 +98,7 @@ prod.analytics.events
      why: oldest snapshot is 34d old (> 7d), 61 snapshots retained (keeping at least 3)
      removes up to 58 snapshots
 
-1 tables, 2 operations (2 will run, 0 blocked), 2.14 GiB to read
+1 tables, 2 operations, 2.14 GiB to read
 ```
 
 Every operation carries the measurement that triggered it and the threshold it

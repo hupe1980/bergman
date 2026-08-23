@@ -73,35 +73,59 @@ See [Snapshots](@/docs/snapshots.md).
 
 ```toml
 [defaults.orphans]
-enabled    = false       # the scanner runs at all
-mode       = "dry-run"   # or "delete"
-older_than = "7d"        # hard floor of 24h
+enabled      = false      # the scanner runs at all
+mode         = "dry-run"  # or "delete"
+older_than   = "7d"       # hard floor of 24h
+min_interval = "24h"      # shortest gap between two scans of one table
 ```
+
+The blast-radius ceiling is **not** here: it lives in
+[`[limits]`](#limits) as `max_deletes_per_run`, because it governs every
+deletion Bergman performs — orphan removal and expiration's file cleanup alike,
+which share one deleter and therefore one safety model.
 
 `older_than` below 24 hours is refused at startup and again in the scanner. Read
 [Orphan files](@/docs/orphans.md) before setting `mode = "delete"`.
+
+`min_interval` exists because this is the one operation whose cost cannot be
+judged from metadata: knowing whether a table has orphans means listing its
+whole location. It applies within one process — a one-shot `bergman run` always
+scans. See [Cadence](@/docs/orphans.md#cadence).
 
 ### `compaction`
 
 ```toml
 [defaults.compaction]
-enabled                    = false
-target_file_size           = 536870912   # -> write.target-file-size-bytes -> 512 MiB
-sort                       = ["event_date", "customer_id"]
-max_sort_memory            = 1073741824   # 1 GiB
+enabled          = false
+target_file_size = 536870912    # -> write.target-file-size-bytes -> 512 MiB
+sort             = ["event_date", "customer_id"]
+max_sort_memory  = 1073741824   # 1 GiB executor memory pool
+max_group_bytes  = 8589934592   # 8 GiB per file group
+max_input_files  = 10000        # files per file group
 
 [defaults.compaction.trigger]
 small_file_ratio    = 0.3     # fraction of small files that triggers a rewrite
 min_input_files     = 5       # matches Spark's rewrite_data_files
 delete_ratio        = 0.1     # delete records as a fraction of rows
 min_file_size_ratio = 0.75    # what counts as "small"
+min_file_age        = "1h"    # leave a partition alone until it settles
 ```
 
-Ratios outside 0–1 are refused at startup, as is an empty `sort` list.
+Ratios outside 0–1 are refused at startup, as is an empty `sort` list and a
+`max_input_files` below 2.
 
-`sort` orders rows globally within each partition, which needs the file group in
-memory. `max_sort_memory` bounds that; a larger partition is refused rather than
-written unsorted. See [Compaction](@/docs/compaction.md#sort-based-clustering).
+`max_group_bytes` and `max_input_files` bound a **file group**, which is the
+unit a rewrite commits at. A partition is bin-packed into as many groups as it
+needs, so a partition larger than memory is still compactable and one lost
+commit costs one group. See [File groups](@/docs/compaction.md#file-groups).
+
+`min_file_age` leaves a partition alone until its newest file has settled — the
+guard against fighting your own writer for the hot partition.
+
+`sort` orders rows globally within each file group. `max_sort_memory` is the
+executor's memory pool: the sort and the anti-join that applies equality deletes
+**spill to disk** when they reach it rather than failing. See
+[Compaction](@/docs/compaction.md#query-engine).
 
 ### `manifests`
 
@@ -126,8 +150,10 @@ six-field form with seconds are accepted; a five-field expression means "at
 second zero".
 
 Read by [`bergman daemon`](@/docs/operating.md#as-a-daemon), which wakes at the
-earliest schedule any rule declares. Under `bergman run` the whole cycle is
-driven by whatever scheduler invoked it, so `schedule` is inert.
+earliest schedule any rule declares and then evaluates **only the tables that
+rule matches** — so one aggressive cadence does not set the pace for the whole
+catalog. Under `bergman run` the cycle is driven by whatever scheduler invoked
+it, so `schedule` is inert; use `--table` to scope a run instead.
 
 ### `skip`
 
@@ -146,13 +172,28 @@ would make the other a line that does nothing.
 [limits]
 max_parallel_tables       = 4
 max_rewrite_bytes_per_run = 536870912000   # 500 GiB
+max_deletes_per_run       = 100000         # blast-radius ceiling, every deleter
 maintenance_window        = "22:00-06:00 Europe/Berlin"
 ```
 
+`max_deletes_per_run` caps how many files any single operation may delete —
+[orphan removal](@/docs/orphans.md) and
+[expiration's file cleanup](@/docs/snapshots.md) both. Nothing is lost by
+hitting it: what is withheld is reported and reclaimed by the next pass. What
+would be lost without it is the difference between an incident and a
+catastrophe. `0` is refused at startup.
+
 When the byte budget cannot cover everything, tables are ordered
 most-fragmented-first and the remainder is reported as **deferred**, never
-silently dropped — the run report names them. Metadata-only work is not charged
-against it, so a rewrite ceiling cannot block snapshot expiration.
+silently dropped — the run report names them, and the table's plan carries a
+note saying why.
+
+The ceiling is charged **per operation, not per table**. Metadata-only work
+reads no data files and costs the budget nothing, so a rewrite ceiling cannot
+block snapshot expiration — not even on the table whose compaction exhausted it.
+Deferring the whole table instead would mean a table too fragmented to fit the
+budget also stopped expiring snapshots, growing its history without bound
+*because* it needed compaction.
 
 `maintenance_window` governs when work *begins*. A cycle already under way runs
 to completion: stopping mid-rewrite at the window's edge would leave files

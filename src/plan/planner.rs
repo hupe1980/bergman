@@ -7,39 +7,75 @@
 use chrono::{DateTime, Utc};
 
 use crate::health::TableHealth;
-use crate::plan::{Estimate, Executability, Operation, OperationKind, TablePlan};
+use crate::plan::{Estimate, Operation, OperationKind, TablePlan};
 use crate::policy::{EffectivePolicy, OrphanMode};
 use crate::util::{human_bytes, human_duration};
 
+/// What the caller knows about a table beyond its metadata.
+///
+/// Only orphan removal needs anything here, and only because it is the one
+/// operation whose cost cannot be judged from metadata: the only way to know
+/// whether a table has orphans is to list its whole location.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PlanContext {
+    /// When this process last scanned the table for orphans, if it has.
+    ///
+    /// Deliberately per-process rather than persisted. A one-shot `bergman run`
+    /// *is* the schedule — the cron entry that invoked it already decided the
+    /// cadence — so it scans. A daemon on a five-minute cycle must not list
+    /// every table's whole location every five minutes, and "since this process
+    /// started" is exactly the right scope for that: losing it on restart costs
+    /// one extra scan, which is harmless, and persisting it would mean state
+    /// that has to survive a crash, which is the thing Bergman does not have.
+    pub last_orphan_scan: Option<DateTime<Utc>>,
+}
+
 /// Plan one table.
 ///
-/// Returns `None` when nothing should happen — an empty table, or one already
-/// healthy under its policy. The caller distinguishes the two for reporting.
+/// Returns `None` when there is genuinely nothing to say — a table already
+/// healthy under its policy, and nothing about its shape that stops the policy
+/// applying. A plan with no operations but a note is still returned, because
+/// "your compaction rule can never run against this table" is information an
+/// operator needs and silence is not.
 pub fn plan_table(
     health: &TableHealth,
     policy: &EffectivePolicy,
+    context: PlanContext,
     now: DateTime<Utc>,
 ) -> Option<TablePlan> {
-    if health.is_empty() {
-        return None;
-    }
-
     let mut operations = Vec::new();
+    let mut notes = Vec::new();
 
-    if let Some(op) = plan_compaction(health, policy) {
+    // A table with no snapshots has no data to compact, no manifests to
+    // re-pack and no snapshots to expire — but it can still hold files: a
+    // first write that died between staging its data and committing leaves
+    // them under the table location with nothing to reference them, and
+    // nothing but the orphan scanner will ever reclaim them.
+    if health.is_empty() {
+        let op = plan_orphan_removal(health, policy, context, now)?;
+        return Some(TablePlan {
+            table: health.table.clone(),
+            health: health.clone(),
+            policy: Box::new(policy.clone()),
+            operations: vec![op],
+            notes,
+        });
+    }
+
+    if let Some(op) = plan_compaction(health, policy, now, &mut notes) {
         operations.push(op);
     }
-    if let Some(op) = plan_manifest_rewrite(health, policy) {
+    if let Some(op) = plan_manifest_rewrite(health, policy, &mut notes) {
         operations.push(op);
     }
-    if let Some(op) = plan_expiration(health, policy, now) {
+    if let Some(op) = plan_expiration(health, policy) {
         operations.push(op);
     }
-    if let Some(op) = plan_orphan_removal(health, policy) {
+    if let Some(op) = plan_orphan_removal(health, policy, context, now) {
         operations.push(op);
     }
 
-    if operations.is_empty() {
+    if operations.is_empty() && notes.is_empty() {
         return None;
     }
 
@@ -52,23 +88,75 @@ pub fn plan_table(
         health: health.clone(),
         policy: Box::new(policy.clone()),
         operations,
+        notes,
     })
 }
 
-fn plan_compaction(health: &TableHealth, policy: &EffectivePolicy) -> Option<Operation> {
+fn plan_compaction(
+    health: &TableHealth,
+    policy: &EffectivePolicy,
+    now: DateTime<Utc>,
+    notes: &mut Vec<String>,
+) -> Option<Operation> {
     let settings = &policy.compaction;
     if !settings.enabled.value {
         return None;
     }
 
+    // A table whose snapshots Bergman cannot author is one compaction can never
+    // run against, however fragmented it is. Saying so once per plan is the
+    // difference between an operator seeing "healthy" forever and seeing the
+    // reason.
+    if let Some(reason) = crate::commit::authoring_refusal(health.format_version) {
+        notes.push(format!("compaction is enabled but cannot run: {reason}"));
+        return None;
+    }
+
+    // Bergman reads Parquet, Avro and ORC but writes only Parquet, so a table
+    // asking for anything else would have its format silently changed by a
+    // rewrite. The executor refuses it too; saying so here turns a refusal
+    // reported every cycle into an explanation given once.
+    if let Some(format) = health.write_format.as_deref()
+        && format != "parquet"
+    {
+        notes.push(format!(
+            "compaction is enabled but cannot run: the table's \
+             write.format.default is {format:?}, and Bergman writes only Parquet — \
+             a rewrite must not silently change a table's format"
+        ));
+        return None;
+    }
+
     let threshold = settings.small_file_threshold();
     let target = settings.target_file_size.value;
+    let now_ms = now.timestamp_millis();
 
     // Partition-grained, because that is the granularity a rewrite commits at
     // and because a table can look healthy on average while one partition is
     // in a bad state.
     let mut triggered = Vec::new();
+    let mut superseded = 0usize;
     for partition in &health.partitions {
+        // A partition still receiving writes will lose the compare-and-swap to
+        // the very next micro-batch, spending a full read and write of the data
+        // to achieve nothing — repeatedly. Waiting for it to settle is strictly
+        // cheaper than competing with the writer for it, and this is the single
+        // most common way a naive compactor burns a cycle.
+        if !partition.has_settled(settings.min_file_age.value, now_ms) {
+            continue;
+        }
+
+        // Output is written under the table's current spec, so a partition
+        // whose files were written under an older one cannot be rewritten: the
+        // commit would claim to replace files partitioned differently. The
+        // executor refuses these too; not planning them keeps the plan honest
+        // about what will happen — and counting them keeps it from being
+        // silent about a partition that will never be maintained.
+        if partition.key.spec_id != health.current_spec_id {
+            superseded += 1;
+            continue;
+        }
+
         let small_files = partition.small_file_count(threshold);
         let small_ratio = partition.small_file_ratio(threshold);
         let delete_ratio = partition.delete_ratio();
@@ -112,6 +200,16 @@ fn plan_compaction(health: &TableHealth, policy: &EffectivePolicy) -> Option<Ope
         triggered.push((partition, output_files, reason));
     }
 
+    if superseded > 0 {
+        notes.push(format!(
+            "{superseded} partitions are under a superseded partition spec \
+             (current is {}) and are never rewritten: output goes out under the current \
+             spec, and a commit claiming it replaces files partitioned differently would \
+             mis-file every row in it",
+            health.current_spec_id,
+        ));
+    }
+
     if triggered.is_empty() {
         return None;
     }
@@ -145,13 +243,25 @@ fn plan_compaction(health: &TableHealth, policy: &EffectivePolicy) -> Option<Ope
             output_files,
             snapshots_removed: 0,
         },
-        executability: Executability::Executable,
     })
 }
 
-fn plan_manifest_rewrite(health: &TableHealth, policy: &EffectivePolicy) -> Option<Operation> {
+fn plan_manifest_rewrite(
+    health: &TableHealth,
+    policy: &EffectivePolicy,
+    notes: &mut Vec<String>,
+) -> Option<Operation> {
     let settings = &policy.manifests;
     if !settings.rewrite.value {
+        return None;
+    }
+
+    // Re-packing entries produces a snapshot like any other, so the same format
+    // limit applies — see `plan_compaction`.
+    if let Some(reason) = crate::commit::authoring_refusal(health.format_version) {
+        notes.push(format!(
+            "manifest rewriting is enabled but cannot run: {reason}"
+        ));
         return None;
     }
 
@@ -178,15 +288,10 @@ fn plan_manifest_rewrite(health: &TableHealth, policy: &EffectivePolicy) -> Opti
             output_files,
             snapshots_removed: 0,
         },
-        executability: Executability::Executable,
     })
 }
 
-fn plan_expiration(
-    health: &TableHealth,
-    policy: &EffectivePolicy,
-    _now: DateTime<Utc>,
-) -> Option<Operation> {
+fn plan_expiration(health: &TableHealth, policy: &EffectivePolicy) -> Option<Operation> {
     let settings = &policy.snapshots;
     if !settings.enabled.value {
         return None;
@@ -230,20 +335,38 @@ fn plan_expiration(
             // and a shared ancestor reachable from a retained branch survives.
             snapshots_removed: expirable,
         },
-        executability: Executability::Executable,
     })
 }
 
-fn plan_orphan_removal(health: &TableHealth, policy: &EffectivePolicy) -> Option<Operation> {
+fn plan_orphan_removal(
+    health: &TableHealth,
+    policy: &EffectivePolicy,
+    context: PlanContext,
+    now: DateTime<Utc>,
+) -> Option<Operation> {
     let settings = &policy.orphans;
     if !settings.enabled.value {
         return None;
     }
 
-    // The scanner has to list object storage to know whether there are any
-    // orphans, and listing is the expensive part of the operation — so the plan
-    // cannot estimate what it will find. It says what it will *do*, which is
-    // the honest thing a plan can promise here.
+    // The one operation that is scheduled rather than triggered. Every other
+    // operation decides from metadata Bergman has already read; this one cannot
+    // know whether a table has orphans without listing its whole location, and
+    // that listing *is* the cost. Running it on every cycle would make a
+    // five-minute cadence mean a full object-store listing of every table every
+    // five minutes — real money on S3, and it finds nothing almost every time.
+    if let Some(last) = context.last_orphan_scan {
+        let elapsed = now.signed_duration_since(last);
+        let interval = chrono::Duration::from_std(settings.min_interval.value)
+            .unwrap_or_else(|_| chrono::Duration::days(1));
+        if elapsed < interval {
+            return None;
+        }
+    }
+
+    // Listing is the expensive part, so the plan cannot estimate what it will
+    // find. It says what it will *do*, which is the honest thing a plan can
+    // promise here.
     let action = match settings.mode.value {
         OrphanMode::DryRun => "report",
         OrphanMode::Delete => "delete",
@@ -258,25 +381,23 @@ fn plan_orphan_removal(health: &TableHealth, policy: &EffectivePolicy) -> Option
             human_duration(settings.older_than.value),
         ),
         estimate: Estimate::default(),
-        executability: Executability::Executable,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::time::Duration;
 
     use super::*;
     use crate::health::{
         FileHealth, ManifestHealth, PartitionHealth, PartitionKey, SnapshotHealth,
     };
-    use crate::policy::{Config, Decision, Policy, TableRef};
+    use crate::policy::{Config, Decision, Policy, TableFacts, TableRef};
 
     fn effective(toml: &str) -> EffectivePolicy {
         let config = Config::from_toml(toml).unwrap();
         let policy = Policy::compile(&config).unwrap();
-        match policy.decide(&TableRef::new("prod", ["db"], "t"), &HashMap::new()) {
+        match policy.decide(&TableRef::new("prod", ["db"], "t"), &TableFacts::unknown()) {
             Decision::Maintain(e) => *e,
             other => panic!("expected Maintain, got {other:?}"),
         }
@@ -295,8 +416,10 @@ mod tests {
 
         TableHealth {
             table: TableRef::new("prod", ["db"], "t"),
-            format_version: 2,
+            format_version: iceberg::spec::FormatVersion::V2,
+            write_format: None,
             location: "s3://bucket/wh/db/t".into(),
+            current_spec_id: 0,
             snapshots,
             manifests: ManifestHealth::default(),
             files,
@@ -351,7 +474,15 @@ mod tests {
             vec![partition("d=1", &[1000, 1000, 1000, 1000], 100, 0, 0)],
             snapshots(1, Duration::from_secs(60)),
         );
-        assert!(plan_table(&health, &effective(COMPACT_ON), Utc::now()).is_none());
+        assert!(
+            plan_table(
+                &health,
+                &effective(COMPACT_ON),
+                PlanContext::default(),
+                Utc::now()
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -360,7 +491,13 @@ mod tests {
             vec![partition("d=1", &[10, 10, 10, 10, 10, 10], 100, 0, 0)],
             snapshots(1, Duration::from_secs(60)),
         );
-        let plan = plan_table(&health, &effective(COMPACT_ON), Utc::now()).unwrap();
+        let plan = plan_table(
+            &health,
+            &effective(COMPACT_ON),
+            PlanContext::default(),
+            Utc::now(),
+        )
+        .unwrap();
         let op = &plan.operations[0];
 
         assert_eq!(op.kind, OperationKind::Compact);
@@ -381,7 +518,15 @@ mod tests {
             vec![partition("d=1", &[10, 10, 10, 10], 100, 0, 0)],
             snapshots(1, Duration::from_secs(60)),
         );
-        assert!(plan_table(&health, &effective(COMPACT_ON), Utc::now()).is_none());
+        assert!(
+            plan_table(
+                &health,
+                &effective(COMPACT_ON),
+                PlanContext::default(),
+                Utc::now()
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -393,7 +538,13 @@ mod tests {
             vec![partition("d=1", &[1000, 1000, 1000], 1000, 500, 12)],
             snapshots(1, Duration::from_secs(60)),
         );
-        let plan = plan_table(&health, &effective(COMPACT_ON), Utc::now()).unwrap();
+        let plan = plan_table(
+            &health,
+            &effective(COMPACT_ON),
+            PlanContext::default(),
+            Utc::now(),
+        )
+        .unwrap();
         let op = &plan.operations[0];
 
         assert_eq!(op.kind, OperationKind::Compact);
@@ -410,13 +561,15 @@ mod tests {
             vec![partition("d=1", &[10; 10], 100, 0, 0)],
             snapshots(1, Duration::from_secs(60)),
         );
-        let plan = plan_table(&health, &effective(COMPACT_ON), Utc::now()).unwrap();
-
-        assert_eq!(plan.executable().count(), 1);
-        assert_eq!(plan.blocked().count(), 0);
+        let plan = plan_table(
+            &health,
+            &effective(COMPACT_ON),
+            PlanContext::default(),
+            Utc::now(),
+        )
+        .unwrap();
 
         let op = &plan.operations[0];
-        assert_eq!(op.executability, Executability::Executable);
         assert_eq!(
             op.targets
                 .iter()
@@ -445,7 +598,7 @@ mod tests {
             vec![partition("d=1", &[1000], 100, 0, 0)],
             snapshots(10, Duration::from_secs(30 * 86400)),
         );
-        let plan = plan_table(&health, &policy, Utc::now()).unwrap();
+        let plan = plan_table(&health, &policy, PlanContext::default(), Utc::now()).unwrap();
         assert!(plan.operations.iter().all(|op| op.targets.is_empty()));
     }
 
@@ -464,11 +617,10 @@ mod tests {
             vec![partition("d=1", &[1000], 100, 0, 0)],
             snapshots(10, Duration::from_secs(30 * 86400)),
         );
-        let plan = plan_table(&health, &policy, Utc::now()).unwrap();
+        let plan = plan_table(&health, &policy, PlanContext::default(), Utc::now()).unwrap();
         let op = &plan.operations[0];
 
         assert_eq!(op.kind, OperationKind::ExpireSnapshots);
-        assert!(op.is_executable());
         assert_eq!(op.estimate.snapshots_removed, 8);
         assert!(op.reason.contains("30d old"), "got: {}", op.reason);
     }
@@ -489,7 +641,7 @@ mod tests {
             vec![partition("d=1", &[1000], 100, 0, 0)],
             snapshots(2, Duration::from_secs(30 * 86400)),
         );
-        assert!(plan_table(&health, &policy, Utc::now()).is_none());
+        assert!(plan_table(&health, &policy, PlanContext::default(), Utc::now()).is_none());
     }
 
     #[test]
@@ -512,7 +664,7 @@ mod tests {
             vec![partition("d=1", &[10; 10], 100, 0, 0)],
             snapshots(10, Duration::from_secs(30 * 86400)),
         );
-        let plan = plan_table(&health, &policy, Utc::now()).unwrap();
+        let plan = plan_table(&health, &policy, PlanContext::default(), Utc::now()).unwrap();
 
         let kinds: Vec<_> = plan.operations.iter().map(|op| op.kind).collect();
         assert_eq!(
@@ -523,5 +675,264 @@ mod tests {
                 OperationKind::RemoveOrphans,
             ]
         );
+    }
+
+    #[test]
+    fn a_partition_still_being_written_is_not_compacted() {
+        // The guard against fighting the streaming writer for the hot
+        // partition. A rewrite of it loses its compare-and-swap to the very
+        // next micro-batch, having already spent a full read and write of the
+        // data — repeatedly, every cycle.
+        let now = Utc::now();
+        let mut hot = partition("d=1", &[10; 10], 100, 0, 0);
+        hot.newest_file_ms = Some(now.timestamp_millis() - 60_000);
+
+        let health = health_with(vec![hot], snapshots(1, Duration::from_secs(60)));
+        assert!(plan_table(&health, &effective(COMPACT_ON), PlanContext::default(), now).is_none());
+    }
+
+    #[test]
+    fn a_partition_that_has_settled_is_compacted() {
+        // The other side of the same rule: waiting forever would be no better
+        // than never waiting.
+        let now = Utc::now();
+        let mut cold = partition("d=1", &[10; 10], 100, 0, 0);
+        cold.newest_file_ms = Some(now.timestamp_millis() - 7_200_000);
+
+        let health = health_with(vec![cold], snapshots(1, Duration::from_secs(60)));
+        let plan =
+            plan_table(&health, &effective(COMPACT_ON), PlanContext::default(), now).unwrap();
+        assert_eq!(plan.operations[0].kind, OperationKind::Compact);
+    }
+
+    #[test]
+    fn a_partition_under_a_superseded_spec_is_not_compacted() {
+        // Output is written under the table's current spec. A commit claiming
+        // it replaces files partitioned by an older one mis-files every row in
+        // it, so the plan must not promise the rewrite either.
+        let mut old = partition("d=1", &[10; 10], 100, 0, 0);
+        old.key.spec_id = 0;
+
+        let mut health = health_with(vec![old], snapshots(1, Duration::from_secs(60)));
+        health.current_spec_id = 1;
+
+        let plan = plan_table(
+            &health,
+            &effective(COMPACT_ON),
+            PlanContext::default(),
+            Utc::now(),
+        )
+        .expect("a partition that can never be rewritten is not silence");
+
+        assert!(!plan.has_work(), "nothing may be planned for it");
+        // ...but the operator has to learn why, or a fragmented partition reads
+        // as a healthy one forever.
+        assert_eq!(plan.notes.len(), 1);
+        assert!(
+            plan.notes[0].contains("superseded partition spec"),
+            "got: {}",
+            plan.notes[0]
+        );
+    }
+
+    #[test]
+    fn a_non_parquet_table_says_why_compaction_will_never_run() {
+        // Bergman reads Parquet, Avro and ORC but writes only Parquet, so a
+        // rewrite of an ORC table would silently change its format. The
+        // executor refuses it; planning it anyway would report that refusal
+        // every cycle forever, and planning nothing silently would look exactly
+        // like a healthy table.
+        let mut health = health_with(
+            vec![partition("d=1", &[10; 10], 100, 0, 0)],
+            snapshots(1, Duration::from_secs(60)),
+        );
+        health.write_format = Some("orc".into());
+
+        let plan = plan_table(
+            &health,
+            &effective(COMPACT_ON),
+            PlanContext::default(),
+            Utc::now(),
+        )
+        .expect("a table whose policy cannot apply is not silence");
+
+        assert!(!plan.has_work());
+        assert!(plan.notes[0].contains("orc"), "got: {}", plan.notes[0]);
+    }
+
+    #[test]
+    fn a_parquet_table_is_compacted_normally() {
+        // The other direction: an explicit `write.format.default = "parquet"`
+        // must not be mistaken for a refusal.
+        let mut health = health_with(
+            vec![partition("d=1", &[10; 10], 100, 0, 0)],
+            snapshots(1, Duration::from_secs(60)),
+        );
+        health.write_format = Some("parquet".into());
+
+        let plan = plan_table(
+            &health,
+            &effective(COMPACT_ON),
+            PlanContext::default(),
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(plan.operations[0].kind, OperationKind::Compact);
+        assert!(plan.notes.is_empty());
+    }
+
+    #[test]
+    fn a_v3_table_says_why_compaction_will_never_run() {
+        // Bergman cannot author a v3 snapshot without destroying row lineage,
+        // and `TableMetadataBuilder` rejects one that tries. Planning the
+        // rewrite anyway would report a refusal every cycle forever; planning
+        // nothing and saying nothing would look exactly like a healthy table.
+        let mut health = health_with(
+            vec![partition("d=1", &[10; 10], 100, 0, 0)],
+            snapshots(1, Duration::from_secs(60)),
+        );
+        health.format_version = iceberg::spec::FormatVersion::V3;
+
+        let plan = plan_table(
+            &health,
+            &effective(COMPACT_ON),
+            PlanContext::default(),
+            Utc::now(),
+        )
+        .expect("a table whose policy cannot apply is not silence");
+
+        assert!(!plan.has_work());
+        assert!(
+            plan.notes[0].contains("format v3"),
+            "got: {}",
+            plan.notes[0]
+        );
+    }
+
+    #[test]
+    fn a_v3_table_still_gets_its_snapshots_expired() {
+        // The refusal is scoped to what Bergman authors itself. Expiration is
+        // upstream's own action and orphan removal commits nothing, so both
+        // remain available — refusing the whole table would leave every v3
+        // table's history growing without bound.
+        let policy = effective(
+            r#"
+            [[rules]]
+            match = "prod.db.t"
+            [rules.compaction]
+            enabled = true
+            [rules.snapshots]
+            max_age = "7d"
+            min_to_keep = 1
+            "#,
+        );
+        let mut health = health_with(
+            vec![partition("d=1", &[10; 10], 100, 0, 0)],
+            snapshots(10, Duration::from_secs(30 * 86400)),
+        );
+        health.format_version = iceberg::spec::FormatVersion::V3;
+
+        let plan = plan_table(&health, &policy, PlanContext::default(), Utc::now()).unwrap();
+        assert_eq!(
+            plan.operations.iter().map(|op| op.kind).collect::<Vec<_>>(),
+            vec![OperationKind::ExpireSnapshots]
+        );
+        assert_eq!(plan.notes.len(), 1);
+    }
+
+    #[test]
+    fn an_empty_table_is_still_scanned_for_orphans() {
+        // A first write that died between staging its data and committing left
+        // files under the table location that nothing references and nothing
+        // else will ever reclaim. Skipping the table because it has no
+        // snapshots leaks them forever.
+        let policy = effective(
+            r#"
+            [[rules]]
+            match = "prod.db.t"
+            [rules.orphans]
+            enabled = true
+            "#,
+        );
+        let mut health = health_with(vec![], snapshots(0, Duration::from_secs(0)));
+        health.snapshots.current_snapshot_id = None;
+        assert!(health.is_empty());
+
+        let plan = plan_table(&health, &policy, PlanContext::default(), Utc::now()).unwrap();
+        assert_eq!(
+            plan.operations.iter().map(|op| op.kind).collect::<Vec<_>>(),
+            vec![OperationKind::RemoveOrphans]
+        );
+    }
+
+    #[test]
+    fn an_empty_table_with_no_orphan_rule_is_left_alone() {
+        let mut health = health_with(vec![], snapshots(0, Duration::from_secs(0)));
+        health.snapshots.current_snapshot_id = None;
+        assert!(
+            plan_table(
+                &health,
+                &effective(COMPACT_ON),
+                PlanContext::default(),
+                Utc::now()
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn orphan_scanning_is_not_repeated_inside_its_interval() {
+        // The one operation that cannot be triggered from metadata: knowing
+        // whether a table has orphans means listing its whole location, and
+        // that listing is the cost. On a five-minute cadence, running it every
+        // cycle would list every table every five minutes and find nothing
+        // almost every time.
+        let policy = effective(
+            r#"
+            [[rules]]
+            match = "prod.db.t"
+            [rules.orphans]
+            enabled = true
+            min_interval = "24h"
+            "#,
+        );
+        let health = health_with(
+            vec![partition("d=1", &[1000], 100, 0, 0)],
+            snapshots(1, Duration::from_secs(60)),
+        );
+        let now = Utc::now();
+
+        let recent = PlanContext {
+            last_orphan_scan: Some(now - chrono::Duration::hours(1)),
+        };
+        assert!(plan_table(&health, &policy, recent, now).is_none());
+
+        let stale = PlanContext {
+            last_orphan_scan: Some(now - chrono::Duration::hours(48)),
+        };
+        let plan = plan_table(&health, &policy, stale, now).unwrap();
+        assert_eq!(plan.operations[0].kind, OperationKind::RemoveOrphans);
+    }
+
+    #[test]
+    fn a_process_that_has_never_scanned_scans() {
+        // A one-shot `bergman run` *is* the schedule — the cron entry that
+        // invoked it already decided the cadence — so it must not skip the scan
+        // for want of a memory it could never have.
+        let policy = effective(
+            r#"
+            [[rules]]
+            match = "prod.db.t"
+            [rules.orphans]
+            enabled = true
+            "#,
+        );
+        let health = health_with(
+            vec![partition("d=1", &[1000], 100, 0, 0)],
+            snapshots(1, Duration::from_secs(60)),
+        );
+
+        let plan = plan_table(&health, &policy, PlanContext::default(), Utc::now()).unwrap();
+        assert_eq!(plan.operations[0].kind, OperationKind::RemoveOrphans);
     }
 }

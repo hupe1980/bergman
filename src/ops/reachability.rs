@@ -159,6 +159,16 @@ pub async fn compute(table_ref: &TableRef, table: &Table) -> Result<ReachableSet
         reachable.metadata_json.insert(normalize(current));
     }
 
+    // The pointer a Hadoop-layout table uses to find its current metadata. A
+    // REST catalog keeps the pointer itself and never writes this file, but a
+    // table that was migrated from a Hadoop catalog still has one — and it
+    // matches nothing in the metadata, so a scanner would see it as garbage and
+    // delete the only thing that says which `metadata.json` is current.
+    reachable.metadata_json.insert(normalize(&format!(
+        "{}/metadata/version-hint.text",
+        metadata.location().trim_end_matches('/')
+    )));
+
     let snapshots: Vec<_> = metadata.snapshots().cloned().collect();
 
     let per_snapshot: Vec<ReachableSet> = stream::iter(snapshots)

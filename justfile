@@ -57,7 +57,7 @@ coverage:
 # ============================================================================
 
 # Everything CI checks, in the order CI checks it
-ci: lint check-all test docs
+ci: lint check-all test docs site
 
 lint:
     cargo fmt --all -- --check
@@ -75,7 +75,7 @@ fmt:
 check-all:
     cargo check --no-default-features
     cargo check --all-features
-    @for feature in cli catalog-rest storage-s3 storage-gcs storage-azure metrics; do \
+    @for feature in cli catalog-rest compaction storage-s3 storage-gcs storage-azure metrics; do \
         echo "--- checking feature: $feature (alone) ---"; \
         cargo check --no-default-features --features "$feature" || exit 1; \
     done
@@ -88,7 +88,17 @@ docs:
 docs-open:
     cargo doc --all-features --no-deps --open
 
-# Advisories, licences, bans, sources (requires cargo-deny)
+# The documentation site's internal links (requires zola).
+#
+# External links are skipped: a third-party site being down is not a reason to
+# fail a local check.
+site:
+    zola --root site check --skip-external-links
+
+# Advisories, licences, bans, sources (requires cargo-deny).
+#
+# Every ignored advisory in `deny.toml` carries a written reason — an ignore
+# with no argument is a suppressed alarm.
 deny:
     cargo deny check
 

@@ -29,10 +29,14 @@ RUN mkdir -p src \
 COPY src ./src
 COPY README.md ./
 
+# Default features plus `metrics`, which the daemon's `/metrics`, `/health` and
+# `/events` endpoints need. Spelled as an addition rather than as a full feature
+# list, so it cannot drift from whatever `default` becomes.
+#
 # `touch` because cargo decides staleness by mtime, and the files copied above
 # can be older than the stub build that just ran.
 RUN touch src/main.rs src/lib.rs \
-    && cargo build --release --locked --features cli,catalog-rest,storage-all,metrics \
+    && cargo build --release --locked --features metrics \
     && strip target/release/bergman
 
 # ---------------------------------------------------------------------------

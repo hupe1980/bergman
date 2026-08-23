@@ -32,6 +32,11 @@ warehouse = "s3://lake/warehouse"
 # The *name* of the environment variable holding the bearer token. Never the
 # token: a credential in a config file is a credential in version control.
 # token_env = "BERGMAN_CATALOG_TOKEN"
+#
+# For OAuth2 instead, set `credential` in [catalogs.properties] below. Bergman
+# reads the same auth properties the Iceberg REST client does, so one
+# configuration authenticates both the read path and the commit path — and it
+# renews the token before it expires, which matters for a long-lived daemon.
 
 # Restrict discovery to these namespaces instead of walking the whole catalog.
 # Nested namespaces are dotted, as in rule patterns. On a large catalog this
@@ -51,6 +56,12 @@ warehouse = "s3://lake/warehouse"
 # there is no alternative:
 # "s3.access-key-id"     = "..."
 # "s3.secret-access-key" = "..."
+#
+# OAuth2 client credentials, as every Iceberg client spells them. The token
+# endpoint defaults to `{uri}/v1/oauth/tokens` and the scope to `catalog`.
+# "credential"        = "svc-bergman:${SECRET}"
+# "oauth2-server-uri" = "https://idp.example.com/oauth/token"
+# "scope"             = "catalog"
 
 # ---------------------------------------------------------------------------
 # Defaults — layered under every rule that does not override them
@@ -84,6 +95,15 @@ mode = "dry-run"
 # than garbage.
 older_than = "7d"
 
+# The shortest gap between two scans of one table. This is the only operation
+# that is *scheduled* rather than triggered: every other one decides from
+# metadata Bergman has already read, while this one cannot know whether a table
+# has orphans without listing its whole location — and that listing is the cost.
+#
+# Applies within one process. A one-shot `bergman run` always scans, because the
+# cron entry that invoked it already decided the cadence.
+min_interval = "24h"
+
 [defaults.compaction]
 # Compaction rewrites data, so it never arrives by accident.
 #
@@ -96,10 +116,23 @@ older_than = "7d"
 # target_file_size = 536870912
 
 
-# How much memory one partition's sort may use. Sorting needs the whole file
-# group in hand and Bergman does not spill, so a larger partition is refused
-# with a named reason rather than written unsorted.
+# The executor's memory pool for one file group.
+#
+# A real budget rather than an estimate: the two operators that can want more
+# than a batch at a time — the global sort, and the hash anti-join that applies
+# equality deletes — spill to disk when they reach it rather than failing.
 # max_sort_memory = 1073741824   # 1 GiB
+
+# A partition is not a unit of work. Its eligible files are bin-packed into
+# groups bounded by these two, and each group commits on its own — so one lost
+# commit costs one group rather than a whole partition, and a partition larger
+# than memory is still compactable.
+#
+# The equivalent of Spark's `max-file-group-size-bytes`, sized for one process
+# rather than a cluster.
+# max_group_bytes  = 8589934592   # 8 GiB
+# max_input_files  = 10000
+
 
 [defaults.compaction.trigger]
 # Compaction is *triggered*, not scheduled: a table already at target size
@@ -121,6 +154,14 @@ delete_ratio = 0.1
 
 # What counts as "small", as a fraction of the target file size.
 min_file_size_ratio = 0.75
+
+# Leave a partition alone until its newest file is this old.
+#
+# The guard against fighting the writer for the hot partition. A streaming
+# target commits to one partition continuously, and a rewrite of that partition
+# loses its compare-and-swap to the very next micro-batch — having already spent
+# a full read and write of the data. Waiting is strictly cheaper than competing.
+min_file_age = "1h"
 
 [defaults.manifests]
 # Pure metadata: the same manifest entries re-packed into fewer, larger files.
@@ -155,13 +196,26 @@ schedule = "0 */2 * * *"
 
 [rules.compaction]
 enabled = true
-# Rows are sorted globally within each partition, so output files carry tight
+# Rows are sorted globally within each file group, so output files carry tight
 # min/max bounds and a query filtering on these columns can skip whole files.
-# This needs the partition in memory; see `max_sort_memory` above.
+# The sort spills at `max_sort_memory`, so a large group is sorted rather than
+# refused.
+#
+# Only needed for a table that declares no sort order of its own: where the
+# table has one, Bergman honours it — direction and null placement included —
+# without being asked, because a rewrite that bin-packed a sorted table back
+# together unsorted would destroy a layout its owner configured. A rule
+# overrides the table; this one does.
+#
+# Direction is deliberately not expressible here. It belongs on the table's
+# `sort-order`, where every other Iceberg tool reads it.
 sort = ["event_date", "customer_id"]
 
 [rules.compaction.trigger]
 delete_ratio = 0.05
+# A busy streamer needs a longer settle time than the default, or every cycle
+# picks the partition it is actively writing.
+min_file_age = "2h"
 
 # Scratch tables: excluded on purpose. An explicit exclusion is reported as
 # "skipped", where a table no rule matches is reported as "unmatched" — so a
@@ -180,9 +234,22 @@ max_parallel_tables = 4
 
 # Ceiling on bytes read by rewrites in one cycle. When the budget cannot cover
 # everything, tables are ordered most-fragmented-first and the remainder is
-# reported as deferred — never silently dropped. Metadata-only work is never
-# charged against it, so a rewrite ceiling cannot block snapshot expiration.
+# reported as deferred — never silently dropped.
+#
+# Charged per *operation*, not per table: metadata-only work reads no data files
+# and costs the budget nothing, so a rewrite ceiling cannot block snapshot
+# expiration — not even on the table whose compaction exhausted it.
 # max_rewrite_bytes_per_run = 536870912000   # 500 GiB
+
+# Never delete more than this many files in one operation. A ceiling on the
+# blast radius if reasoning about what is dead is ever wrong: the difference
+# between losing a thousand files and losing a million.
+#
+# It lives here rather than under [orphans] because it applies to *every*
+# deletion Bergman performs — orphan removal and snapshot-expiration cleanup
+# alike, which share one deleter and therefore one safety model. Nothing is lost
+# by hitting it: what is withheld is reported and reclaimed by the next pass.
+max_deletes_per_run = 100000
 
 # Only begin work inside this window. A cycle already under way runs to
 # completion — stopping mid-rewrite would leave files written and uncommitted.

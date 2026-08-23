@@ -7,7 +7,7 @@
 
 mod common;
 
-use bergman::obs::{NoopObserver, OperationContext};
+use bergman::obs::OperationContext;
 use bergman::ops::orphans;
 use bergman::ops::store::{InMemoryStore, ObjectStore};
 use bergman::plan::{OperationKind, OperationResult};
@@ -73,12 +73,12 @@ async fn scan(
     let table = fixture.table();
     let table_ref = TableRef::new("prod", ["db"], "events");
 
-    orphans::run(
+    let loader = fixture.loader();
+    let env = common::op_env(
         &table,
-        &fixture.loader(),
-        store,
-        settings,
-        &NoopObserver,
+        &fixture.ident,
+        &loader,
+        fixture.committer.as_ref(),
         OperationContext {
             run_id: "test",
             table: &table_ref,
@@ -86,9 +86,9 @@ async fn scan(
             matched_rule: "prod.db.events",
             reason: "test",
         },
-        Utc::now(),
-    )
-    .await
+    );
+
+    orphans::run(&env, store, settings, &[]).await
 }
 
 async fn seeded() -> TestTable {
@@ -283,4 +283,118 @@ async fn nothing_happens_when_the_scanner_is_disabled() {
         "#,
     );
     assert!(!settings.enabled.value);
+}
+
+#[tokio::test]
+async fn a_table_living_inside_this_one_is_detected_from_the_listing_alone() {
+    // Check 5, and the half of it that has to hold. A nested table's live files
+    // are inside this location and unreachable from this table's metadata,
+    // which is the definition of an orphan and exactly wrong; containment
+    // cannot catch it.
+    //
+    // The sibling list is empty here, as it is for the table most likely to be
+    // nested: one no rule matches, or one a rule skips. The scan must still
+    // refuse.
+    let fixture = seeded().await;
+    let store = store_for(&fixture, &[]).await;
+
+    let old = Utc::now() - Duration::days(30);
+    let nested = format!("{}/sub", fixture.location());
+    store.insert(
+        &format!("{nested}/metadata/00000-abc.metadata.json"),
+        512,
+        Some(old),
+    );
+    store.insert(&format!("{nested}/data/live.parquet"), 4096, Some(old));
+
+    let err = scan(&fixture, &store, &orphan_policy(DELETING))
+        .await
+        .expect_err("a scan that would eat a nested table must be refused");
+
+    assert!(err.to_string().contains("/sub"), "got: {err}");
+    assert!(err.to_string().contains("lives inside"), "got: {err}");
+
+    // And nothing was deleted on the way to that conclusion.
+    assert!(
+        store.paths().iter().any(|p| p.contains("/sub/data/")),
+        "the nested table's data was deleted"
+    );
+}
+
+#[tokio::test]
+async fn this_tables_own_metadata_does_not_look_like_a_nested_table() {
+    // The document that proves a nested table is the same shape as the one
+    // every table has; what tells them apart is depth. Getting that backwards
+    // would refuse every table there is.
+    let fixture = seeded().await;
+    let store = store_for(&fixture, &[]).await;
+    store.insert(
+        &format!("{}/metadata/00000-abc.metadata.json", fixture.location()),
+        512,
+        Some(Utc::now() - Duration::days(30)),
+    );
+
+    let result = scan(&fixture, &store, &orphan_policy(DRY_RUN))
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, OperationResult::NoOp { .. }),
+        "got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_blast_radius_ceiling_leaves_the_rest_for_the_next_scan() {
+    // However wrong everything upstream of this turns out to be, one scan
+    // deletes at most `limits.max_deletes_per_run` — and says so. Silence here
+    // would report "everything deleted" while leaving most of the garbage in
+    // place, and would hide that something produced far more orphans than a
+    // healthy table ever does.
+    let fixture = seeded().await;
+    let store = store_for(&fixture, &[]).await;
+
+    let old = Utc::now() - Duration::days(30);
+    for i in 0..10 {
+        store.insert(
+            &format!("{}/data/orphan-{i}.parquet", fixture.location()),
+            1024,
+            Some(old),
+        );
+    }
+
+    let table = fixture.table();
+    let table_ref = TableRef::new("prod", ["db"], "events");
+    let loader = fixture.loader();
+    let mut env = common::op_env(
+        &table,
+        &fixture.ident,
+        &loader,
+        fixture.committer.as_ref(),
+        OperationContext {
+            run_id: "test",
+            table: &table_ref,
+            kind: OperationKind::RemoveOrphans,
+            matched_rule: "prod.db.events",
+            reason: "test",
+        },
+    );
+    env.max_deletes_per_run = 4;
+
+    let result = orphans::run(&env, &store, &orphan_policy(DELETING), &[])
+        .await
+        .unwrap();
+
+    let detail = match &result {
+        OperationResult::Succeeded { detail } => detail.clone(),
+        other => panic!("expected success, got {other:?}"),
+    };
+    assert!(detail.contains("4 orphans deleted"), "got: {detail}");
+    assert!(detail.contains("6 left for the next scan"), "got: {detail}");
+
+    let left = store
+        .paths()
+        .iter()
+        .filter(|p| p.contains("orphan-"))
+        .count();
+    assert_eq!(left, 6, "the ceiling must withhold rather than delete");
 }

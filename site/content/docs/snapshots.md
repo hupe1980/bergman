@@ -87,12 +87,32 @@ deleted, and a file that will not delete is reported as a leak rather than
 failing the operation — the metadata commit has already succeeded, so the table
 is correct either way.
 
+### One deleter, one safety model
+
+Expiration and [orphan removal](@/docs/orphans.md) decide *what* to delete by
+completely different reasoning, but once a path is on a kill list they share one
+deletion path:
+
+1. apply `limits.max_deletes_per_run`, the blast-radius ceiling
+2. write the audit record naming exactly what will go
+3. delete, with bounded concurrency
+
+Two implementations of that would drift, and the half that drifted would be the
+half nobody was looking at.
+
+Nothing is lost to the ceiling here: the files it withholds are unreferenced by
+every retained snapshot, which is exactly what the orphan scanner reclaims.
+
+```text
+  [ok] expire-snapshots: 58 snapshots expired, 100000 files deleted
+       (12043 left for the orphan scanner by the per-run ceiling of 100000)
+```
+
 ## Or leave it to the scanner
 
 With `delete_files = false` (the default), expiration is pure metadata and the
 [orphan scanner](@/docs/orphans.md) reclaims the files later, after its grace
-period. One deletion path, one safety model, at the cost of a few days' storage
-lag.
+period. The same deleter either way, at the cost of a few days' storage lag.
 
 Both routes share the same containment and path-normalization rules.
 
@@ -116,3 +136,17 @@ Old `metadata.json` files accumulate alongside snapshots. Iceberg's own
 most catalogs — including [Rustberg](@/docs/rustberg.md) and Lakekeeper — enforce
 it server-side. Bergman treats every `metadata.json` the metadata log still names
 as reachable, so it never deletes one the table still refers to.
+
+Expiration's cleanup deliberately never deletes one either, even when it falls
+out of the log mid-operation. Expiring snapshots does not drop metadata-log
+entries — `write.metadata.previous-versions-max` does, on the catalog's own
+schedule — so one that leaves the log leaves it *between* Bergman's before and
+after readings, and deleting on that basis would race the catalog for a file it
+still owns. The orphan scanner reclaims them, behind its grace period.
+
+## Format v3
+
+Expiration is unaffected by the [v3 limit](@/docs/compaction.md#format-v3): the
+selection and the commit are upstream's own action, not a snapshot Bergman
+authors. A v3 table's history stays bounded even though its data files are not
+rewritten.

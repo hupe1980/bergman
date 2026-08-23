@@ -20,7 +20,16 @@ use crate::error::{Error, Result};
 use crate::policy::TableRef;
 
 /// How to reach one catalog.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// [`Debug`] is implemented by hand and **redacts secret property values**.
+/// `properties` is deliberately an open map of Iceberg's own property names, and
+/// several of those names carry secrets — `credential`, `token`,
+/// `s3.secret-access-key`, `gcs.credentials-json`, `adls.sas-token`. The derived
+/// impl would put every one of them into any `{:?}`, and this type is reachable
+/// by `Debug` from [`crate::Config`] and [`crate::Bergman`], so one
+/// `tracing::debug!(?config)` in an embedder would write the warehouse's keys to
+/// its logs.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CatalogConfig {
     /// The name this catalog is known by, and the first segment of every
@@ -77,6 +86,55 @@ pub enum CatalogKind {
     /// The Iceberg REST Catalog protocol.
     #[default]
     Rest,
+}
+
+/// Whether a property name carries a secret value.
+///
+/// Deny-list rather than allow-list is the wrong default for a security check,
+/// so this is a *substring* rule over the words that mark a secret in Iceberg's
+/// property vocabulary — `secret`, `key`, `token`, `credential`, `password`,
+/// `sas`. It over-redacts (`s3.access-key-id` is an identifier, not a secret)
+/// and that is the correct direction to be wrong in: a redacted identifier
+/// costs an operator one lookup, a logged secret costs a rotation.
+fn is_secret_property(key: &str) -> bool {
+    const MARKERS: [&str; 6] = ["secret", "key", "token", "credential", "password", "sas"];
+    let key = key.to_ascii_lowercase();
+    MARKERS.iter().any(|marker| key.contains(marker))
+}
+
+impl std::fmt::Debug for CatalogConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Property *names* are shown and values are not, because "is my endpoint
+        // reaching the config" is a real question and "what is my secret" is
+        // never one a log should answer.
+        let properties: std::collections::BTreeMap<&str, &str> = self
+            .properties
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.as_str(),
+                    if is_secret_property(k) {
+                        "<redacted>"
+                    } else {
+                        v.as_str()
+                    },
+                )
+            })
+            .collect();
+
+        f.debug_struct("CatalogConfig")
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("uri", &self.uri)
+            .field("warehouse", &self.warehouse)
+            .field("storage", &self.storage)
+            // A variable name, never a value — that is the whole point of the
+            // field — so it is safe to show and useful to see.
+            .field("token_env", &self.token_env)
+            .field("namespaces", &self.namespaces)
+            .field("properties", &properties)
+            .finish()
+    }
 }
 
 impl CatalogConfig {
@@ -149,18 +207,19 @@ impl CatalogConfig {
                             self.name
                         ))
                     })?),
-                    // Some deployments put the token straight in `properties`,
-                    // which `iceberg-catalog-rest` also accepts. Reading it here
-                    // keeps both clients authenticating identically — one that
-                    // authenticated and one that did not would fail only on the
-                    // first commit, long after startup.
-                    None => self.properties.get("token").cloned(),
+                    None => None,
                 };
 
+                // The same properties the catalog client reads, so one
+                // configuration authenticates both. A commit path that
+                // authenticated differently would let reads succeed and every
+                // write return 401 — the tool would appear to work and quietly
+                // change nothing.
                 Ok(Arc::new(
                     crate::commit::RestCommitter::connect(
                         &self.uri,
                         self.warehouse.as_deref(),
+                        &self.properties,
                         token,
                     )
                     .await?,
@@ -253,6 +312,53 @@ mod tests {
             properties: HashMap::new(),
             token_env: None,
             namespaces: None,
+        }
+    }
+
+    #[test]
+    fn debug_output_redacts_secret_properties() {
+        // `properties` is an open map of Iceberg property names and several of
+        // them carry secrets. `CatalogConfig` is reachable by `Debug` from
+        // `Config` and `Bergman`, so a derived impl would write the warehouse's
+        // keys into any `tracing::debug!(?config)` an embedder happens to have.
+        let mut config = config("prod", Some("s3://b/wh"));
+        config.properties = HashMap::from([
+            ("s3.endpoint".to_string(), "https://minio:9000".to_string()),
+            ("s3.region".to_string(), "eu-central-1".to_string()),
+            ("s3.secret-access-key".to_string(), "hunter2".to_string()),
+            ("s3.session-token".to_string(), "ephemeral".to_string()),
+            ("credential".to_string(), "id:hunter3".to_string()),
+        ]);
+
+        let rendered = format!("{config:?}");
+        for secret in ["hunter2", "hunter3", "ephemeral"] {
+            assert!(!rendered.contains(secret), "leaked {secret}: {rendered}");
+        }
+        // Non-secret settings still show, because "is my endpoint reaching the
+        // config" is the question a debug line is usually being asked.
+        assert!(rendered.contains("https://minio:9000"), "{rendered}");
+        assert!(rendered.contains("eu-central-1"), "{rendered}");
+        // The names survive redaction: knowing a secret was *supplied* is the
+        // other half of debugging one that was not.
+        assert!(rendered.contains("s3.secret-access-key"), "{rendered}");
+    }
+
+    #[test]
+    fn every_secret_bearing_iceberg_property_is_recognised() {
+        for key in [
+            "credential",
+            "token",
+            "s3.secret-access-key",
+            "s3.session-token",
+            "gcs.credentials-json",
+            "gcs.oauth2.token",
+            "adls.auth.shared-key.account.key",
+            "adls.sas-token",
+        ] {
+            assert!(is_secret_property(key), "{key} is a secret");
+        }
+        for key in ["s3.endpoint", "s3.region", "gcs.project-id"] {
+            assert!(!is_secret_property(key), "{key} is not a secret");
         }
     }
 

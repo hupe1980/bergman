@@ -9,7 +9,42 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+
+# Every entry here is a transitive advisory Bergman cannot resolve by updating,
+# with the reason it is nonetheless acceptable *for this consumer*. An empty
+# justification is not allowed to appear in this list: an ignore with no
+# argument is a suppressed alarm.
+ignore = [
+    # quick-xml 0.39, two denial-of-service advisories: quadratic attribute-name
+    # checking, and unbounded namespace-declaration allocation. Both need
+    # attacker-controlled XML.
+    #
+    # Cannot be updated from here: `opendal-core` pins `^0.39` and the fixes
+    # landed in 0.40. The only XML Bergman parses through it is an object
+    # store's own list-objects response, over TLS with verification on and no
+    # global switch to turn that off — so reaching this needs a compromised
+    # storage provider or a broken TLS chain, at which point a slow list is not
+    # the problem anyone has. Revisit when opendal bumps.
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml DoS; only object-store list responses, behind verified TLS; pinned by opendal-core" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml DoS; same exposure and same pin" },
+
+    # `paste` is archived and unmaintained. It is a proc-macro used at build
+    # time by `parquet`, has no runtime presence and no vulnerability — the
+    # advisory is a maintenance signal, and the fix belongs upstream in arrow-rs.
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; build-time proc-macro pulled in by parquet, no vulnerability" },
+
+    # `rsa` 0.9, Marvin timing sidechannel. **No patched version exists** — this
+    # is the well-known unavoidable one in the Rust cloud-credential stack.
+    #
+    # It arrives via `reqsign`, which uses RSA to sign service-account
+    # assertions for GCS and Azure. Recovering a key needs an attacker who can
+    # drive many operations against it and measure their timing precisely; the
+    # only counterparty here is the cloud provider's own IAM endpoint, reached
+    # over verified TLS. A deployment using catalog-vended credentials
+    # (recommended, and the one Bergman is designed for) does not reach this
+    # code at all, and one using instance roles or IRSA does not either.
+    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin sidechannel; no fixed version; reached only via reqsign service-account signing for GCS/Azure" },
+]
 
 [licenses]
 version = 2
@@ -28,7 +63,14 @@ allow = [
     "Zlib",
     "CC0-1.0",
     "BSL-1.0",
-    "MPL-2.0",
+    # `webpki-root-certs`, via `rustls-platform-verifier`. A permissive data
+    # licence, and the crate it covers is a bundle of root certificates rather
+    # than code.
+    "CDLA-Permissive-2.0",
+    # `libbz2-rs-sys`, via `bzip2` ← `async-compression` ← `datafusion`. The
+    # bzip2 licence: BSD-style, permissive, and compatible with both of
+    # Bergman's.
+    "bzip2-1.0.6",
 ]
 confidence-threshold = 0.9
 

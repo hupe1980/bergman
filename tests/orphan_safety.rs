@@ -6,10 +6,24 @@
 
 use std::time::Duration;
 
+use bergman::ops::delete::FileDeleter;
 use bergman::ops::reachability::{is_inside, normalize};
-use bergman::ops::store::{InMemoryStore, ObjectStore};
+use bergman::ops::store::{InMemoryStore, ObjectMeta, ObjectStore};
 use bergman::policy::{Config, Decision, MIN_ORPHAN_AGE, OrphanMode, Policy, TableRef};
 use chrono::{Duration as ChronoDuration, Utc};
+
+/// Drain a listing, which is a stream so that a scan of a table with millions
+/// of objects never holds them all at once.
+async fn collect(store: &InMemoryStore, prefix: &str) -> Vec<ObjectMeta> {
+    use futures::TryStreamExt;
+    store
+        .list(prefix)
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap()
+}
 
 fn effective(toml: &str) -> bergman::policy::EffectivePolicy {
     let config = Config::from_toml(toml).unwrap();
@@ -85,7 +99,7 @@ async fn listing_does_not_cross_into_a_similarly_named_table() {
         None,
     );
 
-    let listed = store.list("s3://bucket/wh/db/events").await.unwrap();
+    let listed = collect(&store, "s3://bucket/wh/db/events").await;
     let paths: Vec<&str> = listed.iter().map(|o| o.path.as_str()).collect();
 
     assert_eq!(paths.len(), 2);
@@ -144,7 +158,7 @@ async fn files_with_no_modification_time_are_never_old_enough() {
     let store = InMemoryStore::new();
     store.insert("s3://bucket/wh/t/unknown-age.parquet", 1, None);
 
-    let objects = store.list("s3://bucket/wh/t").await.unwrap();
+    let objects = collect(&store, "s3://bucket/wh/t").await;
     assert_eq!(objects.len(), 1);
     assert!(objects[0].last_modified.is_none());
 }

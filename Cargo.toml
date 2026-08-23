@@ -23,7 +23,25 @@ rust-version = "1.94"
 #
 # Embedders take `default-features = false` and add only the backends they use;
 # the library core has no CLI, no catalog client and no cloud object store.
-default = ["cli", "catalog-rest", "storage-all"]
+default = ["cli", "catalog-rest", "compaction", "storage-all"]
+
+# Compaction: rewriting data files with their delete files applied.
+#
+# This is the one operation that reads and writes *data*, and it is the only
+# one that needs a query engine. The reason is equality deletes: applying them
+# is an anti-join, and upstream's reader does it by building one predicate term
+# per delete row and evaluating that tree against every record batch — work
+# proportional to `data rows × delete rows`. DataFusion does it as a hash
+# anti-join, which is proportional to their sum, and spills.
+#
+# The feature gates the *operation*, never a second implementation of it: a
+# build without it has no compaction rather than a slower compaction, so there
+# is only ever one executor to keep correct.
+#
+# Metadata-only maintenance — expiration, manifest rewriting, orphan removal —
+# needs none of this. An embedder that wants only those takes
+# `default-features = false` and carries no query engine at all.
+compaction = ["dep:datafusion"]
 
 # Command-line interface. Gates the binary (see `[[bin]]`), the terminal
 # rendering, and process-level concerns the library deliberately does not own:
@@ -101,7 +119,15 @@ opendal = { version = "0.57", default-features = false, features = [
 # so it needs its own HTTP client rather than reaching through a catalog client
 # that cannot express the commit. rustls only: a native-tls dependency would
 # make the static musl build stop being static.
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+#
+# `form` is for the OAuth2 client-credentials exchange, which the specification
+# defines as a form post — the same exchange `iceberg-catalog-rest` performs, so
+# that both clients authenticate from one configuration.
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
+    "json",
+    "form",
+] }
 
 # Arrow, for the sort stage of compaction: `lexsort_to_indices` plus `take`
 # over the concatenated batches of one file group. Version-matched to what
@@ -112,6 +138,19 @@ arrow = { version = "58", default-features = false }
 # iceberg writer does — but it must express the table's own compression codec,
 # and that vocabulary is parquet's. Version-matched to what iceberg 0.10 uses.
 parquet = "58"
+
+# The compaction executor (optional; see the `compaction` feature).
+#
+# Used for exactly one thing: the merge-on-read anti-join that applies equality
+# deletes, plus the spilling sort that clustering needs. Everything else in the
+# pipeline is still upstream's — `ArrowReader` for the scan (its positional
+# deletes become a Parquet `RowSelection`, so deleted rows are never decoded,
+# which beats a join) and `RollingFileWriter` for the output.
+#
+# DataFusion 54 resolves to the same arrow 58 that `iceberg` 0.10 pins, so
+# record batches pass between them with no conversion and the tree holds one
+# arrow. Its MSRV (1.88) is below the floor `iceberg` already imposes.
+datafusion = { version = "54", optional = true }
 
 # Serialization. Configuration is TOML, matching the sister project Rustberg;
 # audit records and `--format json` are JSON.

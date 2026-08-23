@@ -1,6 +1,6 @@
 +++
 title = "Orphan files"
-description = "The one operation that can destroy a healthy table, and the five independent checks standing in front of it."
+description = "The one operation that can destroy a healthy table, and the seven independent checks standing in front of it."
 weight = 7
 +++
 An orphan is a file under a table's location that no retained metadata
@@ -26,9 +26,9 @@ older_than = "7d"
 That is not ceremony: the default has to be the safe one, because an operator
 who forgets to say should get a list, not an incident.
 
-## The five checks
+## The seven checks
 
-Every candidate passes all five before it is deleted. Each exists because of a
+Every candidate passes all seven before it is deleted. Each exists because of a
 specific way this goes wrong.
 
 ### 1. Dry run by default
@@ -91,7 +91,49 @@ also normalizes spellings first, so all of these name the same object:
 A live file spelled differently from its metadata would otherwise look exactly
 like garbage.
 
-### 5. Re-verification before deleting
+### 5. No scanning a location another table lives inside
+
+A table at `s3://lake/wh/db` whose sibling sits at `s3://lake/wh/db/events` is a
+trap that containment cannot catch. Every one of that nested table's live files
+*is* inside this table's location, and *is* unreachable from this table's
+metadata — because it belongs to somebody else. That is precisely the definition
+of an orphan, and precisely wrong.
+
+Bergman refuses the scan and names the nested table:
+
+```
+remove-orphans refused on prod.db.warehouse: table "s3://lake/wh/db/events"
+lives inside this table's location "s3://lake/wh/db"; its live files would look
+like orphans here. Move one of the two, or exclude this table from orphan
+removal.
+```
+
+Refusing rather than quietly scanning around the nested table is deliberate: a
+warehouse laid out this way needs fixing, and working around it would leave the
+hazard in place for the next table added underneath.
+
+**This is checked two ways, and the second is the one that has to hold.**
+
+The first consults the locations of tables Bergman has examined. It is cheap and
+it can refuse before a single object is listed — but that ledger is structurally
+incomplete. A table no rule matches, one a rule `skip`s, one outside this
+cycle's `--table` scope, or one that failed to load is simply absent from it.
+And a deliberately-excluded table is *exactly* the one most likely to be sitting
+somewhere it should not be, so relying on the ledger alone would leave the
+nested table an operator was most careful about the least protected.
+
+The second reads the listing the scan is already walking. An Iceberg table's
+identity is a `metadata/….metadata.json` document at its root; this table's own
+live at `<location>/metadata/…`, so one found at
+`<location>/<anything>/metadata/…` belongs to a *different* table whose root is
+`<location>/<anything>`. No ledger, no prior examination, no extra I/O — and it
+holds for a table Bergman has never heard of.
+
+Note that this keys on the metadata document's own suffix, not on a directory
+name. A table's data may legitimately sit in a directory called `metadata`, and
+a name-based heuristic would trip over it.
+
+### 6. Re-verification before deleting
 
 Listing a large table takes long enough for a writer to commit, and any file that
 commit referenced is now live. So after listing and before deleting, Bergman
@@ -106,9 +148,50 @@ became reachable in between:
 A non-zero "spared" count is the check doing its job, and worth noticing — it
 means your tables are being written during maintenance windows.
 
+### 7. A ceiling on the blast radius
+
+However wrong everything above turns out to be, one scan deletes at most
+`limits.max_deletes_per_run` files — 100 000 by default — and says loudly that
+it withheld the rest:
+
+```text
+  [ok] remove-orphans: 100000 orphans deleted (312 GiB) from 6102000 objects,
+       48211 left for the next scan by the per-run ceiling of 100000
+```
+
+The difference between losing a thousand files and losing a million is the
+difference between an incident and a catastrophe. Hitting the ceiling is also
+information in its own right: a healthy table does not produce that many
+orphans, and a scan that quietly deleted them all would have hidden the fact.
+
+Deletions run with bounded concurrency. Deleting a million orphans one round
+trip at a time takes hours; a burst of ten thousand concurrent deletes is how a
+shared bucket starts throttling everybody.
+
+The ceiling lives under `[limits]` rather than under `[orphans]` because it
+governs **every** deletion Bergman performs. Orphan removal and
+[expiration's file cleanup](@/docs/snapshots.md) decide *what* to delete by completely
+different reasoning, but they share one deletion path: apply the ceiling, write
+the audit record, then delete with bounded concurrency. Two implementations of
+that would drift, and the half that drifted would be the half nobody was
+looking at.
+
+## Memory
+
+The listing is consumed as a **stream** and reduced to candidates as it arrives.
+A table with millions of objects is never held in memory in its entirety just to
+be filtered away — and on a healthy table the answer is almost always empty.
+
+## Empty tables are still scanned
+
+This is the one operation that applies to a table with no snapshots, and it has
+to. A first write that died between staging its data and committing left files
+under the table location that nothing references and nothing else will ever
+reclaim. Every other operation declines an empty table; this one does not.
+
 ## Two refusals
 
-Beyond the five checks, the scanner declines outright in two situations.
+Beyond the seven checks, the scanner declines outright in two situations.
 
 **A table with a current snapshot but no reachable files.** Far more likely than
 "this table is entirely garbage" is that something went wrong reading its
@@ -137,6 +220,30 @@ does.
 - manifests and manifest lists
 - statistics and partition-statistics files (Puffin)
 - every `metadata.json` the metadata log still names, plus the current one
+- `version-hint.text`, if the table was migrated from a Hadoop catalog — it
+  matches nothing in the metadata, so a scanner without this rule would delete
+  the only file that says which `metadata.json` is current
+
+## Cadence
+
+Orphan removal is the one operation that is **scheduled rather than
+triggered**. Every other operation decides from metadata Bergman has already
+read; this one cannot know whether a table has orphans without listing its whole
+location, and that listing *is* the cost. Running it on every cycle would make a
+five-minute cadence mean a full object-store listing of every table every five
+minutes — real money on S3, and it finds nothing almost every time.
+
+```toml
+[rules.orphans]
+min_interval = "24h"   # the default
+```
+
+The interval applies **within one process**. A one-shot `bergman run` always
+scans, because the cron entry that invoked it already decided the cadence; a
+long-lived `bergman daemon` on a short cycle throttles itself. Nothing is
+persisted — losing the memory on restart costs one extra listing, and persisting
+it would mean state that has to survive a crash, which is exactly what Bergman
+does not have.
 
 ## The audit trail
 

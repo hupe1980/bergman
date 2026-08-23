@@ -14,8 +14,8 @@
 mod analyze;
 mod partition;
 
-pub use analyze::{analyze, render_literal};
-pub use partition::{PartitionHealth, PartitionKey};
+pub use analyze::analyze;
+pub use partition::{PartitionHealth, PartitionKey, UNPARTITIONED, partition_path};
 
 use std::time::Duration;
 
@@ -28,10 +28,31 @@ use crate::policy::TableRef;
 pub struct TableHealth {
     /// Which table this describes.
     pub table: TableRef,
-    /// The table's format version (1, 2 or 3).
-    pub format_version: u8,
+    /// The table's Iceberg format version.
+    ///
+    /// Serializes as the integer the spec uses (1, 2, 3) — it is upstream's own
+    /// `repr(u8)` type rather than a plain number so that the planner can ask
+    /// [`crate::commit::authoring_refusal`] about it directly, instead of
+    /// carrying a second mapping from integer to meaning.
+    pub format_version: iceberg::spec::FormatVersion,
     /// The table's base location, which bounds every file it may own.
     pub location: String,
+    /// The table's `write.format.default`, lower-cased, when it sets one.
+    ///
+    /// Carried on the health report so the planner can say *before* a cycle that
+    /// compaction will never run against this table. Bergman reads Parquet, Avro
+    /// and ORC but writes only Parquet, and a rewrite must not silently change a
+    /// table's format — so a table asking for anything else is refused, and a
+    /// refusal reported every cycle is noise where an explanation is wanted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_format: Option<String>,
+    /// The partition spec new files are written under.
+    ///
+    /// A table whose spec has evolved holds files under several at once, and
+    /// only the current one can be rewritten: output goes out under this spec,
+    /// so a commit replacing files partitioned differently would mis-file them.
+    #[serde(default)]
+    pub current_spec_id: i32,
     /// Snapshot and history condition.
     pub snapshots: SnapshotHealth,
     /// Manifest condition.

@@ -5,10 +5,21 @@
 //! exists for, and building it any other way would mean two paths to the same
 //! facts.
 //!
-//! The labels are the ones an operator groups by when something looks wrong:
-//! the table, the operation, and the outcome. Notably *not* the policy rule —
-//! a rule pattern is low-cardinality today and unbounded tomorrow, and a label
-//! that grows without limit takes a Prometheus server down.
+//! # Cardinality is the whole design
+//!
+//! A time series is created per label combination and kept forever, so every
+//! label here is a bounded one: catalog, namespace, operation, outcome. A
+//! deployment has tens of namespaces and four operations, so a catalog of any
+//! size costs a few hundred series.
+//!
+//! Absent, and deliberately: the **table** and the **policy rule**. Both are
+//! unbounded — fifty thousand tables would mean fifty thousand series per
+//! metric, times the histogram's buckets. That is an outage of the monitoring
+//! system, caused by the tool meant to be watching it.
+//!
+//! Per-table facts live in the audit trail, which has no cardinality budget.
+//! Metrics answer "is maintenance working"; the audit trail answers "what
+//! happened to this table".
 
 use std::sync::Arc;
 
@@ -21,15 +32,40 @@ use prometheus_client::registry::Registry;
 use crate::obs::{MaintenanceObserver, OperationContext};
 use crate::plan::OperationResult;
 
-/// The labels every operation metric carries.
+/// The labels an operation metric carries.
+///
+/// Bounded by construction — see the module docs for why the table name is not
+/// among them.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct OperationLabels {
-    /// The fully-qualified table.
-    pub table: String,
+    /// The catalog, as named in configuration.
+    pub catalog: String,
+    /// The namespace the table lives in, dotted.
+    ///
+    /// The finest grain that stays bounded: a deployment has tens of these,
+    /// where it may have tens of thousands of tables.
+    pub namespace: String,
     /// `compact`, `expire-snapshots`, …
     pub operation: String,
-    /// `succeeded`, `no-op`, `refused`, `conflicted`, `failed`, `blocked`.
+    /// `succeeded`, `no-op`, `refused`, `conflicted`, `failed`.
     pub outcome: String,
+}
+
+/// The labels the deletion counter carries.
+///
+/// No `outcome`: this counts files a deletion was *announced* for, which has no
+/// outcome of its own. Reusing the operation label set and inventing a value
+/// for it would put a series under `outcome="attempted"` alongside the real
+/// outcomes, where it would silently corrupt any `sum by (outcome)` an operator
+/// writes.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct DeletionLabels {
+    /// The catalog, as named in configuration.
+    pub catalog: String,
+    /// The namespace the table lives in, dotted.
+    pub namespace: String,
+    /// Which operation announced the deletion.
+    pub operation: String,
 }
 
 /// Metrics for a maintenance process.
@@ -37,7 +73,7 @@ pub struct OperationLabels {
 pub struct Metrics {
     operations: Family<OperationLabels, Counter>,
     duration: Family<OperationLabels, Histogram>,
-    files_deleted: Family<OperationLabels, Counter>,
+    files_deleted: Family<DeletionLabels, Counter>,
     registry: Arc<std::sync::Mutex<Registry>>,
 }
 
@@ -55,7 +91,7 @@ impl Metrics {
         let operations = Family::<OperationLabels, Counter>::default();
         registry.register(
             "bergman_operations",
-            "Maintenance operations by table, operation and outcome",
+            "Maintenance operations by catalog, namespace, operation and outcome",
             operations.clone(),
         );
 
@@ -71,10 +107,11 @@ impl Metrics {
             duration.clone(),
         );
 
-        let files_deleted = Family::<OperationLabels, Counter>::default();
+        let files_deleted = Family::<DeletionLabels, Counter>::default();
         registry.register(
-            "bergman_files_deleted",
-            "Files deleted by maintenance",
+            "bergman_files_deletion_announced",
+            "Files a maintenance deletion was announced for, counted before the \
+             first delete so a run that died mid-delete still shows the attempt",
             files_deleted.clone(),
         );
 
@@ -104,9 +141,18 @@ impl Metrics {
 
     fn labels(ctx: OperationContext<'_>, outcome: &str) -> OperationLabels {
         OperationLabels {
-            table: ctx.table.to_string(),
+            catalog: ctx.table.catalog.clone(),
+            namespace: ctx.table.namespace.join("."),
             operation: ctx.kind.as_str().to_string(),
             outcome: outcome.to_string(),
+        }
+    }
+
+    fn deletion_labels(ctx: OperationContext<'_>) -> DeletionLabels {
+        DeletionLabels {
+            catalog: ctx.table.catalog.clone(),
+            namespace: ctx.table.namespace.join("."),
+            operation: ctx.kind.as_str().to_string(),
         }
     }
 }
@@ -116,7 +162,6 @@ fn outcome_label(result: &OperationResult) -> &'static str {
     match result {
         OperationResult::Succeeded { .. } => "succeeded",
         OperationResult::NoOp { .. } => "no-op",
-        OperationResult::Blocked { .. } => "blocked",
         OperationResult::Refused { .. } => "refused",
         OperationResult::Conflicted { .. } => "conflicted",
         OperationResult::Failed { .. } => "failed",
@@ -143,7 +188,7 @@ impl MaintenanceObserver for Metrics {
         // that died mid-delete still shows the attempt — which is the number
         // worth alerting on.
         self.files_deleted
-            .get_or_create(&Self::labels(ctx, "attempted"))
+            .get_or_create(&Self::deletion_labels(ctx))
             .inc_by(paths.len() as u64);
     }
 }
@@ -211,7 +256,10 @@ mod tests {
             .await;
 
         let encoded = metrics.encode();
-        assert!(encoded.contains("bergman_files_deleted"), "{encoded}");
+        assert!(
+            encoded.contains("bergman_files_deletion_announced"),
+            "{encoded}"
+        );
         assert!(encoded.contains("3"), "{encoded}");
     }
 
@@ -246,12 +294,57 @@ mod tests {
         assert_eq!(encoded.trim_end(), "# EOF");
     }
 
-    #[test]
-    fn the_policy_rule_is_not_a_label() {
-        // Rule patterns are low-cardinality today and unbounded tomorrow, and a
-        // label that grows without limit takes a Prometheus server down. The
-        // rule belongs in the audit trail, which is where it is.
+    #[tokio::test]
+    async fn no_label_is_unbounded() {
+        // The property the whole module is designed around. A time series is
+        // created per label combination and kept forever, so an unbounded label
+        // is an outage of the monitoring system caused by the tool that was
+        // supposed to be watching. Both tempting ones — the table and the rule —
+        // are absent, and their facts live in the audit trail instead.
         let metrics = Metrics::new();
-        assert!(!metrics.encode().contains("matched_rule"));
+        let table = TableRef::new("prod", ["analytics", "web"], "events");
+
+        metrics
+            .operation_finished(
+                ctx(&table),
+                &OperationResult::Succeeded {
+                    detail: "ok".into(),
+                },
+                Duration::from_secs(1),
+            )
+            .await;
+        metrics.deleting_files(ctx(&table), &["a".into()]).await;
+
+        let encoded = metrics.encode();
+        assert!(
+            !encoded.contains(r#"table="#),
+            "table is unbounded: {encoded}"
+        );
+        assert!(!encoded.contains("matched_rule"), "{encoded}");
+        assert!(!encoded.contains("prod.analytics.web.events"), "{encoded}");
+
+        // The bounded grain survives, and it is the one an alert groups by.
+        assert!(encoded.contains(r#"catalog="prod""#), "{encoded}");
+        assert!(
+            encoded.contains(r#"namespace="analytics.web""#),
+            "{encoded}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_deletion_counter_does_not_invent_an_outcome() {
+        // Files announced for deletion have no outcome of their own. Putting
+        // them under `outcome="attempted"` alongside the real outcomes would
+        // silently corrupt any `sum by (outcome)` an operator writes.
+        let metrics = Metrics::new();
+        let table = TableRef::new("prod", ["db"], "t");
+        metrics.deleting_files(ctx(&table), &["a".into()]).await;
+
+        let encoded = metrics.encode();
+        assert!(
+            encoded.contains("bergman_files_deletion_announced"),
+            "{encoded}"
+        );
+        assert!(!encoded.contains("attempted"), "{encoded}");
     }
 }

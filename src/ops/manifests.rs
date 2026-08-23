@@ -11,33 +11,86 @@
 //! cheapest real win available in Iceberg maintenance, and upstream has no
 //! action for it — so Bergman commits it through its own commit layer
 //! ([`crate::commit`]).
+//!
+//! # The rule that matters
+//!
+//! **Entries may only be packed together when they share a partition spec and
+//! a content type.** A manifest carries exactly one `partition_spec_id`, and an
+//! entry's partition tuple is meaningless against any other spec — so merging
+//! a spec-0 entry into a spec-1 manifest re-interprets its partition values and
+//! silently mis-prunes files at query time. Nothing fails; queries just start
+//! returning wrong answers.
+//!
+//! # And the rule that makes it worth doing
+//!
+//! **Entries are clustered by partition before they are packed.** A manifest
+//! list records each manifest's partition *summary*, and that summary is what
+//! lets a query skip a manifest without opening it. Packing entries in arrival
+//! order gives every manifest a summary spanning the whole table — fewer
+//! manifests, all of which must now be read, which is worse than what the
+//! rewrite started with. Java's `RewriteManifests` clusters the same way.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use iceberg::TableIdent;
 use iceberg::spec::{
     DataContentType, FormatVersion, ManifestEntry, ManifestFile, ManifestStatus,
-    ManifestWriterBuilder, Operation, Summary,
+    ManifestWriterBuilder, Operation, PartitionSpec, Summary,
 };
 use iceberg::table::Table;
 use uuid::Uuid;
 
-use crate::commit::{SnapshotProducer, TableCommitter};
+use crate::commit::{BranchRetention, SnapshotProducer, TableCommitter};
 use crate::error::{Error, Result};
-use crate::obs::OperationContext;
+use crate::ops::{MAX_COMMIT_ATTEMPTS, OpEnv, retry_delay};
 use crate::plan::OperationResult;
 use crate::policy::EffectiveManifests;
 use crate::util::human_bytes;
 
 /// Rewrite a table's manifests into fewer, larger ones.
-pub async fn run(
+///
+/// Retries against a reloaded table on conflict, because the entries this
+/// re-packs are the ones the table had when the attempt began — and a
+/// concurrent commit changes them.
+pub async fn run(env: &OpEnv<'_>, settings: &EffectiveManifests) -> Result<OperationResult> {
+    let ident = env.ident;
+    let ctx = env.ctx;
+    let mut current = env.table.clone();
+
+    for attempt in 0..MAX_COMMIT_ATTEMPTS {
+        match attempt_rewrite(&current, ident, env.committer, settings).await {
+            Ok(result) => return Ok(result),
+            Err(e) if e.is_replan() && attempt + 1 < MAX_COMMIT_ATTEMPTS => {
+                tracing::debug!(
+                    table = %ctx.table,
+                    attempt = attempt + 1,
+                    "manifest rewrite lost its commit; reloading and re-packing"
+                );
+                tokio::time::sleep(retry_delay(attempt)).await;
+                current = env.loader.reload(ident).await?;
+            }
+            Err(e) if e.is_replan() => {
+                return Ok(OperationResult::Conflicted {
+                    detail: format!(
+                        "table moved during {MAX_COMMIT_ATTEMPTS} commit attempts; \
+                         will replan next cycle"
+                    ),
+                });
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    unreachable!("the loop returns on the final attempt")
+}
+
+async fn attempt_rewrite(
     table: &Table,
     ident: &TableIdent,
     committer: &dyn TableCommitter,
     settings: &EffectiveManifests,
-    ctx: OperationContext<'_>,
 ) -> Result<OperationResult> {
-    let table_ref = ctx.table;
     let metadata = table.metadata();
 
     let Some(parent) = metadata.current_snapshot() else {
@@ -46,41 +99,36 @@ pub async fn run(
         });
     };
 
-    let file_io = table.file_io();
-    let bytes = file_io
-        .new_input(parent.manifest_list())
-        .map_err(|e| Error::Storage(Box::new(e)))?
-        .read()
-        .await
-        .map_err(|e| Error::Storage(Box::new(e)))?;
+    let retention = BranchRetention::load(table).await?;
+    let producer = SnapshotProducer::new(table, retention);
+    // Before any manifest is read, let alone written: a rewrite Bergman cannot
+    // commit should cost a metadata lookup, not a full pass over the table's
+    // manifest set followed by a refusal.
+    producer.check_authorable()?;
 
-    let manifest_list =
-        iceberg::spec::ManifestList::parse_with_version(&bytes, metadata.format_version())
-            .map_err(|e| Error::metadata(table_ref, format!("unreadable manifest list: {e}")))?;
+    let snapshot_id = producer.snapshot_id();
+    let loaded = producer.load_manifests(parent).await?;
 
     let target = settings.target_size.value;
-    let before = manifest_list.entries().len();
-    let bytes_before: u64 = manifest_list
-        .entries()
+    let before = loaded.len();
+    let bytes_before: u64 = loaded
         .iter()
-        .map(|m| m.manifest_length.max(0) as u64)
+        .map(|m| m.file.manifest_length.max(0) as u64)
         .sum();
 
     // Only the undersized manifests are worth touching. Rewriting one that is
     // already at target reads and writes it for no gain — and a rewrite that
     // achieves nothing still costs a snapshot, which is the opposite of the
     // problem being solved.
-    let undersized: Vec<&ManifestFile> = manifest_list
-        .entries()
+    let undersized = loaded
         .iter()
-        .filter(|m| (m.manifest_length.max(0) as u64) < target)
-        .collect();
+        .filter(|m| (m.file.manifest_length.max(0) as u64) < target)
+        .count();
 
-    if undersized.len() < settings.min_count_to_merge.value {
+    if undersized < settings.min_count_to_merge.value {
         return Ok(OperationResult::NoOp {
             detail: format!(
-                "{} of {before} manifests are below {} (need {} to merge)",
-                undersized.len(),
+                "{undersized} of {before} manifests are below {} (need {} to merge)",
                 human_bytes(target),
                 settings.min_count_to_merge.value
             ),
@@ -89,58 +137,44 @@ pub async fn run(
 
     // Manifests already at target are carried through untouched — their bytes
     // are not rewritten, only their reference in the new manifest list.
-    let keep_as_is: Vec<ManifestFile> = manifest_list
-        .entries()
+    let mut manifests: Vec<ManifestFile> = loaded
         .iter()
-        .filter(|m| (m.manifest_length.max(0) as u64) >= target)
-        .cloned()
+        .filter(|m| (m.file.manifest_length.max(0) as u64) >= target)
+        .map(|m| m.file.clone())
         .collect();
 
-    let mut data_entries = Vec::new();
-    let mut delete_entries = Vec::new();
-    for manifest_file in &undersized {
-        let manifest = manifest_file
-            .load_manifest(file_io)
-            .await
-            .map_err(|e| Error::Storage(Box::new(e)))?;
-        for entry in manifest.entries() {
+    // The rule that matters: entries are bucketed by (spec, content) before
+    // anything is packed, so a manifest never mixes partition specs.
+    let mut buckets: BTreeMap<(i32, ManifestKind), Vec<Arc<ManifestEntry>>> = BTreeMap::new();
+    for m in &loaded {
+        if (m.file.manifest_length.max(0) as u64) >= target {
+            continue;
+        }
+        for entry in &m.entries {
             // `Deleted` entries are history, not content. Carrying them forward
             // would resurrect files the table no longer has; dropping them is
-            // exactly what a rewrite is for.
+            // exactly what a rewrite is for. (`load_manifests` already filters
+            // them; this is the second half of the same rule, stated where it
+            // is read.)
             if entry.status() == ManifestStatus::Deleted {
                 continue;
             }
-            match entry.content_type() {
-                DataContentType::Data => data_entries.push(entry.clone()),
-                _ => delete_entries.push(entry.clone()),
-            }
+            let kind = match entry.content_type() {
+                DataContentType::Data => ManifestKind::Data,
+                _ => ManifestKind::Deletes,
+            };
+            buckets
+                .entry((m.file.partition_spec_id, kind))
+                .or_default()
+                .push(Arc::new(entry.clone()));
         }
     }
 
-    let producer = SnapshotProducer::new(table);
-    let snapshot_id = producer.snapshot_id();
-    let mut manifests = keep_as_is;
-
-    manifests.extend(
-        write_packed(
-            table,
-            snapshot_id,
-            &data_entries,
-            target,
-            ManifestKind::Data,
-        )
-        .await?,
-    );
-    manifests.extend(
-        write_packed(
-            table,
-            snapshot_id,
-            &delete_entries,
-            target,
-            ManifestKind::Deletes,
-        )
-        .await?,
-    );
+    for ((spec_id, kind), mut entries) in buckets {
+        let spec = producer.spec_for(spec_id)?;
+        cluster_by_partition(&mut entries, &spec, table.metadata().current_schema());
+        manifests.extend(write_packed(table, snapshot_id, &entries, target, kind, &spec).await?);
+    }
 
     let after = manifests.len();
     if after >= before {
@@ -160,13 +194,10 @@ pub async fn run(
         // changed.
         operation: Operation::Replace,
         additional_properties: std::collections::HashMap::from([
-            (
-                "manifests-replaced".to_string(),
-                undersized.len().to_string(),
-            ),
+            ("manifests-replaced".to_string(), undersized.to_string()),
             (
                 "manifests-kept".to_string(),
-                (before - undersized.len()).to_string(),
+                (before - undersized).to_string(),
             ),
             ("engine-name".to_string(), "bergman".to_string()),
             (
@@ -187,19 +218,65 @@ pub async fn run(
     })
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ManifestKind {
     Data,
     Deletes,
 }
 
+/// Sort entries so that each packed manifest covers a narrow range of
+/// partitions.
+///
+/// A manifest list records every manifest's partition summary, and a query
+/// prunes on it: a manifest whose summary cannot contain the predicate's
+/// partition is never opened. Entries arriving in commit order are scattered
+/// across partitions, so packing them as they come produces manifests that each
+/// span the whole table — fewer files, every one of which must now be read,
+/// which is worse than what the rewrite started with.
+///
+/// Sorted by the rendered partition key, which is [`crate::health`]'s and is
+/// injective, so entries of one partition end up adjacent.
+///
+/// The sort is **stable, and nothing breaks ties**: within a partition the
+/// entries keep the order the parent's manifests had, which is commit order. A
+/// table whose rows arrive in time order keeps that locality, and an arbitrary
+/// second key would reshuffle every entry in every partition to no purpose.
+fn cluster_by_partition(
+    entries: &mut [Arc<ManifestEntry>],
+    spec: &PartitionSpec,
+    schema: &iceberg::spec::Schema,
+) {
+    // Rendered once per entry rather than inside the comparator: a sort does
+    // O(n log n) comparisons and rendering a partition tuple is not free.
+    let mut keyed: Vec<(String, Arc<ManifestEntry>)> = entries
+        .iter()
+        .map(|entry| {
+            (
+                crate::health::partition_path(spec, schema, entry.data_file().partition()),
+                Arc::clone(entry),
+            )
+        })
+        .collect();
+
+    keyed.sort_by(|(a_key, _), (b_key, _)| a_key.cmp(b_key));
+
+    for (slot, (_, entry)) in entries.iter_mut().zip(keyed) {
+        *slot = entry;
+    }
+}
+
 /// Bin-pack manifest entries into manifests of roughly `target` bytes.
+///
+/// `spec` is the partition spec every entry in `entries` was written under —
+/// the caller has already bucketed by it, because writing them under any other
+/// re-interprets their partition tuples.
 async fn write_packed(
     table: &Table,
     snapshot_id: i64,
     entries: &[Arc<ManifestEntry>],
     target: u64,
     kind: ManifestKind,
+    spec: &PartitionSpec,
 ) -> Result<Vec<ManifestFile>> {
     if entries.is_empty() {
         return Ok(Vec::new());
@@ -227,12 +304,13 @@ async fn write_packed(
     let mut manifests = Vec::new();
     for chunk in entries.chunks(entries_per_manifest) {
         let location = format!(
-            "{}/metadata/{snapshot_id}-m-{}-{}.avro",
+            "{}/metadata/{snapshot_id}-m-{}-{}-{}.avro",
             metadata.location().trim_end_matches('/'),
             match kind {
                 ManifestKind::Data => "data",
                 ManifestKind::Deletes => "delete",
             },
+            spec.spec_id(),
             Uuid::new_v4()
         );
         let output = table
@@ -244,7 +322,7 @@ async fn write_packed(
             output,
             Some(snapshot_id),
             metadata.current_schema().clone(),
-            metadata.default_partition_spec().as_ref().clone(),
+            spec.clone(),
         );
         let mut writer = match (kind, format_version) {
             (ManifestKind::Data, FormatVersion::V1) => builder.build_v1(),
@@ -296,6 +374,7 @@ fn estimated_entry_bytes(metadata: &iceberg::spec::TableMetadata) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
     #[test]
     fn entry_size_grows_with_column_count() {
@@ -317,5 +396,139 @@ mod tests {
         let target: u64 = 10;
         let per_entry: u64 = 1000;
         assert_eq!((target / per_entry).max(1), 1);
+    }
+
+    /// A manifest entry naming a file in a partition, for the clustering test.
+    fn entry(partition_value: i32, path: &str) -> Arc<ManifestEntry> {
+        use iceberg::spec::{DataFileBuilder, DataFileFormat, Literal, Struct};
+
+        let data_file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .partition(Struct::from_iter([Some(Literal::int(partition_value))]))
+            .record_count(1)
+            .file_size_in_bytes(1)
+            .partition_spec_id(0)
+            .build()
+            .expect("data file");
+
+        Arc::new(
+            ManifestEntry::builder()
+                .status(ManifestStatus::Existing)
+                .snapshot_id(1)
+                .sequence_number(1)
+                .file_sequence_number(1)
+                .data_file(data_file)
+                .build(),
+        )
+    }
+
+    /// A schema and a spec partitioning it by `day` (identity over an int).
+    fn spec_and_schema() -> (PartitionSpec, iceberg::spec::Schema) {
+        use iceberg::spec::{
+            NestedField, PrimitiveType, Schema, Transform, Type, UnboundPartitionSpec,
+        };
+
+        let schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "day", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        let spec = UnboundPartitionSpec::builder()
+            .with_spec_id(0)
+            .add_partition_field(1, "day", Transform::Identity)
+            .unwrap()
+            .build()
+            .bind(schema.clone())
+            .unwrap();
+
+        (spec, schema)
+    }
+
+    #[test]
+    fn entries_are_clustered_by_partition_before_packing() {
+        // The rule that makes the rewrite worth doing. A manifest list records
+        // each manifest's partition summary, and a query prunes on it — so
+        // packing entries in commit order produces manifests that each span the
+        // whole table, and every query then opens every one of them. Fewer
+        // manifests that all have to be read is worse than what the rewrite
+        // started with.
+        let (spec, schema) = spec_and_schema();
+
+        // Commit order: partitions interleaved, exactly as a table written
+        // across several days accumulates them.
+        let mut entries = vec![
+            entry(3, "c.parquet"),
+            entry(1, "a.parquet"),
+            entry(2, "b.parquet"),
+            entry(1, "d.parquet"),
+            entry(3, "e.parquet"),
+        ];
+
+        cluster_by_partition(&mut entries, &spec, &schema);
+
+        let order: Vec<&str> = entries.iter().map(|e| e.file_path()).collect();
+        assert_eq!(
+            order,
+            vec![
+                "a.parquet",
+                "d.parquet",
+                "b.parquet",
+                "c.parquet",
+                "e.parquet"
+            ],
+            "entries of one partition must end up adjacent"
+        );
+    }
+
+    #[test]
+    fn clustering_moves_only_what_it_has_to() {
+        // The sort is stable and nothing breaks ties, so entries of one
+        // partition keep the order the parent's manifests had — commit order.
+        // A table whose rows arrive in time order keeps that locality, and with
+        // it the tight min/max bounds a timestamp column gets from it. An
+        // arbitrary second key would reshuffle every entry in every partition to
+        // no purpose.
+        let (spec, schema) = spec_and_schema();
+
+        let mut entries = vec![
+            entry(1, "z.parquet"),
+            entry(1, "a.parquet"),
+            entry(1, "m.parquet"),
+        ];
+        cluster_by_partition(&mut entries, &spec, &schema);
+
+        let order: Vec<&str> = entries.iter().map(|e| e.file_path()).collect();
+        assert_eq!(
+            order,
+            vec!["z.parquet", "a.parquet", "m.parquet"],
+            "one partition's entries must not be reordered"
+        );
+    }
+
+    #[test]
+    fn entries_bucket_by_spec_and_content_before_packing() {
+        // The rule that matters, exercised on the bucket key itself: two specs
+        // and two content types make four buckets, never one. A manifest that
+        // mixed them would re-interpret partition tuples against the wrong
+        // spec, and nothing would fail — queries would just start pruning the
+        // wrong files.
+        let mut buckets: BTreeMap<(i32, ManifestKind), usize> = BTreeMap::new();
+        for key in [
+            (0, ManifestKind::Data),
+            (0, ManifestKind::Deletes),
+            (1, ManifestKind::Data),
+            (1, ManifestKind::Deletes),
+            (0, ManifestKind::Data),
+        ] {
+            *buckets.entry(key).or_default() += 1;
+        }
+
+        assert_eq!(buckets.len(), 4);
+        assert_eq!(buckets[&(0, ManifestKind::Data)], 2);
     }
 }

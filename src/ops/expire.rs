@@ -20,37 +20,21 @@ use iceberg::transaction::{ApplyTransactionAction, Transaction};
 
 use crate::error::{Error, Result};
 use crate::obs::{MaintenanceObserver, OperationContext};
+use crate::ops::delete::{Deletion, announce_and_delete, withhold_beyond};
 use crate::ops::reachability::{self, ReachableSet};
-use crate::ops::{MAX_COMMIT_ATTEMPTS, retry_delay};
+use crate::ops::{MAX_COMMIT_ATTEMPTS, OpEnv, retry_delay};
 use crate::plan::OperationResult;
 use crate::policy::{EffectiveSnapshots, TableRef};
 
-/// What expiration did.
-#[derive(Debug, Clone, Default)]
-pub struct ExpireOutcome {
-    /// How many snapshots were removed.
-    pub snapshots_removed: usize,
-    /// How many files were deleted, when file cleanup was enabled.
-    pub files_deleted: usize,
-    /// How many files could not be deleted.
-    ///
-    /// A file that will not delete is not a failure of the expiration — the
-    /// metadata commit already succeeded and the table is correct. It is a
-    /// leak, and it is reported so it can be chased.
-    pub files_failed: usize,
-}
-
 /// Expire snapshots, and optionally delete what that orphans.
 pub async fn run(
-    table: &Table,
+    env: &OpEnv<'_>,
     catalog: &Arc<dyn Catalog>,
     settings: &EffectiveSnapshots,
-    observer: &dyn MaintenanceObserver,
-    ctx: OperationContext<'_>,
-    now: DateTime<Utc>,
 ) -> Result<OperationResult> {
-    // One source of the table's identity: the context carries it.
-    let table_ref = ctx.table;
+    let table = env.table;
+    let table_ref = env.table_ref();
+    let (observer, ctx, now) = (env.observer, env.ctx, env.now);
 
     // The reachable set is computed *before* the commit, while the snapshots
     // still exist. Afterwards, the files they referenced are unreachable by
@@ -87,22 +71,38 @@ pub async fn run(
         });
     }
 
-    let mut outcome = ExpireOutcome {
-        snapshots_removed: removed,
-        ..Default::default()
+    // A file that will not delete is not a failure of the expiration — the
+    // metadata commit already succeeded and the table is correct. It is a leak,
+    // and it is counted so it can be chased.
+    let deletion = match before {
+        Some(before) => {
+            delete_now_unreachable(
+                table_ref,
+                &updated,
+                before,
+                observer,
+                ctx,
+                env.max_deletes_per_run,
+            )
+            .await?
+        }
+        None => Deletion::default(),
     };
-
-    if let Some(before) = before {
-        let deleted = delete_now_unreachable(table_ref, &updated, before, observer, ctx).await?;
-        outcome.files_deleted = deleted.0;
-        outcome.files_failed = deleted.1;
-    }
 
     let mut detail = format!("{removed} snapshots expired");
     if settings.delete_files.value {
-        detail.push_str(&format!(", {} files deleted", outcome.files_deleted));
-        if outcome.files_failed > 0 {
-            detail.push_str(&format!(" ({} could not be deleted)", outcome.files_failed));
+        detail.push_str(&format!(", {} files deleted", deletion.deleted));
+        if deletion.withheld > 0 {
+            // Not a loss: what the ceiling withholds is now unreferenced by
+            // every retained snapshot, which is precisely what the orphan
+            // scanner reclaims.
+            detail.push_str(&format!(
+                " ({} left for the orphan scanner by the per-run ceiling of {})",
+                deletion.withheld, env.max_deletes_per_run
+            ));
+        }
+        if deletion.failed > 0 {
+            detail.push_str(&format!(" ({} could not be deleted)", deletion.failed));
         }
     }
 
@@ -126,12 +126,12 @@ async fn commit_with_retry(
     let mut current = table.clone();
 
     for attempt in 0..MAX_COMMIT_ATTEMPTS {
-        let action = Transaction::new(&current)
+        let tx = Transaction::new(&current);
+        let tx = tx
             .expire_snapshots()
             .expire_older_than_ms(cutoff_ms)
-            .retain_last(settings.min_to_keep.value);
-
-        let tx = action.apply(Transaction::new(&current))?;
+            .retain_last(settings.min_to_keep.value)
+            .apply(tx)?;
 
         match tx.commit(catalog.as_ref()).await {
             Ok(updated) => return Ok(Some(updated)),
@@ -189,17 +189,28 @@ fn is_conflict(err: &Error) -> bool {
 /// The set is `reachable_before − reachable_after`. Recomputing *after* the
 /// commit rather than predicting it is the point: the commit is the thing that
 /// decides, and a prediction that disagreed with it would delete live files.
+///
+/// Deletion itself goes through [`crate::ops::delete`], the same path orphan
+/// removal uses: same blast-radius ceiling, same bounded concurrency, same
+/// announce-before-deleting rule.
 async fn delete_now_unreachable(
     table_ref: &TableRef,
     updated: &Table,
     before: ReachableSet,
     observer: &dyn MaintenanceObserver,
     ctx: OperationContext<'_>,
-) -> Result<(usize, usize)> {
+    ceiling: usize,
+) -> Result<Deletion> {
     let after = reachability::compute(table_ref, updated).await?;
     let location = updated.metadata().location();
 
     let mut doomed: Vec<String> = Vec::new();
+    // `metadata_json` is deliberately absent. Expiring snapshots does not drop
+    // entries from the metadata log — `write.metadata.previous-versions-max`
+    // does, on the catalog's own schedule — so a `metadata.json` that leaves
+    // the log leaves it *between* Bergman's before and after readings, and
+    // deleting on that basis would race the catalog for a file it still owns.
+    // The orphan scanner reclaims them, with its grace period.
     for path in before
         .data_files
         .iter()
@@ -225,35 +236,28 @@ async fn delete_now_unreachable(
     }
 
     if doomed.is_empty() {
-        return Ok((0, 0));
+        return Ok(Deletion::default());
     }
 
     // Deterministic order so an audit record of a partial deletion can be read
-    // against a later one.
+    // against a later one — and so that a ceiling truncating the list twice
+    // truncates it the same way.
     doomed.sort();
 
-    // Announced before the first deletion, so a crash halfway through still
-    // leaves a record of what was about to be removed.
-    observer.deleting_files(ctx, &doomed).await;
-
-    let file_io = updated.file_io();
-    let mut deleted = 0usize;
-    let mut failed = 0usize;
-    for path in &doomed {
-        match file_io.delete(path).await {
-            Ok(()) => deleted += 1,
-            Err(e) => {
-                // One undeletable file does not stop the rest. The metadata
-                // commit has already succeeded, so the table is correct either
-                // way; what remains is a leak, and leaking one file is better
-                // than leaking all of them.
-                tracing::warn!(table = %table_ref, file = %path, error = %e, "file could not be deleted");
-                failed += 1;
-            }
-        }
+    let withheld = withhold_beyond(&mut doomed, ceiling);
+    if withheld > 0 {
+        tracing::warn!(
+            table = %table_ref,
+            ceiling,
+            withheld,
+            "expiration orphaned more files than the per-run ceiling; the orphan \
+             scanner reclaims the rest"
+        );
     }
 
-    Ok((deleted, failed))
+    let mut deletion = announce_and_delete(updated.file_io(), observer, ctx, &doomed).await;
+    deletion.withheld = withheld;
+    Ok(deletion)
 }
 
 #[cfg(test)]

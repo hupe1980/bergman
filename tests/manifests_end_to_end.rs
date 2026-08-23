@@ -43,11 +43,12 @@ async fn rewrite(
     let table = fixture.table();
     let table_ref = TableRef::new("prod", ["db"], "events");
 
-    manifests::run(
+    let loader = fixture.loader();
+    let env = common::op_env(
         &table,
         &fixture.ident,
+        &loader,
         fixture.committer.as_ref(),
-        settings,
         OperationContext {
             run_id: "test",
             table: &table_ref,
@@ -55,9 +56,35 @@ async fn rewrite(
             matched_rule: "prod.db.events",
             reason: "test",
         },
-    )
-    .await
-    .expect("manifest rewrite runs")
+    );
+
+    manifests::run(&env, settings)
+        .await
+        .expect("manifest rewrite runs")
+}
+
+/// The same, without unwrapping — for the paths that must refuse.
+async fn try_rewrite(
+    fixture: &TestTable,
+    settings: &bergman::policy::EffectiveManifests,
+) -> bergman::Result<OperationResult> {
+    let table = fixture.table();
+    let table_ref = TableRef::new("prod", ["db"], "events");
+    let loader = fixture.loader();
+    let env = common::op_env(
+        &table,
+        &fixture.ident,
+        &loader,
+        fixture.committer.as_ref(),
+        OperationContext {
+            run_id: "test",
+            table: &table_ref,
+            kind: OperationKind::RewriteManifests,
+            matched_rule: "prod.db.events",
+            reason: "test",
+        },
+    );
+    manifests::run(&env, settings).await
 }
 
 /// Append each file in its own snapshot, so the table accumulates manifests.
@@ -141,20 +168,43 @@ async fn rewriting_is_off_unless_a_rule_asks_for_it() {
 }
 
 #[tokio::test]
-async fn a_conflicting_commit_leaves_the_table_untouched() {
+async fn a_lost_commit_is_re_packed_against_the_table_that_now_exists() {
+    // The entries this re-packs are the ones the table had when the attempt
+    // began. A concurrent commit changes them, so the retry must reload and
+    // re-pack rather than re-offer a manifest set built from a table that has
+    // since moved.
     let fixture = TestTable::new().unwrap();
     append_separately(&fixture, &[&[(1, "a")], &[(2, "b")], &[(3, "c")]]).await;
 
     let rows_before = read_all(&fixture.table()).await.unwrap();
     *fixture.committer.fail_next_as_conflict.lock().unwrap() = true;
 
+    let result = rewrite(&fixture, &manifest_policy(EAGER)).await;
+    assert!(
+        matches!(result, OperationResult::Succeeded { .. }),
+        "expected the retry to succeed, got {result:?}"
+    );
+
+    // And not one row moved, which is the whole promise of a manifest rewrite.
+    assert_eq!(read_all(&fixture.table()).await.unwrap(), rows_before);
+}
+
+#[tokio::test]
+async fn a_table_that_conflicts_every_time_is_left_untouched() {
+    let fixture = TestTable::new().unwrap();
+    append_separately(&fixture, &[&[(1, "a")], &[(2, "b")], &[(3, "c")]]).await;
+
+    let rows_before = read_all(&fixture.table()).await.unwrap();
+    *fixture.committer.always_conflict.lock().unwrap() = true;
+
     let table = fixture.table();
     let table_ref = TableRef::new("prod", ["db"], "events");
-    let err = manifests::run(
+    let loader = fixture.loader();
+    let env = common::op_env(
         &table,
         &fixture.ident,
+        &loader,
         fixture.committer.as_ref(),
-        &manifest_policy(EAGER),
         OperationContext {
             run_id: "test",
             table: &table_ref,
@@ -162,13 +212,19 @@ async fn a_conflicting_commit_leaves_the_table_untouched() {
             matched_rule: "prod.db.events",
             reason: "test",
         },
-    )
-    .await
-    .unwrap_err();
+    );
+    let result = manifests::run(&env, &manifest_policy(EAGER))
+        .await
+        .expect("a conflict is reported, not raised");
 
-    // A conflict must be classified as one, because the caller's response to a
-    // conflict is to replan and to anything else is not.
-    assert!(err.is_replan(), "got: {err}");
+    // A conflict must be reported as one, because the operator's response to a
+    // conflict is to wait for the next cycle and to anything else is not.
+    match &result {
+        OperationResult::Conflicted { detail } => {
+            assert!(detail.contains("replan"), "{detail}")
+        }
+        other => panic!("expected a reported conflict, got {other:?}"),
+    }
     assert_eq!(read_all(&fixture.table()).await.unwrap(), rows_before);
 }
 
@@ -195,5 +251,38 @@ async fn the_rewritten_table_is_still_readable_after_more_writes() {
             (3, "c".to_string()),
             (4, "d".to_string()),
         ]
+    );
+}
+
+#[tokio::test]
+async fn a_v3_table_is_refused_before_a_manifest_is_written() {
+    // Re-packing entries produces a snapshot like any other, so the same v3
+    // limit applies (see `compaction_end_to_end`). The refusal has to arrive
+    // before anything is written, or every cycle would leave a fresh set of
+    // Avro files under the table's metadata directory for the orphan scanner.
+    let fixture = TestTable::with_format(iceberg::spec::FormatVersion::V3).unwrap();
+    for i in 0..3 {
+        let file = fixture.write_data_file(&[(i, "x")]).await.unwrap();
+        fixture.append(vec![file]).await.unwrap();
+    }
+
+    let before_manifests = common::manifest_paths(&fixture.table())
+        .await
+        .unwrap()
+        .len();
+    let before_commits = fixture.committer.commit_count();
+
+    let err = try_rewrite(&fixture, &manifest_policy(EAGER))
+        .await
+        .expect_err("a v3 manifest rewrite must be refused");
+
+    assert!(err.to_string().contains("format v3"), "got: {err}");
+    assert_eq!(fixture.committer.commit_count(), before_commits);
+    assert_eq!(
+        common::manifest_paths(&fixture.table())
+            .await
+            .unwrap()
+            .len(),
+        before_manifests
     );
 }

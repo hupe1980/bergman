@@ -32,16 +32,53 @@
 //! so an upstream action that can express a rewrite becomes a second
 //! implementation and nothing above this module changes.
 
+mod auth;
 mod rest;
 mod snapshot;
 
+pub use auth::{Credential, TokenSource};
 pub use rest::RestCommitter;
-pub use snapshot::{RewriteFiles, SnapshotProducer};
+pub use snapshot::{BranchRetention, RewriteFiles, SnapshotProducer};
 
 use async_trait::async_trait;
+use iceberg::spec::FormatVersion;
 use iceberg::{TableIdent, TableRequirement, TableUpdate};
 
 use crate::error::Result;
+
+/// Why Bergman will not author a snapshot for a table of this format version,
+/// if it will not.
+///
+/// Only format 3 answers. V3 introduces **row lineage**: every row carries a
+/// `_row_id` and a `_last_updated_sequence_number`, a snapshot must declare the
+/// `first-row-id` it starts from and how many rows it added, and each manifest
+/// carries the base its entries count from. Three things follow, and each on
+/// its own is disqualifying:
+///
+/// 1. A rewrite must carry every row's existing `_row_id` through to the file
+///    that replaces it. Upstream's `ArrowReader` does not project the field and
+///    its `RollingFileWriter` will not accept it, so a rewrite would renumber
+///    every row it touched — and a `MERGE` or a CDC consumer joining on row id
+///    would then match the wrong rows, with nothing failing.
+/// 2. A manifest holding *existing* files, written fresh, has no `first-row-id`
+///    of its own, so `ManifestListWriter` assigns it a new range — moving files
+///    that were never rewritten to row ids they never had.
+/// 3. `TableMetadataBuilder::add_snapshot` rejects a v3 snapshot carrying no
+///    `first-row-id` outright, so such a commit does not merely risk being
+///    wrong: no spec-correct catalog applies it at all.
+///
+/// Operations that do not go through Bergman's snapshot producer — expiration,
+/// which is upstream's own action, and orphan removal, which commits nothing —
+/// stay available on a v3 table.
+pub fn authoring_refusal(format_version: FormatVersion) -> Option<&'static str> {
+    match format_version {
+        FormatVersion::V1 | FormatVersion::V2 => None,
+        FormatVersion::V3 => Some(
+            "the table is Iceberg format v3, whose row lineage Bergman cannot yet preserve \
+             through a rewrite; snapshot expiration and orphan removal still run",
+        ),
+    }
+}
 
 /// Delivers a commit to a catalog.
 ///

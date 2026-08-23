@@ -33,7 +33,7 @@ mod window;
 pub use matcher::TableMatcher;
 pub use resolve::{
     EffectiveCompaction, EffectiveManifests, EffectiveOrphans, EffectivePolicy, EffectiveSnapshots,
-    Provenance, Resolved,
+    Provenance, Resolved, SortColumn, TableFacts,
 };
 pub use schedule::parse as parse_schedule;
 pub use settings::{
@@ -42,7 +42,6 @@ pub use settings::{
 };
 pub use window::{MaintenanceWindow, next_open};
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -132,6 +131,20 @@ pub struct Limits {
     #[serde(default)]
     pub max_rewrite_bytes_per_run: Option<u64>,
 
+    /// Ceiling on how many files one operation may delete.
+    ///
+    /// A ceiling on the blast radius of reasoning that turns out to be wrong.
+    /// It applies to **every** deletion Bergman performs — orphan removal and
+    /// snapshot-expiration cleanup alike — which is why it lives here rather
+    /// than under one of them: they share one deleter and therefore one safety
+    /// model (see [`crate::ops::delete`]).
+    ///
+    /// Nothing is lost by hitting it. What is withheld is reported and picked
+    /// up by the next pass; what would be lost by *not* having it is the
+    /// difference between an incident and a catastrophe.
+    #[serde(default = "Limits::default_max_deletes_per_run")]
+    pub max_deletes_per_run: usize,
+
     /// Only start work inside this window, e.g. `22:00-06:00 Europe/Berlin`.
     ///
     /// The timezone is mandatory: a window in local time moves when a replica
@@ -145,6 +158,27 @@ impl Limits {
     fn default_max_parallel_tables() -> usize {
         4
     }
+
+    fn default_max_deletes_per_run() -> usize {
+        100_000
+    }
+
+    /// Validate what can be checked without contacting anything.
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.max_parallel_tables == 0 {
+            return Err(Error::policy(
+                "limits.max_parallel_tables is 0, which would maintain no table at all",
+            ));
+        }
+        if self.max_deletes_per_run == 0 {
+            return Err(Error::policy(
+                "limits.max_deletes_per_run is 0, which would delete nothing while still \
+                 paying for every listing; set orphans.mode = \"dry-run\" and \
+                 snapshots.delete_files = false to report without deleting",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for Limits {
@@ -152,6 +186,7 @@ impl Default for Limits {
         Self {
             max_parallel_tables: Self::default_max_parallel_tables(),
             max_rewrite_bytes_per_run: None,
+            max_deletes_per_run: Self::default_max_deletes_per_run(),
             maintenance_window: None,
         }
     }
@@ -244,6 +279,7 @@ impl Policy {
     /// Validation happens here, so a bad policy is a startup failure rather
     /// than a surprise on the first table that matches it.
     pub fn compile(config: &Config) -> Result<Self> {
+        config.limits.validate()?;
         config.defaults.validate("defaults")?;
 
         let mut rules = Vec::with_capacity(config.rules.len());
@@ -300,11 +336,13 @@ impl Policy {
 
     /// Decide what happens to one table.
     ///
-    /// `table_properties` are the table's own Iceberg properties, which form
-    /// layer 3 of the resolution. Passing them separately (rather than reading
-    /// them here) keeps this function pure and testable, and lets the caller
-    /// decide what a table with unreadable metadata should get.
-    pub fn decide(&self, table: &TableRef, table_properties: &HashMap<String, String>) -> Decision {
+    /// `facts` is what the table itself says — its properties and its sort
+    /// order — which together form layer 3 of the resolution. Passing them in
+    /// (rather than reading metadata here) keeps this function pure and
+    /// testable, and lets the caller decide what a table with unreadable
+    /// metadata should get. [`TableFacts::unknown`] answers "does any rule match
+    /// this name at all", which needs no metadata read.
+    pub fn decide(&self, table: &TableRef, facts: &TableFacts) -> Decision {
         let Some(rule) = self.rules.iter().find(|r| r.matcher.matches(table)) else {
             return Decision::Unmatched;
         };
@@ -319,7 +357,7 @@ impl Policy {
             &rule.settings,
             &rule.pattern,
             &self.defaults,
-            table_properties,
+            facts,
         )))
     }
 
@@ -388,7 +426,8 @@ mod tests {
         .unwrap();
         let policy = Policy::compile(&config).unwrap();
 
-        let Decision::Maintain(eff) = policy.decide(&table("events"), &HashMap::new()) else {
+        let Decision::Maintain(eff) = policy.decide(&table("events"), &TableFacts::unknown())
+        else {
             panic!("expected the table to be maintained");
         };
         // The specific rule is listed first, so it answers — the general one
@@ -409,7 +448,10 @@ mod tests {
         let policy = Policy::compile(&config).unwrap();
 
         assert_eq!(
-            policy.decide(&TableRef::new("prod", ["tmp"], "scratch"), &HashMap::new()),
+            policy.decide(
+                &TableRef::new("prod", ["tmp"], "scratch"),
+                &TableFacts::unknown()
+            ),
             Decision::Skip {
                 pattern: "prod.tmp.*".into()
             }
@@ -418,7 +460,7 @@ mod tests {
         // deliberately excluded, and an operator debugging coverage needs to
         // tell them apart.
         assert_eq!(
-            policy.decide(&table("events"), &HashMap::new()),
+            policy.decide(&table("events"), &TableFacts::unknown()),
             Decision::Unmatched
         );
     }

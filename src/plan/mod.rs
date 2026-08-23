@@ -14,7 +14,7 @@
 mod planner;
 mod report;
 
-pub use planner::plan_table;
+pub use planner::{PlanContext, plan_table};
 pub use report::{OperationOutcome, OperationResult, RunReport, TableOutcome};
 
 use chrono::{DateTime, Utc};
@@ -93,17 +93,20 @@ pub struct TablePlan {
     pub policy: Box<EffectivePolicy>,
     /// The operations to perform, in execution order.
     pub operations: Vec<Operation>,
+    /// Work policy asked for that this table cannot receive, and why.
+    ///
+    /// An operation the policy enabled but the table's own shape forbids — a v3
+    /// table's row lineage, a partition under a superseded spec — would
+    /// otherwise read as "healthy". A note is not a failure: the table is fine,
+    /// some of the configured maintenance simply does not apply to it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 impl TablePlan {
-    /// Operations that will actually run.
-    pub fn executable(&self) -> impl Iterator<Item = &Operation> {
-        self.operations.iter().filter(|op| op.is_executable())
-    }
-
-    /// Operations that were planned but cannot run in this build.
-    pub fn blocked(&self) -> impl Iterator<Item = &Operation> {
-        self.operations.iter().filter(|op| !op.is_executable())
+    /// Whether this entry describes work rather than only an explanation.
+    pub fn has_work(&self) -> bool {
+        !self.operations.is_empty()
     }
 }
 
@@ -123,15 +126,6 @@ pub struct Operation {
     pub targets: Vec<crate::health::PartitionKey>,
     /// What it is expected to change.
     pub estimate: Estimate,
-    /// Whether Bergman can execute it, and if not, why not.
-    pub executability: Executability,
-}
-
-impl Operation {
-    /// Whether this operation will run.
-    pub fn is_executable(&self) -> bool {
-        matches!(self.executability, Executability::Executable)
-    }
 }
 
 /// The kinds of maintenance Bergman performs.
@@ -171,33 +165,6 @@ impl std::fmt::Display for OperationKind {
     }
 }
 
-/// Whether an operation can run.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "kebab-case")]
-pub enum Executability {
-    /// Bergman will perform it.
-    Executable,
-    /// Bergman planned it but cannot perform it.
-    ///
-    /// This is not a failure and not a silent omission — it is the honest
-    /// state of an operation whose commit path does not exist upstream yet.
-    /// Reporting it keeps the plan a true description of the table's needs
-    /// while being clear about what will actually happen.
-    Blocked {
-        /// Why it cannot run, in a sentence an operator can act on.
-        reason: String,
-    },
-}
-
-impl Executability {
-    /// Construct a [`Executability::Blocked`].
-    pub fn blocked(reason: impl Into<String>) -> Self {
-        Self::Blocked {
-            reason: reason.into(),
-        }
-    }
-}
-
 /// What an operation is expected to change.
 ///
 /// Estimates, and named as such. Exact figures for a rewrite are not knowable
@@ -221,11 +188,6 @@ impl MaintenancePlan {
         self.tables.iter().map(|t| t.operations.len()).sum()
     }
 
-    /// Operations that will actually run.
-    pub fn executable_count(&self) -> usize {
-        self.tables.iter().map(|t| t.executable().count()).sum()
-    }
-
     /// Bytes every planned rewrite would read.
     pub fn total_input_bytes(&self) -> u64 {
         self.tables
@@ -235,17 +197,38 @@ impl MaintenancePlan {
             .sum()
     }
 
-    /// Whether there is anything at all to do.
+    /// Whether this plan would do anything.
+    ///
+    /// Operations, not entries. A table can appear in `tables` carrying only a
+    /// note — work its policy asked for that it cannot receive — and that is an
+    /// explanation rather than a plan.
     pub fn is_empty(&self) -> bool {
-        self.tables.is_empty()
+        self.operation_count() == 0
     }
 
-    /// Apply a global byte budget, deferring what does not fit.
+    /// Explanations attached to tables, with no work planned for them.
+    ///
+    /// Separate from [`Self::is_empty`] because a cycle that will do nothing and
+    /// a cycle that will do nothing *for a reason worth reading* are different
+    /// answers, and only one of them wants an operator's attention.
+    pub fn notes(&self) -> impl Iterator<Item = (&TableRef, &str)> {
+        self.tables
+            .iter()
+            .flat_map(|t| t.notes.iter().map(move |note| (&t.table, note.as_str())))
+    }
+
+    /// Apply a global byte budget, deferring the rewrites that do not fit.
     ///
     /// Tables are ordered most-fragmented-first, so a budget too small for
     /// everything buys the most improvement it can. What does not fit is
     /// returned rather than dropped: a plan that silently truncated would read
     /// as "this is all there was to do".
+    ///
+    /// **Charged per operation, not per table.** Metadata-only work reads no
+    /// data files and costs the budget nothing. Deferring a whole table because
+    /// its compaction did not fit would stop that table's snapshots expiring —
+    /// it would grow history without bound *because* it was too fragmented to
+    /// compact, which is the opposite of what a cost control is for.
     pub fn apply_budget(&mut self, max_bytes: u64) -> Vec<TableRef> {
         // Most-fragmented first. Small files are the metric because they are
         // what a rewrite actually fixes; a large table already at target size
@@ -260,21 +243,37 @@ impl MaintenancePlan {
         let mut deferred = Vec::new();
         let mut kept = Vec::with_capacity(self.tables.len());
 
-        for table in std::mem::take(&mut self.tables) {
-            let cost: u64 = table
-                .operations
-                .iter()
-                .map(|op| op.estimate.input_bytes)
-                .sum();
+        for mut table in std::mem::take(&mut self.tables) {
+            let before = table.operations.len();
+            table.operations.retain(|op| {
+                let cost = op.estimate.input_bytes;
+                if cost == 0 {
+                    return true;
+                }
+                if spent.saturating_add(cost) <= max_bytes {
+                    spent = spent.saturating_add(cost);
+                    return true;
+                }
+                false
+            });
 
-            // A table costing nothing (metadata-only work) always proceeds:
-            // charging it against a byte budget would let a rewrite ceiling
-            // block snapshot expiration, which reads nothing.
-            if cost == 0 || spent.saturating_add(cost) <= max_bytes {
-                spent = spent.saturating_add(cost);
-                kept.push(table);
-            } else {
+            if table.operations.len() < before {
                 deferred.push(table.table.clone());
+                // Never silent, even when the table stays in the plan for its
+                // metadata-only half: an operator reading the run report has to
+                // be able to tell "compacted" from "compaction deferred, the
+                // rest ran".
+                table.notes.push(format!(
+                    "{} rewrite operations deferred: the cycle's \
+                     limits.max_rewrite_bytes_per_run budget is spent",
+                    before - table.operations.len()
+                ));
+            }
+
+            // A table left with nothing to do still carries its notes, and they
+            // are the reason it is worth keeping in the plan.
+            if !table.operations.is_empty() || !table.notes.is_empty() {
+                kept.push(table);
             }
         }
 
@@ -297,6 +296,119 @@ fn fragmentation_score(plan: &TablePlan) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::health::{FileHealth, ManifestHealth, SnapshotHealth, TableHealth};
+
+    fn plan_with(name: &str, ops: Vec<(OperationKind, u64)>) -> TablePlan {
+        let table = TableRef::new("prod", ["db"], name);
+        let policy = crate::policy::Policy::compile(
+            &crate::policy::Config::from_toml("[[rules]]\nmatch = \"prod.**\"\n").unwrap(),
+        )
+        .unwrap();
+        let crate::policy::Decision::Maintain(effective) =
+            policy.decide(&table, &crate::policy::TableFacts::unknown())
+        else {
+            panic!("expected the table to be maintained");
+        };
+
+        TablePlan {
+            table: table.clone(),
+            health: TableHealth {
+                table,
+                format_version: iceberg::spec::FormatVersion::V2,
+                write_format: None,
+                location: "s3://b/wh/db/t".into(),
+                current_spec_id: 0,
+                snapshots: SnapshotHealth::default(),
+                manifests: ManifestHealth::default(),
+                files: FileHealth::default(),
+                partitions: Vec::new(),
+            },
+            policy: effective,
+            operations: ops
+                .into_iter()
+                .map(|(kind, input_bytes)| Operation {
+                    kind,
+                    reason: "test".into(),
+                    targets: Vec::new(),
+                    estimate: Estimate {
+                        input_bytes,
+                        ..Default::default()
+                    },
+                })
+                .collect(),
+            notes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_spent_budget_defers_the_rewrite_and_keeps_the_metadata_work() {
+        // The failure this exists to prevent: a table too fragmented to fit the
+        // budget would also stop expiring snapshots, so it would grow history
+        // without bound *because* it needed compaction. A byte ceiling bounds
+        // the cost of rewriting data; it is not a reason to stop reading
+        // metadata.
+        let mut plan = MaintenancePlan {
+            generated_at: Utc::now(),
+            tables: vec![plan_with(
+                "t",
+                vec![
+                    (OperationKind::Compact, 1_000),
+                    (OperationKind::ExpireSnapshots, 0),
+                ],
+            )],
+            uneventful: Vec::new(),
+            deferred: Vec::new(),
+        };
+
+        let deferred = plan.apply_budget(10);
+
+        assert_eq!(deferred.len(), 1, "the deferral must be reported");
+        let kept = &plan.tables[0];
+        assert_eq!(
+            kept.operations.iter().map(|op| op.kind).collect::<Vec<_>>(),
+            vec![OperationKind::ExpireSnapshots],
+            "metadata-only work is not charged against a rewrite budget"
+        );
+        assert!(
+            kept.notes[0].contains("deferred"),
+            "the partial deferral must not be silent: {:?}",
+            kept.notes
+        );
+    }
+
+    #[test]
+    fn a_budget_that_covers_everything_defers_nothing() {
+        let mut plan = MaintenancePlan {
+            generated_at: Utc::now(),
+            tables: vec![plan_with("t", vec![(OperationKind::Compact, 1_000)])],
+            uneventful: Vec::new(),
+            deferred: Vec::new(),
+        };
+
+        assert!(plan.apply_budget(10_000).is_empty());
+        assert_eq!(plan.tables[0].operations.len(), 1);
+        assert!(plan.tables[0].notes.is_empty());
+    }
+
+    #[test]
+    fn the_budget_is_spent_across_tables_most_fragmented_first() {
+        let mut plan = MaintenancePlan {
+            generated_at: Utc::now(),
+            tables: vec![
+                plan_with("a", vec![(OperationKind::Compact, 100)]),
+                plan_with("b", vec![(OperationKind::Compact, 100)]),
+                plan_with("c", vec![(OperationKind::Compact, 100)]),
+            ],
+            uneventful: Vec::new(),
+            deferred: Vec::new(),
+        };
+
+        // Two fit, the third does not — and the third is still in the plan,
+        // carrying the note that says why nothing happened to it.
+        let deferred = plan.apply_budget(250);
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(plan.tables.iter().filter(|t| t.has_work()).count(), 2);
+    }
 
     #[test]
     fn operations_order_compact_before_cleanup() {
@@ -319,17 +431,5 @@ mod tests {
                 OperationKind::RemoveOrphans,
             ]
         );
-    }
-
-    #[test]
-    fn blocked_operations_are_not_executable() {
-        let op = Operation {
-            kind: OperationKind::Compact,
-            targets: Vec::new(),
-            reason: "60% small files".into(),
-            estimate: Estimate::default(),
-            executability: Executability::blocked("no upstream commit path"),
-        };
-        assert!(!op.is_executable());
     }
 }

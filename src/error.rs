@@ -18,7 +18,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// getting them confused is how a maintenance engine corrupts a table. A
 /// *conflict* means the table moved under us and our outputs describe a state
 /// that no longer exists: the plan must be rebuilt from the new snapshot, never
-/// re-committed as-is (§6). A *transient* failure is the same request against a
+/// re-committed as-is. A *transient* failure is the same request against a
 /// working world — retrying is correct. A *terminal* failure will fail
 /// identically forever, so retrying only spends money.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,7 +64,7 @@ pub enum Error {
     ///
     /// Distinct from [`Error::CommitConflict`]: that one is the catalog
     /// refusing our compare-and-swap, this one is Bergman refusing to *offer*
-    /// a commit it has already determined would be unsafe (§6).
+    /// a commit it has already determined would be unsafe.
     #[error("plan for {table} is stale: {detail}")]
     StalePlan {
         /// The table whose plan is stale.
@@ -120,7 +120,8 @@ impl Error {
     pub fn disposition(&self) -> Disposition {
         match self {
             // The table moved. Rebuilding the plan is the only safe response;
-            // §6 explains why re-committing is not.
+            // Re-committing outputs computed against a table that has moved
+            // is how a concurrent delete gets discarded.
             Error::CommitConflict { .. } | Error::StalePlan { .. } => Disposition::Replan,
 
             // A catalog or storage failure is usually the network, and the

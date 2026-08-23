@@ -10,7 +10,7 @@ mod common;
 
 use std::time::Duration;
 
-use bergman::obs::{NoopObserver, OperationContext};
+use bergman::obs::OperationContext;
 use bergman::ops::expire;
 use bergman::plan::{OperationKind, OperationResult};
 use bergman::policy::{Config, Decision, Policy, TableRef};
@@ -55,11 +55,12 @@ async fn expire_now(
     let table = fixture.table();
     let table_ref = TableRef::new("prod", ["db"], "events");
 
-    expire::run(
+    let loader = fixture.loader();
+    let mut env = common::op_env(
         &table,
-        &fixture.catalog(),
-        settings,
-        &NoopObserver,
+        &fixture.ident,
+        &loader,
+        fixture.committer.as_ref(),
         OperationContext {
             run_id: "test",
             table: &table_ref,
@@ -67,12 +68,14 @@ async fn expire_now(
             matched_rule: "prod.db.events",
             reason: "test",
         },
-        // An hour ahead, so every snapshot the fixture just wrote is older than
-        // the cutoff without the test having to sleep.
-        Utc::now() + chrono::Duration::hours(1),
-    )
-    .await
-    .expect("expiration runs")
+    );
+    // An hour ahead, so every snapshot the fixture just wrote is older than the
+    // cutoff without the test having to sleep.
+    env.now = Utc::now() + chrono::Duration::hours(1);
+
+    expire::run(&env, &fixture.catalog(), settings)
+        .await
+        .expect("expiration runs")
 }
 
 /// A table with `snapshots` appends, each adding one file.

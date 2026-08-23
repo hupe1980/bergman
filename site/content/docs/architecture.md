@@ -72,10 +72,13 @@ about a specific table state. Re-submitting it against a state that has moved
 applies a decision to a world it was not made for — and for a rewrite, that is
 precisely how rows deleted by a concurrent commit come back to life.
 
-Retries are few (three) and the backoff is short. A table being written hard will
-keep winning, and the right response is to come back next cycle rather than to
-spend the cycle losing. A conflict is reported as `conflicted`, distinct from
-`failed`:
+Retries are few (three) and the backoff is short, exponential, and **jittered**.
+A table being written hard will keep winning, and the right response is to come
+back next cycle rather than to spend the cycle losing. The jitter matters
+because the scale-out model is N stateless replicas coordinating through
+optimistic commits: two replicas that lose the same compare-and-swap at the same
+moment would otherwise come back in lockstep and spend the whole budget losing
+to each other. A conflict is reported as `conflicted`, distinct from `failed`:
 
 ```text
   [<>] expire-snapshots: table moved during 3 commit attempts; will replan next cycle
@@ -111,15 +114,57 @@ Bounded everywhere, and the bounds are parameters rather than statics:
 
 | Where | Default | Why |
 |---|---|---|
-| Tables in a cycle | `limits.max_parallel_tables` (4) | Configurable; the catalog is a shared service |
+| Tables in a cycle | `limits.max_parallel_tables` (4) | Both examined and maintained concurrently; the catalog is a shared service |
 | Namespaces during discovery | 16 | Latency-bound tree walk, not CPU-bound |
 | Manifests within a table | 16 | Same |
 | Snapshots during reachability | 8 | Each fans out to 16 manifests |
+| Deletions within an orphan scan | 32 | A million round trips in series takes hours; ten thousand at once throttles the bucket |
+| Within one file group's rewrite | 1 | Parallelism is across tables and groups, which are already bounded and commit separately. Intra-group parallelism would multiply the memory budget by the core count without changing how much work a cycle does |
 
-Scale-out, when it comes, is stateless replicas sharding tables by UUID — no
-broker, no consensus service. Optimistic catalog commits already make
-double-execution safe, so sharding is a cost optimization rather than a
-correctness requirement.
+`compaction.max_sort_memory` is the executor's memory pool **per file group**,
+and groups within a table run one at a time — so a cycle's peak is roughly
+`max_parallel_tables × max_sort_memory`.
+
+Operations *within* a table stay strictly ordered, because that ordering is a
+correctness property. Two different tables share nothing but the object store,
+so nothing is serialised between them.
+
+Scale-out is stateless replicas with disjoint `[[rules]]` or disjoint catalog
+`namespaces` — no broker, no consensus service. Optimistic catalog commits
+already make double-execution safe, so sharding is a cost optimization rather
+than a correctness requirement. Automatic shard assignment is
+[not built](@/docs/status.md#limits).
+
+## The executor {#executor}
+
+Compaction is the only operation that reads and writes data, and the only one
+that needs a query engine. The split is deliberate, and each stage goes to
+whichever component does it best:
+
+| Stage | Who | Why |
+|---|---|---|
+| Scan | upstream `ArrowReader` | Already vectorized, already Iceberg-correct |
+| **Positional** deletes | upstream `ArrowReader` | They become a Parquet row selection, so deleted rows are never decoded — *better* than a join |
+| **Equality** deletes | DataFusion hash anti-join | Upstream builds one predicate term per delete row and evaluates that tree against every batch: `data rows × delete rows`. A hash anti-join is their sum, and spills |
+| Sort | DataFusion | Spills |
+| Write | upstream `RollingFileWriter` | Real `DataFile`s with full column metrics |
+
+Two rules govern the plan, and both are silent when broken:
+
+**Files are bucketed by which deletes apply to them.** A delete committed at
+sequence N applies to files written before it and not after, and upstream's scan
+has already worked that out — `FileScanTask::deletes` holds exactly the
+applicable ones. So one file group can hold files with *different* delete sets,
+which is the ordinary CDC shape. Anti-joining a file against a delete that does
+not apply to it would remove rows nothing ever deleted.
+
+**Buckets are unioned before the sort, not sorted individually.** Sorting per
+bucket would leave the output ordered in runs rather than globally — metadata
+claiming a clustering the files do not have.
+
+`compaction` is a default-on feature; a build without it has no compaction
+rather than a slower one, so there is only ever one executor to keep correct.
+See [Compaction](@/docs/compaction.md#query-engine).
 
 ## The commit layer {#commit-layer}
 
@@ -144,14 +189,62 @@ Operations are written against a `TableCommitter` trait rather than the
 transport, so when upstream lands `OverwriteAction` a second implementation
 wraps it and nothing above `src/commit` changes.
 
-Two invariants govern a rewrite commit, and both lose data when broken:
+Four invariants govern a produced snapshot. Each loses or corrupts data when
+broken, and none of them fails visibly:
 
 1. **Every live file not being removed is carried forward.** A manifest set that
-   omits one silently deletes those rows.
-2. **Sequence numbers are inherited, never reassigned.** A file carried through
-   a rewrite keeps the sequence number of the file it replaces, so delete files
-   written *later* still apply to it. Stamping the new snapshot's number on it
-   would make it look newer than the deletes that should remove its rows.
+   omits one silently deletes those rows. Checked rather than assumed:
+   everything the caller asked to remove must actually be live, or the plan is
+   stale and the commit is refused before it is offered.
+2. **A carried-forward file keeps its own sequence number and snapshot id**, so
+   delete files written *later* still apply to it. Stamping the new snapshot's
+   number on an untouched file would make it look newer than the deletes that
+   should remove its rows. Files the snapshot genuinely *adds* are the opposite
+   case and take the new number — which is higher than every delete already
+   applied to their contents, and is therefore what retires those deletes.
+3. **A manifest is rewritten under the partition spec it was written under.** A
+   manifest carries exactly one `partition_spec_id`, and an entry's partition
+   tuple is meaningless against any other. Rewriting an old manifest under the
+   table's *current* spec re-interprets every tuple in it, which mis-prunes
+   files at query time. Nothing fails; queries just start returning wrong
+   answers.
+4. **A branch's retention survives a commit that moves it.** The REST protocol's
+   `set-snapshot-ref` replaces the whole reference, so a commit that names no
+   retention silently erases what `ALTER TABLE … CREATE BRANCH main RETAIN …`
+   configured — visible only the next time expiration runs. Upstream exposes no
+   accessor for it, so Bergman reads the retention out of the table's own
+   metadata JSON.
+
+5. **A snapshot Bergman authors is v1 or v2.** A format v3 table's row lineage
+   cannot survive a rewrite, and `TableMetadataBuilder::add_snapshot` rejects a
+   v3 snapshot with no `first-row-id` outright — so such a commit does not
+   merely risk being wrong, no spec-correct catalog applies it. Refused with a
+   reason, per operation, so expiration and orphan removal still run. See
+   [Compaction](@/docs/compaction.md#format-v3).
+
+Bergman only maintains `main`. A table whose current snapshot is not `main`'s
+head is refused with that reason, rather than having `main` moved to a snapshot
+descending from something else.
+
+### Re-packing manifests clusters by partition
+
+Manifest rewriting has a second rule beside invariant 3, and it is the one that
+makes the operation worth doing at all.
+
+A manifest list records each manifest's partition *summary* — the range of
+values its entries cover — and that summary is what lets a query skip a manifest
+without opening it. Re-packing entries in whatever order they happened to arrive
+produces manifests whose summaries each span the whole table, so every query
+opens every one of them: fewer manifests, all of which must now be read, which
+is worse than what the rewrite started with. One sort of metadata already in
+memory prevents it.
+
+The sort is **stable and breaks no ties**, so within one partition entries keep
+the order the parent's manifests had — commit order. A table whose rows arrive
+in time order keeps that locality, and with it the tight min/max bounds a
+timestamp column gets from it; an arbitrary second key would reshuffle every
+entry in every partition to no purpose. Java's `RewriteManifests` clusters the
+same way.
 
 ## What Bergman owns, and why
 
@@ -167,9 +260,14 @@ logic can be tested against an in-memory store rather than a cloud account.
 physical cleanup as a higher-level responsibility. Bergman computes the reachable
 set before and after the commit and deletes the difference.
 
-**Commit delivery**, as above.
+**Commit delivery**, as above — including the OAuth2 client-credentials
+exchange, with refresh. `iceberg-catalog-rest` carries a `TODO: Support
+automatic token refreshing`, and the commit path reads the same auth properties
+the read path does. Two clients that authenticated differently would let reads
+succeed and every write return 401 — the tool would appear to work and quietly
+change nothing.
 
-All three are temporary implementations while the gap exists, and the first two
+All four are temporary implementations while the gap exists, and the first two
 are the natural things to contribute back.
 
 ## Errors carry a disposition

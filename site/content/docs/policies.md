@@ -70,13 +70,12 @@ Every setting resolves through four layers, most specific first:
 
 1. the matching **rule**
 2. the config's **`[defaults]`**
-3. the **table's own Iceberg properties**
+3. the **table's own metadata** — its Iceberg properties, and its `sort-order`
 4. the **Iceberg specification default**
 
 Layer 3 is what makes this more than a config file. A table already carries its
-owner's intent in its properties, and every other Iceberg tool reads them; a
-maintenance engine that ignored them would be a second, competing source of
-truth.
+owner's intent, and every other Iceberg tool reads it; a maintenance engine that
+ignored it would be a second, competing source of truth.
 
 Properties consulted:
 
@@ -87,6 +86,20 @@ Properties consulted:
 | `snapshots.min_to_keep` | `history.expire.min-snapshots-to-keep` | 1 |
 | `manifests.target_size` | `commit.manifest.target-size-bytes` | 8 MiB |
 | `manifests.min_count_to_merge` | `commit.manifest.min-count-to-merge` | 100 |
+
+And one thing that is not a property:
+
+| Setting | Table metadata | Default |
+|---|---|---|
+| `compaction.sort` | the table's `sort-order` | unsorted |
+
+That one is the sharpest case for the whole layer. A table declaring a sort
+order has writers that honour it, so a rewrite that bin-packed those files back
+together unsorted would leave the table claiming a clustering its files no
+longer have — and every query with a predicate on the sort columns would start
+reading every file. Preserving it is not an optimization; it is not breaking
+something the table configured. See
+[Compaction](@/docs/compaction.md#the-tables-own-sort-order).
 
 A property that is present but unparseable falls through to the default rather
 than failing the run — it is one table's typo, and refusing to maintain a table
@@ -106,24 +119,35 @@ bergman policy explain prod.analytics.events
 prod.analytics.events
   matched rule: prod.analytics.*
 
- SETTING                                VALUE      FROM
- compaction.enabled                     false      Bergman default
- compaction.target_file_size            128 MiB    table property write.target-file-size-bytes
- compaction.trigger.small_file_ratio    0.30       Bergman default
- compaction.trigger.min_input_files     5          Bergman default
- compaction.trigger.delete_ratio        0.10       Bergman default
- snapshots.enabled                      true       Bergman default
- snapshots.max_age                      7d         [defaults]
- snapshots.min_to_keep                  3          [defaults]
- snapshots.delete_files                 false      Bergman default
- manifests.rewrite                      false      Bergman default
- orphans.enabled                        false      Bergman default
- orphans.mode                           DryRun     Bergman default
- orphans.older_than                     7d         Bergman default
+ SETTING                                 VALUE                    FROM
+ compaction.enabled                      true                     rule "prod.analytics.*"
+ compaction.target_file_size             128 MiB                  table property write.target-file-size-bytes
+ compaction.sort                         event_date, region desc  the table's sort order
+ compaction.trigger.small_file_ratio     0.30                     Bergman default
+ compaction.trigger.min_file_size_ratio  0.75                     Bergman default
+ compaction.trigger.min_input_files      5                        Bergman default
+ compaction.trigger.delete_ratio         0.10                     Bergman default
+ compaction.trigger.min_file_age         1h                       Bergman default
+ compaction.max_sort_memory              1.00 GiB                 Bergman default
+ compaction.max_group_bytes              8.00 GiB                 Bergman default
+ compaction.max_input_files              10000                    Bergman default
+ snapshots.enabled                       true                     Bergman default
+ snapshots.max_age                       7d                       [defaults]
+ snapshots.min_to_keep                   3                        [defaults]
+ snapshots.delete_files                  false                    Bergman default
+ manifests.rewrite                       false                    Bergman default
+ manifests.target_size                   8.00 MiB                 Iceberg default
+ manifests.min_count_to_merge            100                      Iceberg default
+ orphans.enabled                         false                    Bergman default
+ orphans.mode                            dry-run                  Bergman default
+ orphans.older_than                      7d                       Bergman default
+ orphans.min_interval                    24h                      Bergman default
 ```
 
-Every row names the layer that answered. A setting whose origin cannot be shown
-is a setting nobody can debug.
+**Every** resolved setting, not a selection — a knob missing from the table is a
+knob whose answer you have to go and guess. Every row names the layer that
+answered, including the ones where the answer was "nobody asked": a setting
+whose origin cannot be shown is a setting nobody can debug.
 
 ## Which tables a policy covers
 
@@ -151,7 +175,14 @@ Bergman's own defaults, for knobs Iceberg does not define:
 | `compaction.trigger.min_input_files` | 5 | Matches Spark's `rewrite_data_files` |
 | `compaction.trigger.delete_ratio` | 0.1 | |
 | `compaction.trigger.min_file_size_ratio` | 0.75 | What counts as "small" |
+| `compaction.trigger.min_file_age` | 1 hour | How long a partition must be quiet before it is rewritten |
+| `compaction.max_group_bytes` | 8 GiB | Bytes per [file group](@/docs/compaction.md#file-groups) |
+| `compaction.max_input_files` | 10 000 | Files per file group |
+| `compaction.max_sort_memory` | 1 GiB | Executor memory pool; the sort and the anti-join spill when they reach it |
+| `compaction.sort` | the table's own `sort-order` | Output clustering — see [Compaction](@/docs/compaction.md#the-tables-own-sort-order) |
 | `orphans.older_than` | 7 days | Floor of 24h, [not configurable](@/docs/orphans.md#the-grace-period) |
+| `orphans.min_interval` | 24 hours | Shortest gap between two [scans](@/docs/orphans.md#cadence) of one table |
+| `limits.max_deletes_per_run` | 100 000 | Ceiling on one operation's blast radius — every deleter, not only the scanner |
 
 Everything that rewrites or deletes data defaults **off**. Metadata-only
 snapshot expiration is the single exception.

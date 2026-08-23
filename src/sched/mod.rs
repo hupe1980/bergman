@@ -154,8 +154,20 @@ impl Daemon {
                 () = tokio::time::sleep(delay) => Scope::Everything,
             };
 
+            // A rule's schedule scopes the cycle to that rule's tables. A rule
+            // asking to be evaluated every five minutes should cost five-minute
+            // evaluation of *its* tables, not of every table the deployment
+            // holds — otherwise one aggressive schedule sets the cadence for
+            // the whole catalog.
+            let scope = match (&scope, &trigger) {
+                (Scope::Everything, Trigger::Schedule { pattern }) => {
+                    Scope::Matching(pattern.clone())
+                }
+                _ => scope,
+            };
+
             let trigger = match &scope {
-                Scope::Everything => trigger,
+                Scope::Everything | Scope::Matching(_) => trigger,
                 Scope::Tables(tables) => Trigger::Event {
                     tables: tables.len(),
                 },
@@ -175,6 +187,7 @@ impl Daemon {
     async fn cycle(&self, scope: &Scope) -> Result<RunReport> {
         let plan = match scope {
             Scope::Everything => self.bergman.plan().await?,
+            Scope::Matching(pattern) => self.bergman.plan_matching(pattern).await?,
             Scope::Tables(tables) => self.bergman.plan_tables(tables).await?,
         };
         self.bergman.run(&plan).await
@@ -183,9 +196,12 @@ impl Daemon {
 
 /// What a cycle covers.
 enum Scope {
-    /// Every table the catalogs hold.
+    /// Every table the catalogs hold. What the daemon's own interval means.
     Everything,
-    /// Only these.
+    /// Only the tables one rule's pattern matches. What a rule's `schedule`
+    /// means.
+    Matching(String),
+    /// Only these. What an event means.
     Tables(Vec<crate::policy::TableRef>),
 }
 

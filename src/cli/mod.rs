@@ -64,12 +64,23 @@ enum Command {
     /// before Bergman is trusted to write anything.
     Inspect {
         /// Only inspect tables matching this glob.
+        ///
+        /// Scopes the *examination*, not just the output: a table the pattern
+        /// excludes is never read.
         #[arg(long)]
         table: Option<String>,
     },
 
     /// Show what maintenance would do. Reads only, changes nothing.
-    Plan,
+    Plan {
+        /// Only plan tables matching this glob.
+        ///
+        /// Scopes the *evaluation*, not just the output: a table the pattern
+        /// excludes is never read. That is what makes it usable against a
+        /// catalog of thousands when you care about one namespace.
+        #[arg(long)]
+        table: Option<String>,
+    },
 
     /// Execute maintenance.
     Run {
@@ -79,6 +90,10 @@ enum Command {
         /// `--dry-run` on the command that changes things is the safer habit.
         #[arg(long)]
         dry_run: bool,
+
+        /// Only maintain tables matching this glob.
+        #[arg(long)]
+        table: Option<String>,
     },
 
     /// Run maintenance repeatedly until stopped.
@@ -113,6 +128,21 @@ enum Command {
         #[cfg(feature = "metrics")]
         #[arg(long, default_value = "30s", value_parser = parse_duration)]
         debounce: std::time::Duration,
+
+        /// Require this bearer token on `POST /events`.
+        ///
+        /// A name, not a value — the token is read from the environment, the
+        /// way every other credential is.
+        ///
+        /// Unlike `/metrics` and `/health`, a notification *causes work*: the
+        /// daemon plans and maintains a table, which lists object storage and
+        /// can rewrite data. Leaving it open is right on a loopback bind or
+        /// behind a service mesh that authenticates for you, and wrong
+        /// everywhere else — the daemon warns when it is open on a routable
+        /// address.
+        #[cfg(feature = "metrics")]
+        #[arg(long, requires = "events", value_name = "VAR")]
+        events_token_env: Option<String>,
     },
 
     /// Policy inspection.
@@ -172,22 +202,20 @@ pub async fn main() -> Result<()> {
 
     match cli.command {
         Command::Inspect { table } => {
-            let mut health = bergman.inspect().await?;
-            if let Some(pattern) = table {
-                let matcher = crate::policy::TableMatcher::new(&pattern)
-                    .map_err(|e| Error::config(format!("--table {pattern:?}: {e}")))?;
-                health.retain(|h| matcher.matches(&h.table));
-            }
+            let health = match table {
+                Some(pattern) => bergman.inspect_matching(&pattern).await?,
+                None => bergman.inspect().await?,
+            };
             render::inspect(&health, cli.format)
         }
 
-        Command::Plan => {
-            let plan = bergman.plan().await?;
+        Command::Plan { table } => {
+            let plan = plan_for(&bergman, table.as_deref()).await?;
             render::plan(&plan, cli.format)
         }
 
-        Command::Run { dry_run } => {
-            let plan = bergman.plan().await?;
+        Command::Run { dry_run, table } => {
+            let plan = plan_for(&bergman, table.as_deref()).await?;
             if dry_run {
                 return render::plan(&plan, cli.format);
             }
@@ -212,6 +240,8 @@ pub async fn main() -> Result<()> {
             events,
             #[cfg(feature = "metrics")]
             debounce,
+            #[cfg(feature = "metrics")]
+            events_token_env,
         } => {
             let daemon = crate::sched::Daemon::new(
                 Arc::new(bergman),
@@ -220,6 +250,14 @@ pub async fn main() -> Result<()> {
                     max_cycles,
                 },
             )?;
+
+            #[cfg(feature = "metrics")]
+            let event_token = match &events_token_env {
+                Some(var) => Some(crate::obs::EventToken::new(std::env::var(var).map_err(
+                    |_| Error::config(format!("--events-token-env names ${var}, which is not set")),
+                )?)),
+                None => None,
+            };
 
             #[cfg(feature = "metrics")]
             let (sender, stream) = if events {
@@ -239,7 +277,8 @@ pub async fn main() -> Result<()> {
                 let metrics = Arc::clone(&metrics);
                 tokio::spawn(async move {
                     if let Err(e) =
-                        crate::obs::serve(addr, metrics, sender, shutdown_signal()).await
+                        crate::obs::serve(addr, metrics, sender, event_token, shutdown_signal())
+                            .await
                     {
                         eprintln!("bergman: {e}");
                     }
@@ -296,18 +335,32 @@ pub async fn main() -> Result<()> {
         }
 
         Command::Policy(PolicyCommand::Match) => {
-            let health = bergman.inspect().await?;
-            let matches: Vec<(TableRef, Decision)> = health
+            // Discovery only. Which tables a rule matches is a question about
+            // names, and answering it by reading every table's manifests would
+            // make a one-line question cost a full warehouse walk.
+            let matches: Vec<(TableRef, Decision)> = bergman
+                .tables()
+                .await?
                 .into_iter()
-                .map(|h| {
-                    let decision = bergman.policy().decide(&h.table, &Default::default());
-                    (h.table, decision)
+                .map(|table| {
+                    let decision = bergman
+                        .policy()
+                        .decide(&table, &crate::policy::TableFacts::unknown());
+                    (table, decision)
                 })
                 .collect();
             render::matches(&matches, cli.format)
         }
 
         Command::Policy(PolicyCommand::Lint) => unreachable!("handled above"),
+    }
+}
+
+/// Plan every table, or only those a pattern matches.
+async fn plan_for(bergman: &Bergman, pattern: Option<&str>) -> Result<MaintenancePlan> {
+    match pattern {
+        Some(pattern) => bergman.plan_matching(pattern).await,
+        None => bergman.plan().await,
     }
 }
 
@@ -406,11 +459,6 @@ fn init_tracing(level: &str) {
         .try_init();
 }
 
-/// A plan's exit code, for scripts.
-pub fn plan_exit_code(plan: &MaintenancePlan) -> i32 {
-    if plan.is_empty() { 0 } else { 1 }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,7 +486,9 @@ mod tests {
         // would otherwise only be found by a user.
         assert!(Cli::try_parse_from(["bergman", "inspect"]).is_ok());
         assert!(Cli::try_parse_from(["bergman", "plan", "--format", "json"]).is_ok());
+        assert!(Cli::try_parse_from(["bergman", "plan", "--table", "prod.db.*"]).is_ok());
         assert!(Cli::try_parse_from(["bergman", "run", "--dry-run"]).is_ok());
+        assert!(Cli::try_parse_from(["bergman", "run", "--table", "prod.db.*"]).is_ok());
         assert!(Cli::try_parse_from(["bergman", "policy", "lint"]).is_ok());
         assert!(Cli::try_parse_from(["bergman", "daemon"]).is_ok());
         assert!(Cli::try_parse_from(["bergman", "daemon", "--interval", "15m"]).is_ok());

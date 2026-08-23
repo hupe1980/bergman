@@ -45,8 +45,10 @@ spec:
                 - name: config
                   mountPath: /etc/bergman
               resources:
-                requests: { cpu: 200m, memory: 128Mi }
-                limits:   { memory: 512Mi }
+                requests: { cpu: 500m, memory: 512Mi }
+                # See "Sizing" below: compaction's memory pool is
+                # max_parallel_tables x max_sort_memory, 4 GiB by default.
+                limits:   { memory: 6Gi }
           volumes:
             - name: config
               configMap: { name: bergman-config }
@@ -66,20 +68,30 @@ bergman daemon --interval 1h
 ```
 
 It sleeps until the **earliest** trigger fires — the interval, or the soonest
-rule `schedule` — because a cycle evaluates every table anyway and the health
-analyzer is what decides whether a given one has work. Waking more often than
-the busiest rule asks for would be waste; waking less often would silently
-stretch that rule's cadence.
+rule `schedule`. Waking more often than the busiest rule asks for would be
+waste; waking less often would silently stretch that rule's cadence.
+
+What wakes it decides what the cycle covers:
+
+| Woken by | Evaluates |
+|---|---|
+| `--interval` | Every table the catalogs hold |
+| A rule's `schedule` | Only the tables that rule's pattern matches |
+| An event | Only the tables it was told about |
 
 ```toml
 [[rules]]
 match    = "prod.streaming.**"
-schedule = "*/15 * * * *"      # this rule pulls the daemon to 15 minutes
+schedule = "*/15 * * * *"      # wakes every 15 minutes, for these tables only
 
 [[rules]]
 match    = "prod.archive.**"
-schedule = "0 3 * * *"         # this one does not push it back out
+schedule = "0 3 * * *"         # nightly, for these
 ```
+
+Scoping a schedule to its own rule is what keeps one aggressive cadence from
+setting the pace for the whole catalog: without it, `*/15` above would mean the
+archive tables were evaluated every fifteen minutes too.
 
 ```yaml
 # As a Deployment rather than a CronJob, when you want the metrics endpoint.
@@ -128,6 +140,35 @@ ignores the rest of a `CloudEvents` envelope — validating fields Bergman has n
 use for would reject perfectly good notifications for reasons that do not matter
 to it.
 
+#### Authenticate it {#events-token}
+
+Unlike `/metrics` and `/health`, this endpoint **causes work**: a notification
+makes the daemon plan and maintain a table, which lists object storage and can
+rewrite data. An open one on a routable address lets anyone who can reach the
+port spend the warehouse's money.
+
+```bash
+BERGMAN_EVENTS_TOKEN=$(openssl rand -hex 32) \
+  bergman daemon --listen 0.0.0.0:9090 --events \
+                 --events-token-env BERGMAN_EVENTS_TOKEN
+```
+
+```bash
+curl -XPOST localhost:9090/events \
+  -H "authorization: Bearer $BERGMAN_EVENTS_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"catalog":"prod","namespace":["analytics"],"table":"events"}'
+```
+
+The token is a variable *name*, never a value, and it is compared in constant
+time — a naive `==` leaks a secret's length and, byte by byte, its contents to
+anyone who can measure response latency, and an endpoint on the network is
+exactly where that is measurable.
+
+Leaving it open is right on a loopback bind, or behind a service mesh that
+authenticates for you. It is the wrong answer everywhere else, so the daemon
+warns when `/events` is served without a token on an address that is neither.
+
 ### Windows
 
 With a `maintenance_window` set, the daemon sleeps to the window's edge rather
@@ -147,6 +188,26 @@ trigger that fired.
 > Prefer `run` under a scheduler you already operate. A `CronJob` gives you
 > retries, history, alerting and resource limits that the daemon does not
 > reimplement.
+
+## Sizing
+
+Metadata-only maintenance — expire, manifests, orphans — needs very little:
+a few hundred MiB covers a large catalog, because nothing but manifests is ever
+held.
+
+Compaction is what needs headroom. `compaction.max_sort_memory` (1 GiB by
+default) is the executor's memory pool **per file group**, groups within a table
+run one at a time, and `limits.max_parallel_tables` (4) tables run at once — so
+budget roughly:
+
+```text
+max_parallel_tables x max_sort_memory   +   headroom
+        4           x      1 GiB        +   ~1 GiB    =  ~5 GiB
+```
+
+Both knobs are worth lowering on a small node. Going below the pool size does
+not fail — the sort and the anti-join spill to disk — it just gets slower, so
+give the container writable scratch space if you tighten it.
 
 ## Exit codes
 
@@ -175,17 +236,57 @@ per table.
 **Provider chain.** Instance roles, IRSA, workload identity. Nothing in the
 config file, nothing in the environment.
 
-**Environment.** `token_env` names the variable holding the catalog token; the
-value never appears in `bergman.toml`.
+**OAuth2 client credentials.** Set `credential = "client-id:secret"` in
+`[catalogs.properties]`, optionally with `oauth2-server-uri` and `scope` — the
+same properties every Iceberg client reads, so one configuration authenticates
+both Bergman's read path and its commit path. Bergman renews the token before
+it expires, which matters for a daemon holding a one-hour token.
+
+**Environment.** `token_env` names the variable holding a static bearer token;
+the value never appears in `bergman.toml`. Whatever produced that token owns its
+lifetime — Bergman does not renew a token it was handed.
 
 **Last resort.** Keys in `[catalogs.properties]`. Works, but the file is now a
 secret.
 
+### Secrets never reach a log
+
+`Credential`, the cached bearer token and `CatalogConfig` implement `Debug` by
+hand and **redact**. That is not belt-and-braces: every one of those types is
+reachable by `Debug` from `Bergman` itself, so a derived impl would mean a
+single `tracing::debug!(?bergman)` in an embedding service wrote the client
+secret and the warehouse's storage keys into that service's logs.
+
+Property *names* survive redaction — knowing a secret was supplied is the other
+half of debugging one that was not — and non-secret settings such as
+`s3.endpoint` and `s3.region` are shown in full, because "is my endpoint
+reaching the config" is usually the question being asked:
+
+```text
+CatalogConfig { name: "prod", uri: "https://polaris.example.com/api/catalog",
+  token_env: Some("BERGMAN_CATALOG_TOKEN"),
+  properties: {"s3.endpoint": "https://minio:9000", "s3.region": "eu-central-1",
+               "s3.secret-access-key": "<redacted>"} }
+```
+
+The redaction rule is a substring match over the words that mark a secret in
+Iceberg's property vocabulary — `secret`, `key`, `token`, `credential`,
+`password`, `sas` — so it over-redacts rather than under-redacts. A redacted
+identifier costs you one lookup; a logged secret costs you a rotation.
+
 ### Least privilege
 
-Bergman needs `s3:ListBucket` and `s3:GetObject` on the warehouse prefix, plus
-`s3:DeleteObject` **only if** you enable orphan deletion or
-`snapshots.delete_files`:
+Bergman needs, on the warehouse prefix:
+
+| Action | Needed for |
+|---|---|
+| `s3:ListBucket` | Orphan scanning — the listing *is* the operation |
+| `s3:GetObject` | Reading metadata, and reading data files during compaction |
+| `s3:PutObject` | Writing rewritten data files, manifests and manifest lists |
+| `s3:DeleteObject` | **Only if** you enable orphan deletion or `snapshots.delete_files` |
+
+A read-only deployment — `inspect` and `plan`, nothing else — needs only the
+first two.
 
 ```json
 {
@@ -199,7 +300,7 @@ Bergman needs `s3:ListBucket` and `s3:GetObject` on the warehouse prefix, plus
     },
     {
       "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:DeleteObject"],
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
       "Resource": "arn:aws:s3:::lake/warehouse/*"
     }
   ]
@@ -251,9 +352,13 @@ narrow the rule.
 ## Rolling it out
 
 1. **`inspect`** for a week. No writes, no risk, and you learn what your tables
-   actually look like.
+   actually look like. `--table <glob>` scopes the *examination*, not just the
+   output, so narrowing to one namespace costs one namespace's metadata reads.
 2. **`plan`** with the policy you intend. Read the reasons; adjust thresholds
-   until the plans are ones you would sign off.
+   until the plans are ones you would sign off. Read the **notes** too: a
+   `note:` line is work your policy asked for that the table cannot receive —
+   a [format v3 table](@/docs/compaction.md#format-v3), a partition under a
+   superseded spec — and without it that table would read as simply healthy.
 3. **`run`** with metadata-only expiration (the default). Nothing is deleted.
 4. **Orphans in `dry-run`.** Read the counts. A table with 480 live files
    reporting 6,000 orphans means something is wrong with the configuration, not
@@ -284,11 +389,11 @@ bergman daemon --metrics-addr 0.0.0.0:9090
 
 | Metric | Labels | What it is |
 |---|---|---|
-| `bergman_operations` | table, operation, outcome | Operations, counted by how they ended |
-| `bergman_operation_duration_seconds` | table, operation, outcome | How long each took |
-| `bergman_files_deleted` | table, operation | Files a deletion was announced for |
+| `bergman_operations` | catalog, namespace, operation, outcome | Operations, counted by how they ended |
+| `bergman_operation_duration_seconds` | catalog, namespace, operation, outcome | How long each took |
+| `bergman_files_deletion_announced` | catalog, namespace, operation | Files a deletion was announced for, counted *before* the first delete |
 
-`outcome` is `succeeded`, `no-op`, `blocked`, `refused`, `conflicted` or
+`outcome` is `succeeded`, `no-op`, `refused`, `conflicted` or
 `failed`. The distinctions matter for alerting: a `no-op` is a healthy table, a
 `conflicted` is maintenance yielding to a writer as designed, and only `failed`
 and `refused` need anyone's attention.
@@ -301,11 +406,26 @@ sum by (table) (rate(bergman_operations{outcome=~"failed|refused"}[1h])) > 0
 sum by (table) (rate(bergman_operations{outcome="conflicted"}[6h])) > 0.5
 ```
 
-> [!NOTE]
-> The policy rule is deliberately **not** a label. Rule patterns are
-> low-cardinality today and unbounded tomorrow, and a label that grows without
-> limit takes a Prometheus server down. The rule is in the audit trail, where
-> unbounded values are fine.
+> [!IMPORTANT]
+> **The table name is deliberately not a label**, and neither is the policy
+> rule. A time series is created per label combination and kept forever, so a
+> warehouse with fifty thousand tables would produce fifty thousand series per
+> metric — multiplied, for the histogram, by its bucket count. That is not a
+> slow dashboard; it is an outage of the monitoring system, caused by the tool
+> that was supposed to be watching it.
+>
+> The namespace is the finest grain that stays bounded, and it is enough to tell
+> you where to look. The per-table facts are in the audit trail, which is
+> append-only and has no cardinality budget:
+>
+> ```bash
+> jq -r 'select(.result.result == "failed") | "\(.table)\t\(.result.error)"' \
+>   /var/log/bergman.jsonl
+> ```
+>
+> Metrics answer "is maintenance working". The audit trail answers "what
+> happened to this table". Asking either to do the other's job makes both
+> worse.
 
 Metrics are recorded whether or not an endpoint serves them, so adding
 `--metrics-addr` later gives you history from that moment rather than from the

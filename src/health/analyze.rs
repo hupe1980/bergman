@@ -1,13 +1,14 @@
 //! The manifest walk that produces a [`TableHealth`].
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use iceberg::spec::{
-    DataContentType, FormatVersion, ManifestContentType, ManifestList, ManifestStatus, Struct,
-    TableMetadata,
+    DataContentType, ManifestContentType, ManifestEntry, ManifestList, ManifestStatus,
+    PartitionSpec, Schema, TableMetadata,
 };
 use iceberg::table::Table;
 
@@ -43,11 +44,11 @@ pub async fn analyze(
 
     let snapshots = snapshot_health(metadata, now);
     let location = metadata.location().to_string();
-    let format_version = match metadata.format_version() {
-        FormatVersion::V1 => 1,
-        FormatVersion::V2 => 2,
-        FormatVersion::V3 => 3,
-    };
+    let format_version = metadata.format_version();
+    let write_format = metadata
+        .properties()
+        .get("write.format.default")
+        .map(|s| s.trim().to_ascii_lowercase());
 
     // A table with no current snapshot has never been written to. Everything
     // below would read a manifest list that does not exist.
@@ -55,7 +56,9 @@ pub async fn analyze(
         return Ok(TableHealth {
             table: table_ref.clone(),
             format_version,
+            write_format,
             location,
+            current_spec_id: metadata.default_partition_spec_id(),
             snapshots,
             manifests: ManifestHealth::default(),
             files: FileHealth::default(),
@@ -89,12 +92,34 @@ pub async fn analyze(
         }
     }
 
+    // When each snapshot happened, so a file entry can be dated by the snapshot
+    // that added it. That is the only "when did this arrive" signal a manifest
+    // carries, and it is what tells the planner whether a partition is still
+    // being written.
+    let snapshot_times: Arc<HashMap<i64, i64>> = Arc::new(
+        metadata
+            .snapshots()
+            .map(|s| (s.snapshot_id(), s.timestamp_ms()))
+            .collect(),
+    );
+
     // Each manifest is independent, so they are read concurrently and folded
     // afterwards. Folding in the stream would serialise on the accumulator and
     // give back most of what the concurrency bought.
+    let schema = metadata.current_schema().clone();
     let per_manifest: Vec<ManifestTally> = stream::iter(manifest_list.entries())
         .map(|manifest_file| {
             let file_io = file_io.clone();
+            let schema = schema.clone();
+            let snapshot_times = Arc::clone(&snapshot_times);
+            // A manifest is written under exactly one partition spec, and a
+            // table whose spec has evolved holds manifests under several. An
+            // entry's partition tuple only means anything against the spec that
+            // produced it, so grouping reads that spec rather than the table's
+            // current one.
+            let spec = metadata
+                .partition_spec_by_id(manifest_file.partition_spec_id)
+                .cloned();
             async move {
                 let manifest = manifest_file
                     .load_manifest(&file_io)
@@ -110,7 +135,13 @@ pub async fn analyze(
                     if entry.status() == ManifestStatus::Deleted {
                         continue;
                     }
-                    tally.add(entry.data_file(), manifest_file.partition_spec_id);
+                    tally.add(
+                        entry,
+                        manifest_file.partition_spec_id,
+                        spec.as_deref(),
+                        &schema,
+                        &snapshot_times,
+                    );
                 }
                 Ok::<_, Error>(tally)
             }
@@ -137,7 +168,9 @@ pub async fn analyze(
     Ok(TableHealth {
         table: table_ref.clone(),
         format_version,
+        write_format,
         location,
+        current_spec_id: metadata.default_partition_spec_id(),
         snapshots,
         manifests,
         files,
@@ -153,10 +186,22 @@ struct ManifestTally {
 }
 
 impl ManifestTally {
-    fn add(&mut self, data_file: &iceberg::spec::DataFile, spec_id: i32) {
-        let key = PartitionKey {
-            spec_id,
-            value: render_partition(data_file.partition()),
+    fn add(
+        &mut self,
+        entry: &ManifestEntry,
+        spec_id: i32,
+        spec: Option<&PartitionSpec>,
+        schema: &Schema,
+        snapshot_times: &HashMap<i64, i64>,
+    ) {
+        let data_file = entry.data_file();
+        // A spec the metadata no longer carries means the manifest names one
+        // that was removed. That is malformed, but not a reason to drop the
+        // file from the health report — every file under that spec still shares
+        // one key, so the counts stay right and the plan says which spec.
+        let key = match spec {
+            Some(spec) => PartitionKey::new(spec, schema, data_file.partition()),
+            None => PartitionKey::unpartitioned(spec_id),
         };
         let partition = self
             .partitions
@@ -177,6 +222,15 @@ impl ManifestTally {
                 partition.data_bytes += size;
                 partition.record_count += records;
                 partition.file_sizes.push(size);
+
+                // A file arrived with the snapshot that added it, and the
+                // newest arrival is what says whether the partition has
+                // settled. An entry whose snapshot is no longer retained
+                // carries no date, which reads as "old enough".
+                if let Some(added_ms) = entry.snapshot_id().and_then(|id| snapshot_times.get(&id)) {
+                    partition.newest_file_ms =
+                        Some(partition.newest_file_ms.unwrap_or(i64::MIN).max(*added_ms));
+                }
             }
             DataContentType::PositionDeletes => {
                 self.files.position_delete_count += 1;
@@ -193,6 +247,7 @@ impl ManifestTally {
 
                 partition.equality_delete_count += 1;
                 partition.delete_record_count += records;
+                partition.equality_delete_record_count += records;
             }
         }
     }
@@ -221,55 +276,13 @@ impl ManifestTally {
             target.position_delete_count += incoming.position_delete_count;
             target.equality_delete_count += incoming.equality_delete_count;
             target.delete_record_count += incoming.delete_record_count;
+            target.equality_delete_record_count += incoming.equality_delete_record_count;
             target.file_sizes.extend(incoming.file_sizes);
+            target.newest_file_ms = match (target.newest_file_ms, incoming.newest_file_ms) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
         }
-    }
-}
-
-/// Render a partition value to a stable string.
-///
-/// Bergman groups and displays partitions but never interprets them, so a
-/// rendering is enough and modelling the spec's type system here would be a
-/// large amount of code for no additional capability.
-fn render_partition(partition: &Struct) -> String {
-    let rendered: Vec<String> = partition
-        .iter()
-        .map(|value| match value {
-            // `Literal` implements neither `Display` nor `Serialize`, so the
-            // debug form is what is available. It is stable enough for grouping
-            // — which is all this is load-bearing for — and readable enough for
-            // a plan line. `Primitive(Int(5))` renders as `5`.
-            Some(v) => render_literal(v),
-            None => "null".to_string(),
-        })
-        .collect();
-
-    if rendered.is_empty() {
-        "unpartitioned".to_string()
-    } else {
-        rendered.join("/")
-    }
-}
-
-/// Render one partition value.
-///
-/// Unwraps the `Primitive(Int(5))` debug shape to `5`, which is what an
-/// operator reading a plan expects to see. Anything more structured (a nested
-/// struct, a list) keeps its debug form: it still groups correctly, which is
-/// the only thing this value is load-bearing for.
-pub fn render_literal(literal: &iceberg::spec::Literal) -> String {
-    let debug = format!("{literal:?}");
-    let Some(inner) = debug
-        .strip_prefix("Primitive(")
-        .and_then(|s| s.strip_suffix(')'))
-    else {
-        return debug;
-    };
-
-    // `Int(5)` → `5`, `String("eu")` → `"eu"`.
-    match inner.split_once('(') {
-        Some((_, rest)) => rest.trim_end_matches(')').trim_matches('"').to_string(),
-        None => inner.to_string(),
     }
 }
 
@@ -294,17 +307,5 @@ fn snapshot_health(metadata: &TableMetadata, now: DateTime<Utc>) -> SnapshotHeal
         oldest_age,
         has_main_branch: metadata.snapshot_for_ref("main").is_some(),
         metadata_log_count: metadata.metadata_log().len(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unpartitioned_renders_as_a_name_not_an_empty_string() {
-        // This value ends up in plan output and audit records, where an empty
-        // string would read as missing data rather than as "no partitioning".
-        assert_eq!(render_partition(&Struct::empty()), "unpartitioned");
     }
 }

@@ -58,7 +58,7 @@ jobs:
       # failure appears in this build and nowhere else.
       - name: Each feature alone
         run: |
-          for feature in cli catalog-rest storage-s3 storage-gcs storage-azure metrics; do
+          for feature in cli catalog-rest compaction storage-s3 storage-gcs storage-azure metrics; do
             echo "::group::$feature"
             cargo check --no-default-features --features "$feature"
             echo "::endgroup::"
@@ -80,6 +80,36 @@ jobs:
       # trusted: the number in Cargo.toml is a claim until something compiles
       # with it.
       - run: cargo check --all-features
+
+  # Advisories, licences, bans and sources. Not a nice-to-have: the tree is
+  # rustls-only on purpose — a native-tls dependency creeping in would make the
+  # static musl build stop being static — and nothing but this notices.
+  #
+  # Every ignored advisory in `deny.toml` carries a written reason. One with no
+  # argument is a suppressed alarm, and this job is what makes somebody write
+  # the argument down.
+  deny:
+    name: Advisories and licences
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  # The documentation is part of the deliverable, and a broken internal link is
+  # a promise it cannot keep. `zola check` catches those; external links are not
+  # checked in CI, because a third-party site being down is not a reason to fail
+  # a pull request.
+  site:
+    name: Documentation site
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: zola
+      - run: zola --root site check --skip-external-links
 
   docs:
     name: Documentation

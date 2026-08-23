@@ -13,7 +13,38 @@ bergman = { version = "0.1", default-features = false, features = ["catalog-rest
 ```
 
 `default-features = false` drops the CLI, the terminal renderer, the logging
-setup and the cloud backends you are not using.
+setup, the cloud backends you are not using — and the query engine.
+
+## What each feature costs you
+
+| Feature | Default | Carries |
+|---|:--:|---|
+| `cli` | ✅ | The binary, terminal rendering, logging setup, signal handling |
+| `catalog-rest` | ✅ | The Iceberg REST catalog client |
+| `compaction` | ✅ | Data-file rewriting — **and DataFusion**, which applies equality deletes as a hash anti-join |
+| `storage-s3` / `-gcs` / `-azure` | ✅ via `storage-all` | Cloud object stores |
+| `metrics` | — | Prometheus metrics and the `/metrics` endpoint |
+
+`compaction` is the one worth a decision. It is the only operation that reads
+and writes *data*, and therefore the only one that needs a query engine — see
+[Compaction](@/docs/compaction.md#query-engine) for why equality deletes make
+that unavoidable. It adds ~70 crates and a noticeable amount of compile time.
+
+If you are embedding Bergman for **metadata maintenance** — the Lakekeeper
+shape: expire snapshots, re-pack manifests, remove orphans — leave it off and
+carry no query engine at all:
+
+```toml
+bergman = { version = "0.1", default-features = false, features = ["catalog-rest", "storage-s3"] }
+# -> expire, manifests, orphans. No DataFusion.
+```
+
+The feature gates the **operation**, never a second implementation of it. A
+build without it has no compaction rather than a slower compaction, so there is
+only ever one executor to keep correct. Planning stays feature-independent —
+`plan()` still reports that a table needs compacting, and `run()` reports the
+operation as `refused` naming the feature to rebuild with, rather than silently
+omitting it.
 
 ## The shape
 
@@ -29,6 +60,23 @@ let plan   = bergman.plan().await?;
 
 // The first call that writes anything.
 let report = bergman.run(&plan).await?;
+```
+
+Every one of these has a scoped sibling — `inspect_matching(pattern)`,
+`plan_matching(pattern)`, `plan_tables(&[table])` — and they scope the
+*examination*, not the output. A table the pattern excludes is never read, which
+is what makes "what is wrong with this one namespace" cost a namespace's
+metadata rather than the warehouse's.
+
+A plan may carry **notes**: work the policy asked for that a table cannot
+receive, with the reason — a [format v3 table](@/docs/compaction.md#format-v3),
+a non-Parquet one, a partition under a superseded spec. Surface them, or those
+tables read as healthy:
+
+```rust
+for (table, note) in plan.notes() {
+    tracing::warn!(%table, %note);
+}
 ```
 
 `Config` is an ordinary Rust value. Nothing forces you to have a file at all:

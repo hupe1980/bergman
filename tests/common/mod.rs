@@ -45,26 +45,73 @@ pub struct TestTable {
 }
 
 impl TestTable {
-    /// Create an unpartitioned two-column table with no snapshots.
+    /// Create an unpartitioned two-column v2 table with no snapshots.
     pub fn new() -> Result<Self> {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let location = format!("file://{}", dir.path().display());
+        Self::with_format(iceberg::spec::FormatVersion::V2)
+    }
 
-        let schema = Schema::builder()
+    /// The same, at a chosen format version.
+    ///
+    /// v3 exists here so the refusal can be tested against a real table rather
+    /// than asserted about a constant: what has to hold is that Bergman *stops*,
+    /// not that a function returns a string.
+    pub fn with_format(format: iceberg::spec::FormatVersion) -> Result<Self> {
+        Self::build(format, iceberg::spec::SortOrder::unsorted_order())
+    }
+
+    /// A table that declares a sort order of its own.
+    ///
+    /// The layer that stops a rewrite destroying a layout the table configured
+    /// can only be checked against a table that actually declares one.
+    pub fn sorted_by(fields: Vec<(i32, iceberg::spec::SortDirection)>) -> Result<Self> {
+        use iceberg::spec::{NullOrder, SortField, SortOrder, Transform};
+
+        let order = SortOrder::builder()
+            .with_order_id(1)
+            .with_fields(
+                fields
+                    .into_iter()
+                    .map(|(source_id, direction)| SortField {
+                        source_id,
+                        transform: Transform::Identity,
+                        direction,
+                        null_order: match direction {
+                            iceberg::spec::SortDirection::Ascending => NullOrder::First,
+                            iceberg::spec::SortDirection::Descending => NullOrder::Last,
+                        },
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .build(&Self::schema())
+            .expect("sort order");
+
+        Self::build(iceberg::spec::FormatVersion::V2, order)
+    }
+
+    fn schema() -> Schema {
+        Schema::builder()
             .with_schema_id(0)
             .with_fields(vec![
                 NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
                 NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
             ])
             .build()
-            .expect("schema");
+            .expect("schema")
+    }
+
+    fn build(
+        format: iceberg::spec::FormatVersion,
+        sort_order: iceberg::spec::SortOrder,
+    ) -> Result<Self> {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let location = format!("file://{}", dir.path().display());
 
         let metadata = TableMetadataBuilder::new(
-            schema,
+            Self::schema(),
             UnboundPartitionSpec::builder().build(),
-            iceberg::spec::SortOrder::unsorted_order(),
+            sort_order,
             location,
-            iceberg::spec::FormatVersion::V2,
+            format,
             HashMap::new(),
         )
         .expect("metadata builder")
@@ -190,13 +237,24 @@ impl TestTable {
 
     /// Append data files as a new snapshot.
     ///
-    /// Uses Bergman's own snapshot producer, so the fixture and the code under
-    /// test agree about what a commit looks like.
+    /// Uses Bergman's own snapshot producer where it can, so the fixture and
+    /// the code under test agree about what a commit looks like.
+    ///
+    /// A v3 table is the exception, and deliberately so: Bergman refuses to
+    /// author a v3 snapshot at all (see `bergman::commit::authoring_refusal`),
+    /// which is exactly what the v3 tests exist to check — so the fixture has
+    /// to be able to build one the way a *writer* would, or those tests could
+    /// only ever run against an empty table.
     pub async fn append(&self, files: Vec<DataFile>) -> Result<()> {
-        use bergman::commit::{RewriteFiles, SnapshotProducer};
+        if self.committer.metadata().format_version() == iceberg::spec::FormatVersion::V3 {
+            return self.append_as_a_writer_would(files).await;
+        }
+
+        use bergman::commit::{BranchRetention, RewriteFiles, SnapshotProducer};
 
         let table = self.table();
-        let producer = SnapshotProducer::new(&table);
+        let retention = BranchRetention::load(&table).await?;
+        let producer = SnapshotProducer::new(&table, retention);
         let rewrite = RewriteFiles {
             removed: Vec::new(),
             added: files,
@@ -209,6 +267,139 @@ impl TestTable {
 
         self.committer
             .commit(&self.ident, requirements, updates)
+            .await
+    }
+
+    /// Append with row lineage, the way a v3-capable writer does.
+    ///
+    /// The snapshot declares the row-id range it consumes: `first-row-id` is
+    /// the table's current `next-row-id`, and `added-rows` is what it appends.
+    /// `TableMetadataBuilder::add_snapshot` rejects a v3 snapshot without it —
+    /// which is one of the reasons Bergman refuses to write one rather than
+    /// guessing at the numbers.
+    async fn append_as_a_writer_would(&self, files: Vec<DataFile>) -> Result<()> {
+        use iceberg::spec::{
+            FormatVersion, ManifestFile, ManifestListWriter, ManifestWriterBuilder, Operation,
+            Snapshot, SnapshotReference, SnapshotRetention, Summary,
+        };
+
+        let table = self.table();
+        let metadata = table.metadata();
+        let parent = metadata.current_snapshot().cloned();
+        let snapshot_id = i64::from(uuid::Uuid::new_v4().as_u128() as u32)
+            .abs()
+            .max(1);
+        let sequence_number = metadata.next_sequence_number();
+        let added_rows: u64 = files.iter().map(|f| f.record_count()).sum();
+
+        let mut manifests: Vec<ManifestFile> = match &parent {
+            Some(parent) => {
+                let bytes = self
+                    .file_io
+                    .new_input(parent.manifest_list())
+                    .map_err(|e| Error::Storage(Box::new(e)))?
+                    .read()
+                    .await
+                    .map_err(|e| Error::Storage(Box::new(e)))?;
+                iceberg::spec::ManifestList::parse_with_version(&bytes, FormatVersion::V3)
+                    .map_err(|e| Error::Storage(Box::new(e)))?
+                    .entries()
+                    .to_vec()
+            }
+            None => Vec::new(),
+        };
+
+        let location = format!(
+            "{}/metadata/{snapshot_id}-data-{}.avro",
+            self.location(),
+            uuid::Uuid::new_v4()
+        );
+        let output = self
+            .file_io
+            .new_output(&location)
+            .map_err(|e| Error::Storage(Box::new(e)))?;
+
+        let mut writer = ManifestWriterBuilder::new(
+            output,
+            Some(snapshot_id),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().as_ref().clone(),
+        )
+        .build_v3_data();
+        for file in files {
+            writer
+                .add_file(file, sequence_number)
+                .map_err(|e| Error::Storage(Box::new(e)))?;
+        }
+        manifests.push(
+            writer
+                .write_manifest_file()
+                .await
+                .map_err(|e| Error::Storage(Box::new(e)))?,
+        );
+
+        let list_location = format!(
+            "{}/metadata/snap-{snapshot_id}-{}.avro",
+            self.location(),
+            uuid::Uuid::new_v4()
+        );
+        let list_output = self
+            .file_io
+            .new_output(&list_location)
+            .map_err(|e| Error::Storage(Box::new(e)))?
+            .writer()
+            .await
+            .map_err(|e| Error::Storage(Box::new(e)))?;
+
+        let mut list = ManifestListWriter::v3(
+            list_output,
+            snapshot_id,
+            parent.as_ref().map(|p| p.snapshot_id()),
+            sequence_number,
+            Some(metadata.next_row_id()),
+        );
+        list.add_manifests(manifests.into_iter())
+            .map_err(|e| Error::Storage(Box::new(e)))?;
+        list.close()
+            .await
+            .map_err(|e| Error::Storage(Box::new(e)))?;
+
+        let snapshot = Snapshot::builder()
+            .with_snapshot_id(snapshot_id)
+            .with_parent_snapshot_id(parent.as_ref().map(|p| p.snapshot_id()))
+            .with_sequence_number(sequence_number)
+            .with_timestamp_ms(chrono::Utc::now().timestamp_millis())
+            .with_manifest_list(list_location)
+            .with_schema_id(metadata.current_schema_id())
+            .with_row_range(metadata.next_row_id(), added_rows)
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .build();
+
+        self.committer
+            .commit(
+                &self.ident,
+                vec![TableRequirement::RefSnapshotIdMatch {
+                    r#ref: "main".to_string(),
+                    snapshot_id: parent.as_ref().map(|p| p.snapshot_id()),
+                }],
+                vec![
+                    TableUpdate::AddSnapshot { snapshot },
+                    TableUpdate::SetSnapshotRef {
+                        ref_name: "main".to_string(),
+                        reference: SnapshotReference::new(
+                            snapshot_id,
+                            SnapshotRetention::Branch {
+                                min_snapshots_to_keep: None,
+                                max_snapshot_age_ms: None,
+                                max_ref_age_ms: None,
+                            },
+                        ),
+                    },
+                ],
+            )
             .await
     }
 }
@@ -507,4 +698,272 @@ pub async fn live_data_files(table: &Table) -> Result<Vec<String>> {
     }
     paths.sort();
     Ok(paths)
+}
+
+/// Every delete file the scan still associates with a live data file.
+///
+/// A delete file that survives a rewrite it was fully applied in is pure read
+/// overhead — every scan opens it and it hides nothing — so tests assert on
+/// this directly rather than trusting a summary line.
+pub async fn live_delete_files(table: &Table) -> Result<Vec<String>> {
+    use futures::StreamExt;
+
+    let scan = table.scan().build()?;
+    let mut stream = scan.plan_files().await?;
+
+    let mut paths = Vec::new();
+    while let Some(task) = stream.next().await {
+        for delete in task?.deletes {
+            paths.push(delete.file_path);
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+/// The environment every operation takes, assembled from a fixture.
+///
+/// Operations receive one `OpEnv` rather than eight positional handles, and
+/// tests should build it the same way the engine does — otherwise a change to
+/// what an operation needs shows up as eight edits per test.
+pub fn op_env<'a>(
+    table: &'a Table,
+    ident: &'a TableIdent,
+    loader: &'a FixtureLoader,
+    committer: &'a InMemoryCommitter,
+    ctx: bergman::obs::OperationContext<'a>,
+) -> bergman::ops::OpEnv<'a> {
+    static NOOP: bergman::obs::NoopObserver = bergman::obs::NoopObserver;
+    bergman::ops::OpEnv {
+        table,
+        ident,
+        loader,
+        committer,
+        observer: &NOOP,
+        ctx,
+        now: chrono::Utc::now(),
+        max_deletes_per_run: 100_000,
+    }
+}
+
+impl TestTable {
+    /// Write an equality delete file naming these `id` values.
+    ///
+    /// This is what a streaming writer produces: a file listing the *key* of
+    /// every row that should stop being visible, matched by value rather than
+    /// by position. Bergman never writes one — the fixture does, because
+    /// applying them is the thing under test.
+    pub async fn write_equality_delete(&self, ids: &[i32]) -> Result<DataFile> {
+        use iceberg::writer::base_writer::equality_delete_writer::{
+            EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
+        };
+
+        let table = self.table();
+        let metadata = table.metadata();
+        let schema = metadata.current_schema().clone();
+
+        // The delete file carries only the equality columns — here `id`,
+        // field 1 — and the writer projects the batch down to them.
+        let config = EqualityDeleteWriterConfig::new(vec![1], schema.clone())
+            .map_err(|e| Error::Storage(Box::new(e)))?;
+
+        // The delete file holds only the equality columns, so the Parquet
+        // writer is given the *projected* schema. Handing it the table's full
+        // schema makes it look for a column the projected batch does not have.
+        let delete_schema = Arc::new(
+            iceberg::arrow::arrow_schema_to_schema(config.projected_arrow_schema_ref())
+                .map_err(|e| Error::Storage(Box::new(e)))?,
+        );
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                "PARQUET:field_id".to_string(),
+                "1".to_string(),
+            )])),
+            Field::new("name", DataType::Utf8, false).with_metadata(HashMap::from([(
+                "PARQUET:field_id".to_string(),
+                "2".to_string(),
+            )])),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(Int32Array::from(ids.to_vec())),
+                // Projected away by the writer; present because the config
+                // projects from the table's full schema.
+                Arc::new(StringArray::from(vec![""; ids.len()])),
+            ],
+        )
+        .expect("batch");
+
+        let location_generator =
+            DefaultLocationGenerator::new(metadata).map_err(|e| Error::Storage(Box::new(e)))?;
+        let file_name_generator = DefaultFileNameGenerator::new(
+            "test-eq-delete".to_string(),
+            Some(uuid::Uuid::new_v4().to_string()),
+            DataFileFormat::Parquet,
+        );
+
+        let rolling = RollingFileWriterBuilder::new(
+            ParquetWriterBuilder::new(
+                parquet::file::properties::WriterProperties::builder().build(),
+                delete_schema,
+            ),
+            1024 * 1024 * 1024,
+            self.file_io.clone(),
+            location_generator,
+            file_name_generator,
+        );
+
+        let mut writer = EqualityDeleteFileWriterBuilder::new(rolling, config)
+            .build(None)
+            .await
+            .map_err(|e| Error::Storage(Box::new(e)))?;
+
+        writer
+            .write(batch)
+            .await
+            .map_err(|e| Error::Storage(Box::new(e)))?;
+
+        let mut files = writer
+            .close()
+            .await
+            .map_err(|e| Error::Storage(Box::new(e)))?;
+
+        Ok(files.pop().expect("one delete file"))
+    }
+
+    /// Commit delete files as a new snapshot.
+    ///
+    /// Bergman's `SnapshotProducer` puts everything it adds in a *data*
+    /// manifest, because Bergman only ever adds data files. A delete file has
+    /// to go in a delete manifest, so the fixture builds this commit itself
+    /// with upstream's writers — which is exactly what a streaming writer does.
+    pub async fn append_deletes(&self, deletes: Vec<DataFile>) -> Result<()> {
+        use iceberg::spec::{
+            FormatVersion, ManifestFile, ManifestListWriter, ManifestWriterBuilder, Operation,
+            Snapshot, SnapshotReference, SnapshotRetention, Summary,
+        };
+        use iceberg::{TableRequirement, TableUpdate};
+
+        let table = self.table();
+        let metadata = table.metadata();
+        let parent = metadata.current_snapshot().cloned();
+        let snapshot_id = i64::from(std::process::id()) * 1_000_000
+            + i64::from(uuid::Uuid::new_v4().as_u128() as u32 % 1_000_000);
+        let sequence_number = metadata.next_sequence_number();
+
+        // Everything the parent snapshot already had, carried by reference.
+        let mut manifests: Vec<ManifestFile> = match &parent {
+            Some(parent) => {
+                let bytes = self
+                    .file_io
+                    .new_input(parent.manifest_list())
+                    .map_err(|e| Error::Storage(Box::new(e)))?
+                    .read()
+                    .await
+                    .map_err(|e| Error::Storage(Box::new(e)))?;
+                iceberg::spec::ManifestList::parse_with_version(&bytes, FormatVersion::V2)
+                    .map_err(|e| Error::Storage(Box::new(e)))?
+                    .entries()
+                    .to_vec()
+            }
+            None => Vec::new(),
+        };
+
+        // Plus one new delete manifest.
+        let location = format!(
+            "{}/metadata/{snapshot_id}-delete-{}.avro",
+            self.location(),
+            uuid::Uuid::new_v4()
+        );
+        let output = self
+            .file_io
+            .new_output(&location)
+            .map_err(|e| Error::Storage(Box::new(e)))?;
+
+        let mut writer = ManifestWriterBuilder::new(
+            output,
+            Some(snapshot_id),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().as_ref().clone(),
+        )
+        .build_v2_deletes();
+
+        for delete in deletes {
+            writer
+                .add_file(delete, sequence_number)
+                .map_err(|e| Error::Storage(Box::new(e)))?;
+        }
+        manifests.push(
+            writer
+                .write_manifest_file()
+                .await
+                .map_err(|e| Error::Storage(Box::new(e)))?,
+        );
+
+        let list_location = format!(
+            "{}/metadata/snap-{snapshot_id}-{}.avro",
+            self.location(),
+            uuid::Uuid::new_v4()
+        );
+        let list_output = self
+            .file_io
+            .new_output(&list_location)
+            .map_err(|e| Error::Storage(Box::new(e)))?
+            .writer()
+            .await
+            .map_err(|e| Error::Storage(Box::new(e)))?;
+
+        let mut list = ManifestListWriter::v2(
+            list_output,
+            snapshot_id,
+            parent.as_ref().map(|p| p.snapshot_id()),
+            sequence_number,
+        );
+        list.add_manifests(manifests.into_iter())
+            .map_err(|e| Error::Storage(Box::new(e)))?;
+        list.close()
+            .await
+            .map_err(|e| Error::Storage(Box::new(e)))?;
+
+        let snapshot = Snapshot::builder()
+            .with_snapshot_id(snapshot_id)
+            .with_parent_snapshot_id(parent.as_ref().map(|p| p.snapshot_id()))
+            .with_sequence_number(sequence_number)
+            .with_timestamp_ms(chrono::Utc::now().timestamp_millis())
+            .with_manifest_list(list_location)
+            .with_schema_id(metadata.current_schema_id())
+            .with_summary(Summary {
+                // A row-level delete, which is what an equality delete is.
+                operation: Operation::Delete,
+                additional_properties: HashMap::new(),
+            })
+            .build();
+
+        self.committer
+            .commit(
+                &self.ident,
+                vec![TableRequirement::RefSnapshotIdMatch {
+                    r#ref: "main".to_string(),
+                    snapshot_id: parent.as_ref().map(|p| p.snapshot_id()),
+                }],
+                vec![
+                    TableUpdate::AddSnapshot { snapshot },
+                    TableUpdate::SetSnapshotRef {
+                        ref_name: "main".to_string(),
+                        reference: SnapshotReference::new(
+                            snapshot_id,
+                            SnapshotRetention::Branch {
+                                min_snapshots_to_keep: None,
+                                max_snapshot_age_ms: None,
+                                max_ref_age_ms: None,
+                            },
+                        ),
+                    },
+                ],
+            )
+            .await
+    }
 }

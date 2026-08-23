@@ -2,20 +2,33 @@
 //!
 //! Assembled from upstream's public writers; see [`super`] for why delivery is
 //! separate. The output is a `replace` snapshot — the same rows, in different
-//! files — and two invariants govern it, both of which lose data when broken:
+//! files — and four invariants govern it, each of which loses or corrupts data
+//! when broken:
 //!
 //! 1. **Every live file not being removed is carried forward.** A manifest set
 //!    that omits one silently deletes those rows.
-//! 2. **Sequence numbers are inherited, never reassigned.** A rewritten file
-//!    keeps the sequence number of the file it replaces, so delete files
-//!    written *later* still apply to it. Stamping the new snapshot's number on
-//!    it would make it look newer than the deletes that should remove its rows.
+//! 2. **A carried-forward file keeps its own sequence number and snapshot id.**
+//!    Stamping this snapshot's numbers on an untouched file would make it look
+//!    newer than the delete files that apply to it, resurrecting deleted rows.
+//!    Files this snapshot genuinely *adds* are different: they take the new
+//!    sequence number, which is what retires the deletes already applied to
+//!    their contents.
+//! 3. **A manifest is written under the partition spec it was written under.**
+//!    A manifest carries exactly one `partition_spec_id`, and every entry's
+//!    partition tuple is meaningless against any other spec. Rewriting an old
+//!    manifest under the table's *current* spec re-interprets every tuple in
+//!    it, which mis-prunes files at query time.
+//! 4. **A branch's retention survives a commit that moves it.** The REST
+//!    protocol's `set-snapshot-ref` replaces the whole reference, so a commit
+//!    that names no retention silently erases what the table's owner
+//!    configured.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use iceberg::spec::{
-    DataFile, FormatVersion, MAIN_BRANCH, ManifestContentType, ManifestEntry, ManifestFile,
-    ManifestListWriter, ManifestStatus, ManifestWriterBuilder, Operation, Snapshot, Summary,
+    DataContentType, DataFile, FormatVersion, MAIN_BRANCH, ManifestContentType, ManifestEntry,
+    ManifestFile, ManifestListWriter, ManifestStatus, ManifestWriterBuilder, Operation,
+    PartitionSpec, Snapshot, SnapshotRetention, Summary,
 };
 use iceberg::table::Table;
 use iceberg::{TableRequirement, TableUpdate};
@@ -43,6 +56,83 @@ impl RewriteFiles {
     }
 }
 
+/// The retention a branch carries, read from the table's own metadata file.
+///
+/// Invariant 4 exists because the REST protocol has no "move this ref, keep its
+/// retention" update: `set-snapshot-ref` replaces the reference wholesale. A
+/// commit that sends no retention therefore erases whatever
+/// `ALTER TABLE … CREATE BRANCH main RETAIN …` configured — silently, and only
+/// visible the next time expiration runs.
+///
+/// Upstream keeps `TableMetadata::refs` `pub(crate)` and does not derive
+/// `Serialize`, so there is no accessor for it. The metadata file itself is a
+/// public, specified JSON document, and `SnapshotReference` is a public
+/// `Deserialize` type — so the retention is read from the document rather than
+/// guessed at.
+#[derive(Debug, Default, Clone)]
+pub struct BranchRetention {
+    main: Option<SnapshotRetention>,
+}
+
+impl BranchRetention {
+    /// Read the `main` branch's retention from a table's metadata file.
+    ///
+    /// A table whose metadata location is unknown, unreadable, or malformed
+    /// yields no retention, which is what a table that never configured any
+    /// also yields. Failing the commit instead would make an unreadable
+    /// optional field stop maintenance altogether.
+    pub async fn load(table: &Table) -> Result<Self> {
+        let Some(location) = table.metadata_location() else {
+            return Ok(Self::default());
+        };
+
+        let Ok(input) = table.file_io().new_input(location) else {
+            return Ok(Self::default());
+        };
+        let Ok(bytes) = input.read().await else {
+            tracing::debug!(
+                location,
+                "metadata file could not be read; committing without branch retention"
+            );
+            return Ok(Self::default());
+        };
+
+        /// Just the field this needs. Deserializing the whole document would
+        /// couple Bergman to every metadata field upstream adds.
+        #[derive(serde::Deserialize)]
+        struct Refs {
+            #[serde(default)]
+            refs: HashMap<String, iceberg::spec::SnapshotReference>,
+        }
+
+        match serde_json::from_slice::<Refs>(&bytes) {
+            Ok(parsed) => Ok(Self {
+                main: parsed
+                    .refs
+                    .get(MAIN_BRANCH)
+                    .map(|r| r.retention.clone())
+                    // Only a branch has retention worth carrying. A `main` that
+                    // somehow deserialized as a tag is malformed, and moving it
+                    // as a branch is the correct repair.
+                    .filter(|r| matches!(r, SnapshotRetention::Branch { .. })),
+            }),
+            Err(e) => {
+                tracing::debug!(%e, "metadata refs could not be parsed; committing without branch retention");
+                Ok(Self::default())
+            }
+        }
+    }
+
+    /// The retention to put on `main`, defaulting to "nothing configured".
+    fn main_or_default(&self) -> SnapshotRetention {
+        self.main.clone().unwrap_or(SnapshotRetention::Branch {
+            min_snapshots_to_keep: None,
+            max_snapshot_age_ms: None,
+            max_ref_age_ms: None,
+        })
+    }
+}
+
 /// One manifest of the parent snapshot, with its live entries.
 pub(crate) struct LoadedManifest {
     /// The manifest as the parent's manifest list records it, so an untouched
@@ -56,17 +146,22 @@ pub(crate) struct LoadedManifest {
 pub struct SnapshotProducer<'a> {
     table: &'a Table,
     snapshot_id: i64,
+    retention: BranchRetention,
 }
 
 impl<'a> SnapshotProducer<'a> {
     /// Start producing a snapshot for a table.
-    pub fn new(table: &'a Table) -> Self {
+    ///
+    /// `retention` is what [`BranchRetention::load`] read for this table; see
+    /// invariant 4.
+    pub fn new(table: &'a Table, retention: BranchRetention) -> Self {
         Self {
             table,
             // Random rather than sequential. Iceberg only requires uniqueness,
             // and a random id cannot collide with a concurrent writer's choice
             // the way `max + 1` can.
             snapshot_id: rand_snapshot_id(),
+            retention,
         }
     }
 
@@ -79,6 +174,11 @@ impl<'a> SnapshotProducer<'a> {
         &self,
         rewrite: &RewriteFiles,
     ) -> Result<Option<(Vec<TableRequirement>, Vec<TableUpdate>)>> {
+        // Checked before a single manifest is written: a refusal that arrived
+        // at install time would already have left Avro files under the table's
+        // metadata directory for the orphan scanner to clean up.
+        self.check_authorable()?;
+
         let metadata = self.table.metadata();
         let ident = self.table.identifier().to_string();
 
@@ -127,23 +227,63 @@ impl<'a> SnapshotProducer<'a> {
             return Ok(None);
         }
 
-        let survivor_count = existing
-            .iter()
-            .flat_map(|m| m.entries.iter())
-            .filter(|entry| !removed.contains(&normalize(entry.file_path())))
-            .count();
-
+        let counts = Counts::of(&existing, &removed, &rewrite.added);
         let manifests = self
             .write_manifests(&existing, &removed, &rewrite.added)
             .await?;
-        let summary = self.summary(rewrite, survivor_count);
+        let summary = self.summary(rewrite, &counts);
 
         Ok(Some(self.install(parent, manifests, summary).await?))
+    }
+
+    /// Which live delete files apply to no data file any more.
+    ///
+    /// A delete file becomes dangling when every data file it applied to has
+    /// been rewritten away — which is exactly what happens to a delete file a
+    /// rewrite could not retire because it was shared, once the other files it
+    /// covered are rewritten too. Nothing else ever removes them, and every
+    /// scan still opens each one.
+    pub async fn dangling_delete_files(
+        &self,
+        still_applied: &HashSet<String>,
+    ) -> Result<Vec<String>> {
+        let Some(parent) = self.table.metadata().current_snapshot() else {
+            return Ok(Vec::new());
+        };
+
+        let mut dangling: Vec<String> = self
+            .load_manifests(parent)
+            .await?
+            .iter()
+            .flat_map(|m| m.entries.iter())
+            .filter(|entry| entry.content_type() != DataContentType::Data)
+            .map(|entry| entry.file_path().to_string())
+            .filter(|path| !still_applied.contains(&normalize(path)))
+            .collect();
+
+        dangling.sort();
+        dangling.dedup();
+        Ok(dangling)
     }
 
     /// The id this producer will stamp on the snapshot it builds.
     pub(crate) fn snapshot_id(&self) -> i64 {
         self.snapshot_id
+    }
+
+    /// Refuse a table whose snapshots Bergman cannot author correctly.
+    ///
+    /// See [`super::authoring_refusal`] for what that means and why the answer
+    /// is a refusal rather than a best effort.
+    pub fn check_authorable(&self) -> Result<()> {
+        match super::authoring_refusal(self.table.metadata().format_version()) {
+            None => Ok(()),
+            Some(reason) => Err(Error::refused(
+                "rewrite",
+                self.table.identifier().to_string(),
+                reason,
+            )),
+        }
     }
 
     /// Turn a finished manifest set into the commit that installs it.
@@ -160,6 +300,32 @@ impl<'a> SnapshotProducer<'a> {
     ) -> Result<(Vec<TableRequirement>, Vec<TableUpdate>)> {
         let parent_id = parent.map(|p| p.snapshot_id());
         let metadata = self.table.metadata();
+
+        // The backstop for the check `rewrite_files` and the planner also make.
+        // Every snapshot Bergman authors passes through here, so an embedder or
+        // a future operation that skipped both still cannot produce one for a
+        // table whose row lineage it would destroy.
+        self.check_authorable()?;
+
+        // Bergman commits on `main` and asserts `main` has not moved. If the
+        // table's current snapshot is not `main`'s head, that assertion is
+        // about a different snapshot than the one this commit was built on —
+        // and the commit would move `main` to a snapshot descending from
+        // something else entirely.
+        let main_head = metadata
+            .snapshot_for_ref(MAIN_BRANCH)
+            .map(|s| s.snapshot_id());
+        if main_head != parent_id {
+            return Err(Error::refused(
+                "rewrite",
+                self.table.identifier().to_string(),
+                format!(
+                    "the table's current snapshot ({parent_id:?}) is not the head of `main` \
+                     ({main_head:?}); Bergman only maintains the main branch"
+                ),
+            ));
+        }
+
         let manifest_list = self.write_manifest_list(parent, manifests).await?;
 
         let snapshot = Snapshot::builder()
@@ -194,15 +360,15 @@ impl<'a> SnapshotProducer<'a> {
                 // Adding a snapshot without moving `main` leaves it
                 // unreachable: the operation would appear to succeed while
                 // changing nothing anyone can read.
+                //
+                // Invariant 4: the retention comes back from the table's own
+                // metadata, because this update *replaces* the reference and
+                // an omitted retention is an erased one.
                 TableUpdate::SetSnapshotRef {
                     ref_name: MAIN_BRANCH.to_string(),
                     reference: iceberg::spec::SnapshotReference::new(
                         self.snapshot_id,
-                        iceberg::spec::SnapshotRetention::Branch {
-                            min_snapshots_to_keep: None,
-                            max_snapshot_age_ms: None,
-                            max_ref_age_ms: None,
-                        },
+                        self.retention.main_or_default(),
                     ),
                 },
             ],
@@ -279,7 +445,6 @@ impl<'a> SnapshotProducer<'a> {
     ) -> Result<Vec<ManifestFile>> {
         let metadata = self.table.metadata();
         let schema = metadata.current_schema().clone();
-        let spec = metadata.default_partition_spec().as_ref().clone();
         let format_version = metadata.format_version();
 
         let mut manifests = Vec::new();
@@ -306,15 +471,16 @@ impl<'a> SnapshotProducer<'a> {
                 continue;
             }
 
+            // Invariant 3. The manifest is rebuilt under the spec it was
+            // written under, not the table's current one: every surviving
+            // entry's partition tuple was produced by that spec and means
+            // nothing against any other.
+            let spec = self.spec_for(loaded.file.partition_spec_id)?;
             let is_delete_manifest = loaded.file.content == ManifestContentType::Deletes;
             let output =
                 self.new_manifest_output(if is_delete_manifest { "delete" } else { "data" })?;
-            let builder = ManifestWriterBuilder::new(
-                output,
-                Some(self.snapshot_id),
-                schema.clone(),
-                spec.clone(),
-            );
+            let builder =
+                ManifestWriterBuilder::new(output, Some(self.snapshot_id), schema.clone(), spec);
             let mut writer = match (is_delete_manifest, format_version) {
                 (false, FormatVersion::V1) => builder.build_v1(),
                 (false, FormatVersion::V2) => builder.build_v2_data(),
@@ -353,6 +519,10 @@ impl<'a> SnapshotProducer<'a> {
         }
 
         if !added.is_empty() {
+            // Added files are written under the table's *current* spec, which
+            // is the spec they were partitioned by — the rewrite refuses any
+            // group that was not (see `crate::ops::compact`).
+            let spec = metadata.default_partition_spec().as_ref().clone();
             let output = self.new_manifest_output("data")?;
             let builder = ManifestWriterBuilder::new(output, Some(self.snapshot_id), schema, spec);
             let mut writer = match format_version {
@@ -362,8 +532,10 @@ impl<'a> SnapshotProducer<'a> {
             };
 
             for file in added {
-                // Newly written files genuinely belong to this snapshot, so they
-                // take its sequence number.
+                // Invariant 2, the other half. A newly written file genuinely
+                // belongs to this snapshot, so it takes the new sequence
+                // number — which is higher than every delete file already
+                // applied to its contents, and is therefore what retires them.
                 writer
                     .add_file(file.clone(), metadata.next_sequence_number())
                     .map_err(|e| Error::Storage(Box::new(e)))?;
@@ -378,6 +550,24 @@ impl<'a> SnapshotProducer<'a> {
         }
 
         Ok(manifests)
+    }
+
+    /// The partition spec a manifest was written under.
+    pub(crate) fn spec_for(&self, spec_id: i32) -> Result<PartitionSpec> {
+        self.table
+            .metadata()
+            .partition_spec_by_id(spec_id)
+            .map(|spec| spec.as_ref().clone())
+            .ok_or_else(|| {
+                Error::metadata(
+                    self.table.identifier().to_string(),
+                    format!(
+                        "a manifest names partition spec {spec_id}, which the table metadata \
+                         does not carry; rewriting it would re-interpret every partition value \
+                         in it"
+                    ),
+                )
+            })
     }
 
     /// Write the manifest list, returning its location.
@@ -447,33 +637,77 @@ impl<'a> SnapshotProducer<'a> {
     /// The snapshot summary.
     ///
     /// Engines read these to explain a table's history, so the counts are the
-    /// spec's own property names rather than something Bergman invented.
-    fn summary(&self, rewrite: &RewriteFiles, survivors: usize) -> Summary {
+    /// spec's own property names rather than something Bergman invented — and
+    /// the totals are the running ones the spec asks for, not just the deltas.
+    /// A summary with deltas but no totals makes Spark's `.snapshots` table
+    /// show blanks where every other writer shows numbers.
+    fn summary(&self, rewrite: &RewriteFiles, counts: &Counts) -> Summary {
         let added_bytes: u64 = rewrite.added.iter().map(|f| f.file_size_in_bytes()).sum();
         let added_records: u64 = rewrite.added.iter().map(|f| f.record_count()).sum();
 
-        let mut properties = std::collections::HashMap::new();
-        properties.insert(
-            "added-data-files".to_string(),
-            rewrite.added.len().to_string(),
+        let mut p = std::collections::HashMap::new();
+        let mut set = |key: &str, value: String| {
+            p.insert(key.to_string(), value);
+        };
+
+        // Deltas. Data files and delete files are counted separately: lumping
+        // a retired delete file in with `deleted-data-files` reports a rewrite
+        // as having dropped more data than it did.
+        set("added-data-files", rewrite.added.len().to_string());
+        set("deleted-data-files", counts.removed_data.to_string());
+        set("added-files-size", added_bytes.to_string());
+        set("removed-files-size", counts.removed_bytes.to_string());
+        set("added-records", added_records.to_string());
+        set("deleted-records", counts.removed_records.to_string());
+        if counts.removed_position_deletes > 0 {
+            set(
+                "removed-position-delete-files",
+                counts.removed_position_deletes.to_string(),
+            );
+        }
+        if counts.removed_equality_deletes > 0 {
+            set(
+                "removed-equality-delete-files",
+                counts.removed_equality_deletes.to_string(),
+            );
+        }
+        if counts.removed_delete_files() > 0 {
+            set(
+                "removed-delete-files",
+                counts.removed_delete_files().to_string(),
+            );
+        }
+
+        // Totals, as they stand after this snapshot.
+        set(
+            "total-data-files",
+            (counts.surviving_data + rewrite.added.len()).to_string(),
         );
-        properties.insert(
-            "deleted-data-files".to_string(),
-            rewrite.removed.len().to_string(),
+        set(
+            "total-delete-files",
+            counts.surviving_delete_files().to_string(),
         );
-        properties.insert("added-files-size".to_string(), added_bytes.to_string());
-        properties.insert("added-records".to_string(), added_records.to_string());
-        properties.insert(
-            "total-data-files".to_string(),
-            (survivors + rewrite.added.len()).to_string(),
+        set(
+            "total-position-deletes",
+            counts.surviving_position_delete_records.to_string(),
         );
+        set(
+            "total-equality-deletes",
+            counts.surviving_equality_delete_records.to_string(),
+        );
+        set(
+            "total-records",
+            (counts.surviving_records + added_records).to_string(),
+        );
+        set(
+            "total-files-size",
+            (counts.surviving_bytes + added_bytes).to_string(),
+        );
+
         // So an operator reading table history in Spark or Trino can see which
         // tool produced a snapshot, and why.
-        properties.insert("engine-name".to_string(), "bergman".to_string());
-        properties.insert(
-            "engine-version".to_string(),
-            env!("CARGO_PKG_VERSION").to_string(),
-        );
+        set("engine-name", "bergman".to_string());
+        set("engine-version", env!("CARGO_PKG_VERSION").to_string());
 
         Summary {
             // `replace`, not `overwrite`: the rows are unchanged and only their
@@ -482,8 +716,74 @@ impl<'a> SnapshotProducer<'a> {
             // would make a compaction look like a data change to every
             // downstream consumer.
             operation: Operation::Replace,
-            additional_properties: properties,
+            additional_properties: p,
         }
+    }
+}
+
+/// What a rewrite removes and what survives it, counted once.
+#[derive(Debug, Default)]
+struct Counts {
+    removed_data: usize,
+    removed_position_deletes: usize,
+    removed_equality_deletes: usize,
+    removed_bytes: u64,
+    removed_records: u64,
+    surviving_data: usize,
+    surviving_position_deletes: usize,
+    surviving_equality_deletes: usize,
+    surviving_position_delete_records: u64,
+    surviving_equality_delete_records: u64,
+    surviving_bytes: u64,
+    surviving_records: u64,
+}
+
+impl Counts {
+    fn of(existing: &[LoadedManifest], removed: &HashSet<String>, _added: &[DataFile]) -> Self {
+        let mut counts = Self::default();
+        for entry in existing.iter().flat_map(|m| m.entries.iter()) {
+            let file = entry.data_file();
+            let gone = removed.contains(&normalize(entry.file_path()));
+            match (gone, file.content_type()) {
+                (true, DataContentType::Data) => {
+                    counts.removed_data += 1;
+                    counts.removed_bytes += file.file_size_in_bytes();
+                    counts.removed_records += file.record_count();
+                }
+                (true, DataContentType::PositionDeletes) => {
+                    counts.removed_position_deletes += 1;
+                    counts.removed_bytes += file.file_size_in_bytes();
+                }
+                (true, DataContentType::EqualityDeletes) => {
+                    counts.removed_equality_deletes += 1;
+                    counts.removed_bytes += file.file_size_in_bytes();
+                }
+                (false, DataContentType::Data) => {
+                    counts.surviving_data += 1;
+                    counts.surviving_bytes += file.file_size_in_bytes();
+                    counts.surviving_records += file.record_count();
+                }
+                (false, DataContentType::PositionDeletes) => {
+                    counts.surviving_position_deletes += 1;
+                    counts.surviving_position_delete_records += file.record_count();
+                    counts.surviving_bytes += file.file_size_in_bytes();
+                }
+                (false, DataContentType::EqualityDeletes) => {
+                    counts.surviving_equality_deletes += 1;
+                    counts.surviving_equality_delete_records += file.record_count();
+                    counts.surviving_bytes += file.file_size_in_bytes();
+                }
+            }
+        }
+        counts
+    }
+
+    fn removed_delete_files(&self) -> usize {
+        self.removed_position_deletes + self.removed_equality_deletes
+    }
+
+    fn surviving_delete_files(&self) -> usize {
+        self.surviving_position_deletes + self.surviving_equality_deletes
     }
 }
 
@@ -523,28 +823,93 @@ mod tests {
     }
 
     #[test]
-    fn the_summary_uses_the_specs_property_names() {
-        // Engines read these to render table history. Inventing names would
-        // make a Bergman snapshot unreadable in Spark's `.snapshots` table.
-        let rewrite = RewriteFiles {
-            removed: vec!["a".into(), "b".into()],
-            added: vec![],
-        };
-        let properties = {
-            let mut p = std::collections::HashMap::new();
-            p.insert(
-                "deleted-data-files".to_string(),
-                rewrite.removed.len().to_string(),
-            );
-            p
-        };
-        assert_eq!(properties["deleted-data-files"], "2");
-    }
-
-    #[test]
     fn replace_is_the_right_operation_for_a_rewrite() {
         // `overwrite` would tell every downstream consumer the rows changed.
         // They did not — only their layout did.
         assert_eq!(Operation::Replace.as_str(), "replace");
+    }
+
+    #[test]
+    fn a_table_with_no_configured_retention_gets_an_empty_branch_reference() {
+        // The default has to be "nothing configured" rather than anything
+        // invented: a retention Bergman made up would start expiring snapshots
+        // on a schedule the table's owner never asked for.
+        let retention = BranchRetention::default().main_or_default();
+        assert!(matches!(
+            retention,
+            SnapshotRetention::Branch {
+                min_snapshots_to_keep: None,
+                max_snapshot_age_ms: None,
+                max_ref_age_ms: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn a_configured_retention_survives_the_commit_that_moves_the_branch() {
+        // `set-snapshot-ref` replaces the whole reference, so a commit that
+        // named no retention would silently erase what
+        // `ALTER TABLE … CREATE BRANCH main RETAIN …` configured — visible only
+        // the next time expiration ran.
+        let retention = BranchRetention {
+            main: Some(SnapshotRetention::Branch {
+                min_snapshots_to_keep: Some(42),
+                max_snapshot_age_ms: Some(86_400_000),
+                max_ref_age_ms: None,
+            }),
+        };
+
+        assert!(matches!(
+            retention.main_or_default(),
+            SnapshotRetention::Branch {
+                min_snapshots_to_keep: Some(42),
+                max_snapshot_age_ms: Some(86_400_000),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn refs_are_read_out_of_the_metadata_document() {
+        // Upstream keeps `TableMetadata::refs` crate-private and derives no
+        // `Serialize`, so this parse is the only way to see the field. It reads
+        // the specified JSON shape, which is stable.
+        #[derive(serde::Deserialize)]
+        struct Refs {
+            #[serde(default)]
+            refs: HashMap<String, iceberg::spec::SnapshotReference>,
+        }
+
+        let document = serde_json::json!({
+            "refs": {
+                "main": {
+                    "snapshot-id": 7,
+                    "type": "branch",
+                    "min-snapshots-to-keep": 5,
+                    "max-snapshot-age-ms": 3600000
+                }
+            }
+        });
+
+        let parsed: Refs = serde_json::from_value(document).unwrap();
+        assert!(matches!(
+            parsed.refs["main"].retention,
+            SnapshotRetention::Branch {
+                min_snapshots_to_keep: Some(5),
+                max_snapshot_age_ms: Some(3_600_000),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_metadata_document_without_refs_yields_no_retention() {
+        #[derive(serde::Deserialize)]
+        struct Refs {
+            #[serde(default)]
+            refs: HashMap<String, iceberg::spec::SnapshotReference>,
+        }
+        let parsed: Refs = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(parsed.refs.is_empty());
     }
 }
