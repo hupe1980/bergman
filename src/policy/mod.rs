@@ -28,6 +28,7 @@ mod matcher;
 mod resolve;
 mod schedule;
 mod settings;
+mod window;
 
 pub use matcher::TableMatcher;
 pub use resolve::{
@@ -39,6 +40,7 @@ pub use settings::{
     CompactionSettings, CompactionTrigger, ManifestSettings, OrphanMode, OrphanSettings,
     SnapshotSettings, TableSettings,
 };
+pub use window::{MaintenanceWindow, next_open};
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -131,6 +133,10 @@ pub struct Limits {
     pub max_rewrite_bytes_per_run: Option<u64>,
 
     /// Only start work inside this window, e.g. `22:00-06:00 Europe/Berlin`.
+    ///
+    /// The timezone is mandatory: a window in local time moves when a replica
+    /// is scheduled in another region, and "not during business hours" must not
+    /// move. Parsed at startup, so a malformed one is a startup failure.
     #[serde(default)]
     pub maintenance_window: Option<String>,
 }
@@ -203,6 +209,7 @@ pub struct Policy {
     defaults: TableSettings,
     rules: Vec<CompiledRule>,
     limits: Limits,
+    window: Option<MaintenanceWindow>,
 }
 
 #[derive(Debug)]
@@ -262,11 +269,33 @@ impl Policy {
             });
         }
 
+        let window = config
+            .limits
+            .maintenance_window
+            .as_deref()
+            .map(MaintenanceWindow::parse)
+            .transpose()?;
+
         Ok(Self {
             defaults: config.defaults.clone(),
             rules,
             limits: config.limits.clone(),
+            window,
         })
+    }
+
+    /// The maintenance window, if one is declared.
+    pub fn window(&self) -> Option<&MaintenanceWindow> {
+        self.window.as_ref()
+    }
+
+    /// Whether maintenance may start now.
+    ///
+    /// A window governs when work *begins*; a cycle already under way runs to
+    /// completion. Stopping mid-rewrite at the window's edge would leave files
+    /// written and uncommitted, which is worse than finishing.
+    pub fn window_is_open(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        self.window.as_ref().is_none_or(|w| w.contains(now))
     }
 
     /// Decide what happens to one table.

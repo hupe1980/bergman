@@ -151,7 +151,6 @@ Bergman's own defaults, for knobs Iceberg does not define:
 | `compaction.trigger.min_input_files` | 5 | Matches Spark's `rewrite_data_files` |
 | `compaction.trigger.delete_ratio` | 0.1 | |
 | `compaction.trigger.min_file_size_ratio` | 0.75 | What counts as "small" |
-| `compaction.max_concurrent_file_groups` | 4 | |
 | `orphans.older_than` | 7 days | Floor of 24h, [not configurable](@/docs/orphans.md#the-grace-period) |
 
 Everything that rewrites or deletes data defaults **off**. Metadata-only

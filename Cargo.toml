@@ -127,6 +127,11 @@ thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 humantime-serde = "1"
 
+# IANA timezones, for maintenance windows. A window is written in the zone the
+# operator thinks in ("22:00-06:00 Europe/Berlin"), and evaluating it in UTC or
+# in the host's local time would move it when a replica is scheduled elsewhere.
+chrono-tz = "0.10"
+
 # Cron expressions. Used today to validate a rule's `schedule` at startup, so a
 # malformed expression fails before a cycle runs rather than during one.
 cron = "0.15"

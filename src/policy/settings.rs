@@ -80,10 +80,6 @@ pub struct CompactionSettings {
     #[serde(default)]
     pub trigger: Option<CompactionTrigger>,
 
-    /// How many file groups may be rewritten concurrently within one table.
-    #[serde(default)]
-    pub max_concurrent_file_groups: Option<usize>,
-
     /// Sort output by these columns.
     ///
     /// A *global* sort within each partition, so output files carry tight
@@ -107,11 +103,6 @@ impl CompactionSettings {
         if let Some(0) = self.target_file_size {
             return Err(Error::policy(format!(
                 "{where_}: compaction.target_file_size must be greater than zero"
-            )));
-        }
-        if let Some(0) = self.max_concurrent_file_groups {
-            return Err(Error::policy(format!(
-                "{where_}: compaction.max_concurrent_file_groups must be greater than zero"
             )));
         }
         if let Some(0) = self.max_sort_memory {

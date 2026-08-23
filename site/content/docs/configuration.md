@@ -87,7 +87,6 @@ older_than = "7d"        # hard floor of 24h
 [defaults.compaction]
 enabled                    = false
 target_file_size           = 536870912   # -> write.target-file-size-bytes -> 512 MiB
-max_concurrent_file_groups = 4
 sort                       = ["event_date", "customer_id"]
 max_sort_memory            = 1073741824   # 1 GiB
 
@@ -152,8 +151,25 @@ maintenance_window        = "22:00-06:00 Europe/Berlin"
 
 When the byte budget cannot cover everything, tables are ordered
 most-fragmented-first and the remainder is reported as **deferred**, never
-silently dropped. Metadata-only work is not charged against it, so a rewrite
-ceiling cannot block snapshot expiration.
+silently dropped — the run report names them. Metadata-only work is not charged
+against it, so a rewrite ceiling cannot block snapshot expiration.
+
+`maintenance_window` governs when work *begins*. A cycle already under way runs
+to completion: stopping mid-rewrite at the window's edge would leave files
+written and uncommitted, which is worse than finishing. Outside it, `run` does
+nothing and reports every planned table as deferred, and
+[`daemon`](@/docs/operating.md#as-a-daemon) sleeps to the edge rather than waking
+every interval to find it shut.
+
+**The timezone is mandatory.** A window in local time moves when a replica is
+scheduled in another region, and "not during business hours" must not move. It
+is parsed at startup, so a malformed one is a startup failure:
+
+```
+policy error: maintenance_window "22:00-06:00" has no timezone; write it as
+"22:00-06:00 Europe/Berlin". A window without one moves when a replica is
+scheduled in another region.
+```
 
 ## Global flags
 

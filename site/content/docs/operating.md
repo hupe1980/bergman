@@ -81,6 +81,10 @@ match    = "prod.archive.**"
 schedule = "0 3 * * *"         # this one does not push it back out
 ```
 
+With a `maintenance_window` set, the daemon sleeps to the window's edge rather
+than waking every interval to find it shut — a daemon that logged "outside the
+window" sixty times a night is a daemon whose logs nobody reads.
+
 `SIGTERM` and Ctrl-C stop it after the cycle in hand. A cycle killed outright is
 safe too — it leaves only files nothing references, which the orphan scanner
 reclaims — but finishing is tidier, and it is what a container runtime's grace

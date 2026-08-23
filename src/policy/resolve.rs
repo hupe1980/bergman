@@ -45,7 +45,6 @@ mod bergman_defaults {
     pub const DELETE_RATIO: f64 = 0.1;
     /// A file smaller than this fraction of the target counts as small.
     pub const MIN_FILE_SIZE_RATIO: f64 = 0.75;
-    pub const MAX_CONCURRENT_FILE_GROUPS: usize = 4;
     /// A partition being compacted is by definition made of *small* files, so
     /// a gibibyte covers the overwhelming majority of real sorts while keeping
     /// a runaway one from taking the process down.
@@ -210,8 +209,6 @@ pub struct EffectiveCompaction {
     pub delete_ratio: Resolved<f64>,
     /// What counts as small, as a fraction of the target.
     pub min_file_size_ratio: Resolved<f64>,
-    /// Concurrency within one table.
-    pub max_concurrent_file_groups: Resolved<usize>,
     /// Sort columns, if clustering is requested.
     pub sort: Option<Resolved<Vec<String>>>,
     /// Memory ceiling for one partition's sort.
@@ -313,16 +310,6 @@ impl EffectivePolicy {
                 |s| trigger(s).and_then(|t| t.min_file_size_ratio),
                 None,
                 bergman_defaults::MIN_FILE_SIZE_RATIO,
-                Provenance::BergmanDefault,
-            ),
-            max_concurrent_file_groups: l.resolve(
-                |s| {
-                    s.compaction
-                        .as_ref()
-                        .and_then(|c| c.max_concurrent_file_groups)
-                },
-                None,
-                bergman_defaults::MAX_CONCURRENT_FILE_GROUPS,
                 Provenance::BergmanDefault,
             ),
             sort: resolve_optional(&l, |s| s.compaction.as_ref().and_then(|c| c.sort.clone())),

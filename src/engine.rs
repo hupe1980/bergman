@@ -209,6 +209,7 @@ impl Bergman {
             generated_at: now,
             tables,
             uneventful,
+            deferred: Vec::new(),
         };
 
         if let Some(budget) = self.policy.limits().max_rewrite_bytes_per_run {
@@ -222,6 +223,7 @@ impl Bergman {
                     "byte budget exhausted; some tables deferred to the next cycle"
                 );
             }
+            plan.deferred = deferred;
         }
 
         Ok(plan)
@@ -233,6 +235,21 @@ impl Bergman {
     pub async fn run(&self, plan: &MaintenancePlan) -> Result<RunReport> {
         let run_id = Uuid::new_v4().to_string();
         let started_at = Utc::now();
+
+        // A window governs when work *begins*. A cycle already under way runs
+        // to completion: stopping mid-rewrite at the window's edge would leave
+        // files written and uncommitted, which is worse than finishing.
+        if !self.policy.window_is_open(started_at) {
+            let window = self.policy.window().expect("closed implies declared");
+            tracing::info!(%window, "outside the maintenance window; nothing will run");
+            return Ok(RunReport {
+                started_at,
+                finished_at: Utc::now(),
+                tables: Vec::new(),
+                deferred: plan.tables.iter().map(|t| t.table.clone()).collect(),
+            });
+        }
+
         let mut outcomes = Vec::new();
 
         for table_plan in &plan.tables {
@@ -267,7 +284,9 @@ impl Bergman {
             started_at,
             finished_at: Utc::now(),
             tables: outcomes,
-            deferred: Vec::new(),
+            // Carried through from the plan, so a budgeted run reports what it
+            // did not get to rather than looking complete.
+            deferred: plan.deferred.clone(),
         })
     }
 

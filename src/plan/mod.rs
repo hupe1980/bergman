@@ -35,6 +35,13 @@ pub struct MaintenancePlan {
     pub tables: Vec<TablePlan>,
     /// Tables examined and found healthy, or excluded.
     pub uneventful: Vec<Uneventful>,
+    /// Tables the byte budget could not cover this cycle.
+    ///
+    /// Carried on the plan rather than logged and forgotten: a run that quietly
+    /// maintained a subset would look exactly like one that maintained
+    /// everything.
+    #[serde(default)]
+    pub deferred: Vec<TableRef>,
 }
 
 /// A table with nothing to do, and why.

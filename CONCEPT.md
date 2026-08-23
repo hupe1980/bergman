@@ -443,7 +443,6 @@ token_env = "BERGMAN_CATALOG_TOKEN"   # a name, never a value
 # Layered under every rule that does not override it.
 [defaults.compaction]
 # target_file_size omitted -> table property -> Iceberg default
-max_concurrent_file_groups = 4
 
 [defaults.compaction.trigger]
 small_file_ratio = 0.3

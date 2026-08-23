@@ -95,7 +95,6 @@ older_than = "7d"
 # Falls back to the table's `write.target-file-size-bytes`, then to 512 MiB.
 # target_file_size = 536870912
 
-max_concurrent_file_groups = 4
 
 # How much memory one partition's sort may use. Sorting needs the whole file
 # group in hand and Bergman does not spill, so a larger partition is refused
@@ -185,5 +184,9 @@ max_parallel_tables = 4
 # charged against it, so a rewrite ceiling cannot block snapshot expiration.
 # max_rewrite_bytes_per_run = 536870912000   # 500 GiB
 
-# Only begin work inside this window.
+# Only begin work inside this window. A cycle already under way runs to
+# completion — stopping mid-rewrite would leave files written and uncommitted.
+#
+# The timezone is mandatory: a window in local time moves when a replica is
+# scheduled in another region, and "not during business hours" must not move.
 # maintenance_window = "22:00-06:00 Europe/Berlin"

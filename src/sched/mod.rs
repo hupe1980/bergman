@@ -97,7 +97,20 @@ impl Daemon {
                 return Ok(completed);
             }
 
-            let (delay, trigger) = self.next_wakeup(chrono::Utc::now());
+            let now = chrono::Utc::now();
+            let (delay, trigger) = self.next_wakeup(now);
+
+            // Sleeping to the window's edge rather than waking every interval
+            // to find it shut. A daemon that logged "outside the window" sixty
+            // times a night is a daemon whose logs nobody reads.
+            let delay = match self.bergman.policy().window() {
+                Some(window) => {
+                    let wake = now + chrono::Duration::from_std(delay).unwrap_or_default();
+                    let opens = crate::policy::next_open(window, wake);
+                    (opens - now).to_std().unwrap_or(delay).max(delay)
+                }
+                None => delay,
+            };
 
             tokio::select! {
                 // Biased so that a shutdown that arrives while a timer is also
