@@ -85,8 +85,21 @@ pub struct CompactionSettings {
     pub max_concurrent_file_groups: Option<usize>,
 
     /// Sort output by these columns.
+    ///
+    /// A *global* sort within each partition, so output files carry tight
+    /// min/max bounds and a query with a predicate on these columns can skip
+    /// whole files.
     #[serde(default)]
     pub sort: Option<Vec<String>>,
+
+    /// How much memory one partition's sort may use.
+    ///
+    /// Sorting needs the whole file group in hand, and Bergman does not spill
+    /// to disk. A partition larger than this is refused with a named reason
+    /// rather than written unsorted, because a table whose metadata says
+    /// "sorted" and whose files are not is worse than one that failed loudly.
+    #[serde(default)]
+    pub max_sort_memory: Option<u64>,
 }
 
 impl CompactionSettings {
@@ -99,6 +112,17 @@ impl CompactionSettings {
         if let Some(0) = self.max_concurrent_file_groups {
             return Err(Error::policy(format!(
                 "{where_}: compaction.max_concurrent_file_groups must be greater than zero"
+            )));
+        }
+        if let Some(0) = self.max_sort_memory {
+            return Err(Error::policy(format!(
+                "{where_}: compaction.max_sort_memory must be greater than zero; \
+                 omit `sort` instead of setting a budget nothing can fit in"
+            )));
+        }
+        if self.sort.as_ref().is_some_and(|s| s.is_empty()) {
+            return Err(Error::policy(format!(
+                "{where_}: compaction.sort is an empty list; omit it to leave output unsorted"
             )));
         }
         if let Some(trigger) = &self.trigger {

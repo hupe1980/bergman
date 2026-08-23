@@ -13,8 +13,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::plan::{OperationKind, OperationResult};
-use crate::policy::TableRef;
+use crate::obs::OperationContext;
+use crate::plan::OperationResult;
 
 /// One audit record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,40 +117,35 @@ impl AuditSink for JsonlSink {
 #[derive(Debug)]
 pub struct AuditObserver<S: AuditSink> {
     sink: S,
-    run_id: String,
 }
 
 impl<S: AuditSink> AuditObserver<S> {
-    /// Wrap a sink for one run.
-    pub fn new(sink: S, run_id: impl Into<String>) -> Self {
+    /// Wrap a sink.
+    pub fn new(sink: S) -> Self {
+        Self { sink }
+    }
+}
+
+impl AuditRecord {
+    /// Build a record from an operation's context.
+    fn from_context(ctx: OperationContext<'_>, result: OperationResult) -> Self {
         Self {
-            sink,
-            run_id: run_id.into(),
+            at: Utc::now(),
+            run_id: ctx.run_id.to_string(),
+            table: ctx.table.to_string(),
+            operation: ctx.kind.as_str().to_string(),
+            matched_rule: ctx.matched_rule.to_string(),
+            reason: ctx.reason.to_string(),
+            result,
+            deleted_files: Vec::new(),
         }
     }
 }
 
 #[async_trait::async_trait]
 impl<S: AuditSink> super::MaintenanceObserver for AuditObserver<S> {
-    async fn operation_finished(
-        &self,
-        table: &TableRef,
-        kind: OperationKind,
-        result: &OperationResult,
-    ) {
-        let record = AuditRecord {
-            at: Utc::now(),
-            run_id: self.run_id.clone(),
-            table: table.to_string(),
-            operation: kind.as_str().to_string(),
-            // Filled by the engine, which knows the rule; an observer sees only
-            // the operation. Kept as a field rather than dropped so the record
-            // shape is the same from every producer.
-            matched_rule: String::new(),
-            reason: String::new(),
-            result: result.clone(),
-            deleted_files: Vec::new(),
-        };
+    async fn operation_finished(&self, ctx: OperationContext<'_>, result: &OperationResult) {
+        let record = AuditRecord::from_context(ctx, result.clone());
         if let Err(e) = self.sink.write(&record) {
             // An observer cannot fail an operation — it is a hook, not a gate.
             // Losing an audit record is still worth a loud event.
@@ -158,19 +153,15 @@ impl<S: AuditSink> super::MaintenanceObserver for AuditObserver<S> {
         }
     }
 
-    async fn deleting_files(&self, table: &TableRef, paths: &[String]) {
-        let record = AuditRecord {
-            at: Utc::now(),
-            run_id: self.run_id.clone(),
-            table: table.to_string(),
-            operation: OperationKind::RemoveOrphans.as_str().to_string(),
-            matched_rule: String::new(),
-            reason: format!("{} files", paths.len()),
-            result: OperationResult::Succeeded {
-                detail: "deletion starting".into(),
+    async fn deleting_files(&self, ctx: OperationContext<'_>, paths: &[String]) {
+        let mut record = AuditRecord::from_context(
+            ctx,
+            OperationResult::Succeeded {
+                detail: format!("deleting {} files", paths.len()),
             },
-            deleted_files: paths.to_vec(),
-        };
+        );
+        record.deleted_files = paths.to_vec();
+
         if let Err(e) = self.sink.write(&record) {
             tracing::error!(error = %e, "deletion manifest could not be written");
         }

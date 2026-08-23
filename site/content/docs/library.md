@@ -86,25 +86,23 @@ no-op body, so you override only what you care about and a new callback is not a
 breaking change.
 
 ```rust
-use bergman::obs::MaintenanceObserver;
-use bergman::plan::{OperationKind, OperationResult};
-use bergman::policy::TableRef;
+use bergman::obs::{MaintenanceObserver, OperationContext};
+use bergman::plan::OperationResult;
 
 #[derive(Debug)]
 struct Metrics(prometheus_client::registry::Registry);
 
 #[async_trait::async_trait]
 impl MaintenanceObserver for Metrics {
-    async fn operation_finished(
-        &self,
-        table: &TableRef,
-        kind: OperationKind,
-        result: &OperationResult,
-    ) {
-        self.record(table, kind, result);
+    async fn operation_finished(&self, ctx: OperationContext<'_>, result: &OperationResult) {
+        self.record(ctx.table, ctx.kind, result);
     }
 }
 ```
+
+`OperationContext` carries the run id, the table, the operation, **the policy
+rule that matched**, and the reason the trigger fired — everything an audit
+record or a metric label needs.
 
 ```rust
 let bergman = Bergman::builder(config)
@@ -119,8 +117,8 @@ let bergman = Bergman::builder(config)
 reported as `Refused` — an outcome that needs attention, not a silent skip:
 
 ```rust
-async fn operation_starting(&self, table: &TableRef, kind: OperationKind) -> bool {
-    kind != OperationKind::RemoveOrphans || self.approved(table).await
+async fn operation_starting(&self, ctx: OperationContext<'_>) -> bool {
+    ctx.kind != OperationKind::RemoveOrphans || self.approved(ctx.table).await
 }
 ```
 

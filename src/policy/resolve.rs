@@ -46,6 +46,10 @@ mod bergman_defaults {
     /// A file smaller than this fraction of the target counts as small.
     pub const MIN_FILE_SIZE_RATIO: f64 = 0.75;
     pub const MAX_CONCURRENT_FILE_GROUPS: usize = 4;
+    /// A partition being compacted is by definition made of *small* files, so
+    /// a gibibyte covers the overwhelming majority of real sorts while keeping
+    /// a runaway one from taking the process down.
+    pub const MAX_SORT_MEMORY: u64 = 1024 * 1024 * 1024;
     pub const ORPHAN_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 }
 
@@ -210,6 +214,8 @@ pub struct EffectiveCompaction {
     pub max_concurrent_file_groups: Resolved<usize>,
     /// Sort columns, if clustering is requested.
     pub sort: Option<Resolved<Vec<String>>>,
+    /// Memory ceiling for one partition's sort.
+    pub max_sort_memory: Resolved<u64>,
 }
 
 impl EffectiveCompaction {
@@ -320,6 +326,12 @@ impl EffectivePolicy {
                 Provenance::BergmanDefault,
             ),
             sort: resolve_optional(&l, |s| s.compaction.as_ref().and_then(|c| c.sort.clone())),
+            max_sort_memory: l.resolve(
+                |s| s.compaction.as_ref().and_then(|c| c.max_sort_memory),
+                None,
+                bergman_defaults::MAX_SORT_MEMORY,
+                Provenance::BergmanDefault,
+            ),
         };
 
         let snapshots = EffectiveSnapshots {

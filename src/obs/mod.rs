@@ -19,6 +19,24 @@ use std::sync::Arc;
 use crate::plan::{OperationKind, OperationResult};
 use crate::policy::TableRef;
 
+/// What an observer is told about the operation it is being asked about.
+///
+/// A struct rather than positional arguments because every field is context an
+/// audit record needs, and adding one later should not break implementors.
+#[derive(Debug, Clone, Copy)]
+pub struct OperationContext<'a> {
+    /// Identifies this maintenance run across every record it produces.
+    pub run_id: &'a str,
+    /// The table being maintained.
+    pub table: &'a TableRef,
+    /// The operation.
+    pub kind: OperationKind,
+    /// The policy rule that selected this table.
+    pub matched_rule: &'a str,
+    /// The measurement that crossed a threshold, and the threshold it crossed.
+    pub reason: &'a str,
+}
+
 /// A hook into a maintenance run.
 ///
 /// This is the extension point the library promises instead of a plugin
@@ -39,24 +57,18 @@ pub trait MaintenanceObserver: Send + Sync + std::fmt::Debug {
     /// refused. This is the approval-gate hook: an embedder can require a human
     /// or a policy service to sign off on deletions without Bergman knowing
     /// anything about how that decision is made.
-    async fn operation_starting(&self, _table: &TableRef, _kind: OperationKind) -> bool {
+    async fn operation_starting(&self, _ctx: OperationContext<'_>) -> bool {
         true
     }
 
     /// An operation finished.
-    async fn operation_finished(
-        &self,
-        _table: &TableRef,
-        _kind: OperationKind,
-        _result: &OperationResult,
-    ) {
-    }
+    async fn operation_finished(&self, _ctx: OperationContext<'_>, _result: &OperationResult) {}
 
     /// Files are about to be deleted.
     ///
     /// Called with the complete list *before* the first deletion, which is what
     /// makes the audit trail survive a crash halfway through.
-    async fn deleting_files(&self, _table: &TableRef, _paths: &[String]) {}
+    async fn deleting_files(&self, _ctx: OperationContext<'_>, _paths: &[String]) {}
 }
 
 /// An observer that does nothing.
@@ -99,34 +111,29 @@ impl MaintenanceObserver for Observers {
         }
     }
 
-    async fn operation_starting(&self, table: &TableRef, kind: OperationKind) -> bool {
+    async fn operation_starting(&self, ctx: OperationContext<'_>) -> bool {
         // Every observer is asked, and any one may veto. Short-circuiting on
         // the first `false` would mean a veto silently changes whether later
         // observers are consulted, which makes an approval gate's behaviour
         // depend on registration order.
         let mut permitted = true;
         for o in &self.0 {
-            if !o.operation_starting(table, kind).await {
+            if !o.operation_starting(ctx).await {
                 permitted = false;
             }
         }
         permitted
     }
 
-    async fn operation_finished(
-        &self,
-        table: &TableRef,
-        kind: OperationKind,
-        result: &OperationResult,
-    ) {
+    async fn operation_finished(&self, ctx: OperationContext<'_>, result: &OperationResult) {
         for o in &self.0 {
-            o.operation_finished(table, kind, result).await;
+            o.operation_finished(ctx, result).await;
         }
     }
 
-    async fn deleting_files(&self, table: &TableRef, paths: &[String]) {
+    async fn deleting_files(&self, ctx: OperationContext<'_>, paths: &[String]) {
         for o in &self.0 {
-            o.deleting_files(table, paths).await;
+            o.deleting_files(ctx, paths).await;
         }
     }
 }
@@ -142,9 +149,19 @@ mod tests {
 
     #[async_trait::async_trait]
     impl MaintenanceObserver for Vetoing {
-        async fn operation_starting(&self, _table: &TableRef, kind: OperationKind) -> bool {
-            self.1.lock().unwrap().push(kind);
+        async fn operation_starting(&self, ctx: OperationContext<'_>) -> bool {
+            self.1.lock().unwrap().push(ctx.kind);
             self.0
+        }
+    }
+
+    fn ctx<'a>(table: &'a TableRef, kind: OperationKind) -> OperationContext<'a> {
+        OperationContext {
+            run_id: "run-1",
+            table,
+            kind,
+            matched_rule: "prod.**",
+            reason: "test",
         }
     }
 
@@ -163,7 +180,7 @@ mod tests {
 
         let table = TableRef::new("prod", ["db"], "t");
         let allowed = observers
-            .operation_starting(&table, OperationKind::RemoveOrphans)
+            .operation_starting(ctx(&table, OperationKind::RemoveOrphans))
             .await;
 
         assert!(!allowed);
@@ -178,9 +195,10 @@ mod tests {
     async fn no_observers_permits_everything() {
         let observers = Observers::new();
         assert!(observers.is_empty());
+        let table = TableRef::new("p", ["d"], "t");
         assert!(
             observers
-                .operation_starting(&TableRef::new("p", ["d"], "t"), OperationKind::Compact)
+                .operation_starting(ctx(&table, OperationKind::Compact))
                 .await
         );
     }

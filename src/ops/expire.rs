@@ -19,7 +19,7 @@ use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 
 use crate::error::{Error, Result};
-use crate::obs::MaintenanceObserver;
+use crate::obs::{MaintenanceObserver, OperationContext};
 use crate::ops::reachability::{self, ReachableSet};
 use crate::ops::{MAX_COMMIT_ATTEMPTS, retry_delay};
 use crate::plan::OperationResult;
@@ -42,13 +42,16 @@ pub struct ExpireOutcome {
 
 /// Expire snapshots, and optionally delete what that orphans.
 pub async fn run(
-    table_ref: &TableRef,
     table: &Table,
     catalog: &Arc<dyn Catalog>,
     settings: &EffectiveSnapshots,
     observer: &dyn MaintenanceObserver,
+    ctx: OperationContext<'_>,
     now: DateTime<Utc>,
 ) -> Result<OperationResult> {
+    // One source of the table's identity: the context carries it.
+    let table_ref = ctx.table;
+
     // The reachable set is computed *before* the commit, while the snapshots
     // still exist. Afterwards, the files they referenced are unreachable by
     // construction and there would be nothing left to diff against.
@@ -90,7 +93,7 @@ pub async fn run(
     };
 
     if let Some(before) = before {
-        let deleted = delete_now_unreachable(table_ref, &updated, before, observer).await?;
+        let deleted = delete_now_unreachable(table_ref, &updated, before, observer, ctx).await?;
         outcome.files_deleted = deleted.0;
         outcome.files_failed = deleted.1;
     }
@@ -191,6 +194,7 @@ async fn delete_now_unreachable(
     updated: &Table,
     before: ReachableSet,
     observer: &dyn MaintenanceObserver,
+    ctx: OperationContext<'_>,
 ) -> Result<(usize, usize)> {
     let after = reachability::compute(table_ref, updated).await?;
     let location = updated.metadata().location();
@@ -230,7 +234,7 @@ async fn delete_now_unreachable(
 
     // Announced before the first deletion, so a crash halfway through still
     // leaves a record of what was about to be removed.
-    observer.deleting_files(table_ref, &doomed).await;
+    observer.deleting_files(ctx, &doomed).await;
 
     let file_io = updated.file_io();
     let mut deleted = 0usize;

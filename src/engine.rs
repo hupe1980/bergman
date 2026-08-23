@@ -12,7 +12,7 @@ use crate::catalog::CatalogConfig;
 use crate::commit::TableCommitter;
 use crate::error::{Error, Result};
 use crate::health::TableHealth;
-use crate::obs::{MaintenanceObserver, NoopObserver};
+use crate::obs::{MaintenanceObserver, NoopObserver, OperationContext};
 use crate::ops::store::{ObjectStore, OpendalStore};
 use crate::plan::{
     Executability, MaintenancePlan, OperationKind, OperationOutcome, OperationResult, RunReport,
@@ -292,7 +292,7 @@ impl Bergman {
         &self,
         catalog: &ConnectedCatalog,
         table_plan: &TablePlan,
-        _run_id: &str,
+        run_id: &str,
     ) -> Result<Vec<OperationOutcome>> {
         let table = self.load(catalog, &table_plan.table).await?;
         let mut outcomes = Vec::new();
@@ -317,17 +317,19 @@ impl Bergman {
 
             // The approval gate. An observer that says no turns the operation
             // into a refusal, which is reported and needs attention.
-            if !self
-                .observer
-                .operation_starting(&table_plan.table, operation.kind)
-                .await
-            {
+            let ctx = OperationContext {
+                run_id,
+                table: &table_plan.table,
+                kind: operation.kind,
+                matched_rule: &table_plan.policy.matched_rule,
+                reason: &operation.reason,
+            };
+
+            if !self.observer.operation_starting(ctx).await {
                 let result = OperationResult::Refused {
                     reason: "vetoed by observer".into(),
                 };
-                self.observer
-                    .operation_finished(&table_plan.table, operation.kind, &result)
-                    .await;
+                self.observer.operation_finished(ctx, &result).await;
                 outcomes.push(OperationOutcome {
                     kind: operation.kind,
                     reason: operation.reason.clone(),
@@ -338,13 +340,7 @@ impl Bergman {
             }
 
             let result = self
-                .execute(
-                    catalog,
-                    &table,
-                    table_plan,
-                    operation.kind,
-                    &operation.targets,
-                )
+                .execute(catalog, &table, table_plan, ctx, &operation.targets)
                 .await
                 .unwrap_or_else(|e| match e {
                     Error::Refused { reason, .. } => OperationResult::Refused { reason },
@@ -356,9 +352,7 @@ impl Bergman {
                     },
                 });
 
-            self.observer
-                .operation_finished(&table_plan.table, operation.kind, &result)
-                .await;
+            self.observer.operation_finished(ctx, &result).await;
 
             outcomes.push(OperationOutcome {
                 kind: operation.kind,
@@ -376,18 +370,18 @@ impl Bergman {
         catalog: &ConnectedCatalog,
         table: &iceberg::table::Table,
         table_plan: &TablePlan,
-        kind: OperationKind,
+        ctx: OperationContext<'_>,
         targets: &[crate::health::PartitionKey],
     ) -> Result<OperationResult> {
         let now = Utc::now();
-        match kind {
+        match ctx.kind {
             OperationKind::ExpireSnapshots => {
                 crate::ops::expire::run(
-                    &table_plan.table,
                     table,
                     &catalog.client,
                     &table_plan.policy.snapshots,
                     self.observer.as_ref(),
+                    ctx,
                     now,
                 )
                 .await
@@ -395,29 +389,28 @@ impl Bergman {
             OperationKind::RemoveOrphans => {
                 let store = self.object_store(catalog, table)?;
                 crate::ops::orphans::run(
-                    &table_plan.table,
                     table,
                     &catalog.client,
                     store.as_ref(),
                     &table_plan.policy.orphans,
                     self.observer.as_ref(),
+                    ctx,
                     now,
                 )
                 .await
             }
             OperationKind::RewriteManifests => {
                 crate::ops::manifests::run(
-                    &table_plan.table,
                     table,
                     &crate::catalog::to_table_ident(&table_plan.table)?,
                     catalog.committer.as_ref(),
                     &table_plan.policy.manifests,
+                    ctx,
                 )
                 .await
             }
             OperationKind::Compact => {
                 crate::ops::compact::run(
-                    &table_plan.table,
                     table,
                     &crate::catalog::to_table_ident(&table_plan.table)?,
                     catalog.committer.as_ref(),
@@ -426,6 +419,7 @@ impl Bergman {
                     // what `plan` displayed rather than re-deciding.
                     targets,
                     self.observer.as_ref(),
+                    ctx,
                 )
                 .await
             }

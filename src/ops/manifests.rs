@@ -14,28 +14,30 @@
 
 use std::sync::Arc;
 
+use iceberg::TableIdent;
 use iceberg::spec::{
-    DataContentType, FormatVersion, MAIN_BRANCH, ManifestEntry, ManifestFile, ManifestListWriter,
-    ManifestStatus, ManifestWriterBuilder, Operation, Snapshot, Summary,
+    DataContentType, FormatVersion, ManifestEntry, ManifestFile, ManifestStatus,
+    ManifestWriterBuilder, Operation, Summary,
 };
 use iceberg::table::Table;
-use iceberg::{TableIdent, TableRequirement, TableUpdate};
 use uuid::Uuid;
 
-use crate::commit::TableCommitter;
+use crate::commit::{SnapshotProducer, TableCommitter};
 use crate::error::{Error, Result};
+use crate::obs::OperationContext;
 use crate::plan::OperationResult;
-use crate::policy::{EffectiveManifests, TableRef};
+use crate::policy::EffectiveManifests;
 use crate::util::human_bytes;
 
 /// Rewrite a table's manifests into fewer, larger ones.
 pub async fn run(
-    table_ref: &TableRef,
     table: &Table,
     ident: &TableIdent,
     committer: &dyn TableCommitter,
     settings: &EffectiveManifests,
+    ctx: OperationContext<'_>,
 ) -> Result<OperationResult> {
+    let table_ref = ctx.table;
     let metadata = table.metadata();
 
     let Some(parent) = metadata.current_snapshot() else {
@@ -115,7 +117,8 @@ pub async fn run(
         }
     }
 
-    let snapshot_id = new_snapshot_id();
+    let producer = SnapshotProducer::new(table);
+    let snapshot_id = producer.snapshot_id();
     let mut manifests = keep_as_is;
 
     manifests.extend(
@@ -151,66 +154,30 @@ pub async fn run(
         });
     }
 
-    let manifest_list_location = write_manifest_list(table, snapshot_id, parent, manifests).await?;
+    let summary = Summary {
+        // `replace`: the rows are untouched and only their metadata layout
+        // differs. Anything else would tell downstream consumers the data
+        // changed.
+        operation: Operation::Replace,
+        additional_properties: std::collections::HashMap::from([
+            (
+                "manifests-replaced".to_string(),
+                undersized.len().to_string(),
+            ),
+            (
+                "manifests-kept".to_string(),
+                (before - undersized.len()).to_string(),
+            ),
+            ("engine-name".to_string(), "bergman".to_string()),
+            (
+                "engine-version".to_string(),
+                env!("CARGO_PKG_VERSION").to_string(),
+            ),
+        ]),
+    };
 
-    let snapshot = Snapshot::builder()
-        .with_snapshot_id(snapshot_id)
-        .with_parent_snapshot_id(Some(parent.snapshot_id()))
-        .with_sequence_number(metadata.next_sequence_number())
-        .with_timestamp_ms(chrono::Utc::now().timestamp_millis())
-        .with_manifest_list(manifest_list_location)
-        .with_schema_id(metadata.current_schema_id())
-        .with_summary(Summary {
-            // `replace`: the rows are untouched and only their metadata layout
-            // differs. Anything else would tell downstream consumers the data
-            // changed.
-            operation: Operation::Replace,
-            additional_properties: std::collections::HashMap::from([
-                (
-                    "manifests-replaced".to_string(),
-                    undersized.len().to_string(),
-                ),
-                (
-                    "manifests-kept".to_string(),
-                    (before - undersized.len()).to_string(),
-                ),
-                ("engine-name".to_string(), "bergman".to_string()),
-                (
-                    "engine-version".to_string(),
-                    env!("CARGO_PKG_VERSION").to_string(),
-                ),
-            ]),
-        })
-        .build();
-
-    committer
-        .commit(
-            ident,
-            vec![
-                TableRequirement::RefSnapshotIdMatch {
-                    r#ref: MAIN_BRANCH.to_string(),
-                    snapshot_id: Some(parent.snapshot_id()),
-                },
-                TableRequirement::UuidMatch {
-                    uuid: metadata.uuid(),
-                },
-            ],
-            vec![
-                TableUpdate::AddSnapshot { snapshot },
-                TableUpdate::SetSnapshotRef {
-                    ref_name: MAIN_BRANCH.to_string(),
-                    reference: iceberg::spec::SnapshotReference::new(
-                        snapshot_id,
-                        iceberg::spec::SnapshotRetention::Branch {
-                            min_snapshots_to_keep: None,
-                            max_snapshot_age_ms: None,
-                            max_ref_age_ms: None,
-                        },
-                    ),
-                },
-            ],
-        )
-        .await?;
+    let (requirements, updates) = producer.install(parent, manifests, summary).await?;
+    committer.commit(ident, requirements, updates).await?;
 
     Ok(OperationResult::Succeeded {
         detail: format!(
@@ -327,67 +294,8 @@ fn estimated_entry_bytes(metadata: &iceberg::spec::TableMetadata) -> u64 {
     BASE + columns * PER_COLUMN
 }
 
-async fn write_manifest_list(
-    table: &Table,
-    snapshot_id: i64,
-    parent: &iceberg::spec::SnapshotRef,
-    manifests: Vec<ManifestFile>,
-) -> Result<String> {
-    let metadata = table.metadata();
-    let location = format!(
-        "{}/metadata/snap-{snapshot_id}-{}.avro",
-        metadata.location().trim_end_matches('/'),
-        Uuid::new_v4()
-    );
-
-    let output = table
-        .file_io()
-        .new_output(&location)
-        .map_err(|e| Error::Storage(Box::new(e)))?
-        .writer()
-        .await
-        .map_err(|e| Error::Storage(Box::new(e)))?;
-
-    let sequence_number = metadata.next_sequence_number();
-    let mut writer = match metadata.format_version() {
-        FormatVersion::V1 => {
-            ManifestListWriter::v1(output, snapshot_id, Some(parent.snapshot_id()))
-        }
-        FormatVersion::V2 => ManifestListWriter::v2(
-            output,
-            snapshot_id,
-            Some(parent.snapshot_id()),
-            sequence_number,
-        ),
-        FormatVersion::V3 => ManifestListWriter::v3(
-            output,
-            snapshot_id,
-            Some(parent.snapshot_id()),
-            sequence_number,
-            Some(metadata.next_row_id()),
-        ),
-    };
-
-    writer
-        .add_manifests(manifests.into_iter())
-        .map_err(|e| Error::Storage(Box::new(e)))?;
-    writer
-        .close()
-        .await
-        .map_err(|e| Error::Storage(Box::new(e)))?;
-
-    Ok(location)
-}
-
-fn new_snapshot_id() -> i64 {
-    let bytes = Uuid::new_v4().into_bytes();
-    let raw = i64::from_be_bytes(bytes[..8].try_into().expect("uuid has 16 bytes"));
-    (raw & i64::MAX).max(1)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     #[test]
     fn entry_size_grows_with_column_count() {
@@ -409,12 +317,5 @@ mod tests {
         let target: u64 = 10;
         let per_entry: u64 = 1000;
         assert_eq!((target / per_entry).max(1), 1);
-    }
-
-    #[test]
-    fn snapshot_ids_are_positive() {
-        for _ in 0..100 {
-            assert!(new_snapshot_id() > 0);
-        }
     }
 }

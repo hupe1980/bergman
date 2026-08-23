@@ -72,8 +72,10 @@ there:
 
 ## What is not built
 
-- **Sort and z-order clustering.** `sort` is accepted, validated and reported,
-  but output is bin-packed rather than sorted. Z-order is not implemented.
+- **Z-order clustering.** Sorting works; z-order does not. It is an
+  optimization rather than table health.
+- **Spilling to disk.** A sorted partition must fit `max_sort_memory`, and one
+  that does not is refused rather than written unsorted.
 - **Rewriting across a partition-spec change.** A partition holding files under
   two specs is refused with a named reason rather than rewritten under the
   current spec, which would mis-file rows.

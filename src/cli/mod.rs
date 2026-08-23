@@ -117,8 +117,7 @@ pub async fn main() -> Result<()> {
 
     let mut observers = Observers::new();
     if let Some(path) = &cli.audit_log {
-        let run_id = uuid::Uuid::new_v4().to_string();
-        observers = observers.with(Arc::new(AuditObserver::new(JsonlSink::open(path)?, run_id)));
+        observers = observers.with(Arc::new(AuditObserver::new(JsonlSink::open(path)?)));
     }
 
     let bergman = Bergman::builder(config)

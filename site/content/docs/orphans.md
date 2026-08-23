@@ -148,8 +148,9 @@ bergman run --audit-log /var/log/bergman.jsonl
 
 ```json
 {"at":"2026-08-23T02:14:07Z","run_id":"6f2c…","table":"prod.analytics.events",
- "operation":"remove-orphans","reason":"1284 files",
- "result":{"result":"succeeded","detail":"deletion starting"},
+ "operation":"remove-orphans","matched_rule":"prod.analytics.**",
+ "reason":"scan s3://lake/warehouse/analytics/events and delete files older than 7d…",
+ "result":{"result":"succeeded","detail":"deleting 1284 files"},
  "deleted_files":["s3://lake/warehouse/analytics/events/data/00042-…parquet", …]}
 ```
 
@@ -164,8 +165,8 @@ Embedders can require sign-off without Bergman knowing how that decision is made
 ```rust
 #[async_trait::async_trait]
 impl MaintenanceObserver for RequireSignoff {
-    async fn operation_starting(&self, table: &TableRef, kind: OperationKind) -> bool {
-        kind != OperationKind::RemoveOrphans || self.approved(table).await
+    async fn operation_starting(&self, ctx: OperationContext<'_>) -> bool {
+        ctx.kind != OperationKind::RemoveOrphans || self.approved(ctx.table).await
     }
 }
 ```

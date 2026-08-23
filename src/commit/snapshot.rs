@@ -115,9 +115,31 @@ impl<'a> SnapshotProducer<'a> {
         }
 
         let manifests = self.write_manifests(&survivors, &rewrite.added).await?;
+        let summary = self.summary(rewrite, survivors.len());
+
+        Ok(Some(self.install(parent, manifests, summary).await?))
+    }
+
+    /// The id this producer will stamp on the snapshot it builds.
+    pub(crate) fn snapshot_id(&self) -> i64 {
+        self.snapshot_id
+    }
+
+    /// Turn a finished manifest set into the commit that installs it.
+    ///
+    /// Both maintenance operations that replace files end here: compaction
+    /// after rewriting data, manifest rewriting after re-packing entries. The
+    /// snapshot, the branch move and the two preconditions are identical in
+    /// both cases, and having one implementation is what keeps them that way.
+    pub(crate) async fn install(
+        &self,
+        parent: &iceberg::spec::SnapshotRef,
+        manifests: Vec<ManifestFile>,
+        summary: Summary,
+    ) -> Result<(Vec<TableRequirement>, Vec<TableUpdate>)> {
+        let metadata = self.table.metadata();
         let manifest_list = self.write_manifest_list(parent, manifests).await?;
 
-        let summary = self.summary(rewrite, survivors.len());
         let snapshot = Snapshot::builder()
             .with_snapshot_id(self.snapshot_id)
             .with_parent_snapshot_id(Some(parent.snapshot_id()))
@@ -128,7 +150,7 @@ impl<'a> SnapshotProducer<'a> {
             .with_summary(summary)
             .build();
 
-        Ok(Some((
+        Ok((
             vec![
                 // The compare-and-swap. If `main` has moved since the plan was
                 // built, the catalog rejects this and Bergman replans — it
@@ -137,12 +159,17 @@ impl<'a> SnapshotProducer<'a> {
                     r#ref: MAIN_BRANCH.to_string(),
                     snapshot_id: Some(parent.snapshot_id()),
                 },
+                // Guards against the table being dropped and recreated in
+                // between, which the ref check alone would not catch.
                 TableRequirement::UuidMatch {
                     uuid: metadata.uuid(),
                 },
             ],
             vec![
                 TableUpdate::AddSnapshot { snapshot },
+                // Adding a snapshot without moving `main` leaves it
+                // unreachable: the operation would appear to succeed while
+                // changing nothing anyone can read.
                 TableUpdate::SetSnapshotRef {
                     ref_name: MAIN_BRANCH.to_string(),
                     reference: iceberg::spec::SnapshotReference::new(
@@ -155,11 +182,11 @@ impl<'a> SnapshotProducer<'a> {
                     ),
                 },
             ],
-        )))
+        ))
     }
 
     /// Every live manifest entry of the parent snapshot.
-    async fn load_live_entries(
+    pub(crate) async fn load_live_entries(
         &self,
         parent: &iceberg::spec::SnapshotRef,
     ) -> Result<Vec<ManifestEntry>> {
@@ -311,7 +338,7 @@ impl<'a> SnapshotProducer<'a> {
     }
 
     /// Write the manifest list, returning its location.
-    async fn write_manifest_list(
+    pub(crate) async fn write_manifest_list(
         &self,
         parent: &iceberg::spec::SnapshotRef,
         manifests: Vec<ManifestFile>,
@@ -364,7 +391,7 @@ impl<'a> SnapshotProducer<'a> {
         Ok(location)
     }
 
-    fn new_manifest_output(&self, kind: &str) -> Result<iceberg::io::OutputFile> {
+    pub(crate) fn new_manifest_output(&self, kind: &str) -> Result<iceberg::io::OutputFile> {
         let location = format!(
             "{}/metadata/{}-m-{}-{}.avro",
             self.table.metadata().location().trim_end_matches('/'),

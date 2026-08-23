@@ -97,6 +97,11 @@ older_than = "7d"
 
 max_concurrent_file_groups = 4
 
+# How much memory one partition's sort may use. Sorting needs the whole file
+# group in hand and Bergman does not spill, so a larger partition is refused
+# with a named reason rather than written unsorted.
+# max_sort_memory = 1073741824   # 1 GiB
+
 [defaults.compaction.trigger]
 # Compaction is *triggered*, not scheduled: a table already at target size
 # costs one metadata read per cycle and no data I/O at all.
@@ -151,8 +156,9 @@ schedule = "0 */2 * * *"
 
 [rules.compaction]
 enabled = true
-# Accepted, validated and reported — but the sort stage is not implemented yet,
-# so output is bin-packed rather than sorted.
+# Rows are sorted globally within each partition, so output files carry tight
+# min/max bounds and a query filtering on these columns can skip whole files.
+# This needs the partition in memory; see `max_sort_memory` above.
 sort = ["event_date", "customer_id"]
 
 [rules.compaction.trigger]

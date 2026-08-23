@@ -139,6 +139,7 @@ Bergman declines rather than guessing:
 - **A table whose `write.format.default` is not Parquet.** Bergman reads
   Parquet, Avro and ORC but writes only Parquet, and a rewrite must not
   silently change a table's format.
+- **A sorted partition larger than the memory budget**, as above.
 
 Both are reported with the reason, per partition, and the rest of the table is
 still compacted — each partition commits on its own, so partial progress is real
@@ -151,7 +152,29 @@ progress.
 sort = ["event_date", "customer_id"]
 ```
 
-Accepted, validated and reported in plans, but **output is bin-packed rather
-than sorted** — the sort stage is not implemented yet. Z-ordering is not
-implemented at all: it is an optimization rather than table health, and it comes
-after bin-packing and sorting are proven.
+Rows are sorted **globally within each partition**, so every output file ends up
+with a tight min/max range for the sort columns and a query with a predicate on
+them can skip whole files. Sorting each batch independently would leave every
+file spanning the whole key range and buy nothing, so Bergman does not do that.
+
+Global sorting means the file group has to be in memory at once. Bergman does
+not spill to disk, so a partition larger than the budget is **refused with a
+named reason** rather than written unsorted — a table whose metadata claims a
+sort order its files do not have is worse than one that failed loudly.
+
+```toml
+[rules.compaction]
+max_sort_memory = 2147483648   # 2 GiB; defaults to 1 GiB
+```
+
+```
+compact refused on prod.analytics.events: partition d=2026-08-20 is 3.40 GiB and
+sorting needs it in memory, over the 1.00 GiB budget; raise
+compaction.max_sort_memory or drop `sort` for this rule
+```
+
+Sort columns are checked against the schema before anything is read, so a typo
+costs a metadata lookup rather than a full partition read.
+
+Z-ordering is not implemented: it is an optimization rather than table health,
+and it comes after bin-packing and sorting are proven.

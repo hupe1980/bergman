@@ -91,6 +91,11 @@ opendal = { version = "0.57", default-features = false, features = [
 # make the static musl build stop being static.
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 
+# Arrow, for the sort stage of compaction: `lexsort_to_indices` plus `take`
+# over the concatenated batches of one file group. Version-matched to what
+# iceberg 0.10 pins, so the tree holds one arrow.
+arrow = { version = "58", default-features = false }
+
 # Parquet writer properties. Bergman does not encode Parquet itself — the
 # iceberg writer does — but it must express the table's own compression codec,
 # and that vocabulary is parquet's. Version-matched to what iceberg 0.10 uses.

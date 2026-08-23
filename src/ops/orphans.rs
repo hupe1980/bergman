@@ -26,11 +26,11 @@ use iceberg::Catalog;
 use iceberg::table::Table;
 
 use crate::error::{Error, Result};
-use crate::obs::MaintenanceObserver;
+use crate::obs::{MaintenanceObserver, OperationContext};
 use crate::ops::reachability::{self, ReachableSet};
 use crate::ops::store::ObjectStore;
 use crate::plan::OperationResult;
-use crate::policy::{EffectiveOrphans, MIN_ORPHAN_AGE, OrphanMode, TableRef};
+use crate::policy::{EffectiveOrphans, MIN_ORPHAN_AGE, OrphanMode};
 use crate::util::human_bytes;
 
 /// What the scan found and did.
@@ -56,14 +56,17 @@ pub struct OrphanOutcome {
 
 /// Scan for orphans, and delete them when policy allows.
 pub async fn run(
-    table_ref: &TableRef,
     table: &Table,
     catalog: &Arc<dyn Catalog>,
     store: &dyn ObjectStore,
     settings: &EffectiveOrphans,
     observer: &dyn MaintenanceObserver,
+    ctx: OperationContext<'_>,
     now: DateTime<Utc>,
 ) -> Result<OperationResult> {
+    // One source of the table's identity: the context carries it.
+    let table_ref = ctx.table;
+
     // Check 2, enforced here as well as at parse time. The library API lets an
     // embedder build settings directly, and a safety rule enforced at only one
     // of two entry points is a safety rule with a hole in it.
@@ -188,7 +191,7 @@ pub async fn run(
 
     // The deletion manifest, written before the first delete. A crash halfway
     // through then leaves a record of exactly what was about to go.
-    observer.deleting_files(table_ref, &doomed).await;
+    observer.deleting_files(ctx, &doomed).await;
 
     for path in &doomed {
         match store.delete(path).await {

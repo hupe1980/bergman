@@ -20,6 +20,7 @@
 
 use std::collections::HashSet;
 
+use arrow::array::RecordBatch;
 use futures::StreamExt;
 use iceberg::TableIdent;
 use iceberg::arrow::ArrowReaderBuilder;
@@ -38,11 +39,30 @@ use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use crate::commit::{RewriteFiles, SnapshotProducer, TableCommitter};
 use crate::error::{Error, Result};
 use crate::health::PartitionKey as HealthPartitionKey;
-use crate::obs::MaintenanceObserver;
+use crate::obs::{MaintenanceObserver, OperationContext};
 use crate::ops::reachability::normalize;
 use crate::plan::OperationResult;
 use crate::policy::{EffectiveCompaction, TableRef};
 use crate::util::human_bytes;
+
+/// The inputs every partition of one compaction run shares.
+///
+/// Bundled rather than threaded as a dozen parameters: they are all constant
+/// for the run, and a long positional list is where a caller eventually swaps
+/// two `u64`s that mean different things.
+struct Job<'a> {
+    table: &'a Table,
+    ident: &'a TableIdent,
+    committer: &'a dyn TableCommitter,
+    /// Every live data file in the table, planned once — the delete-file rule
+    /// cannot be answered from inside a single group.
+    all_tasks: &'a [FileScanTask],
+    target: u64,
+    sort: Option<&'a [String]>,
+    sort_budget: u64,
+    observer: &'a dyn MaintenanceObserver,
+    ctx: OperationContext<'a>,
+}
 
 /// What a compaction did.
 #[derive(Debug, Clone, Default)]
@@ -65,15 +85,16 @@ pub struct CompactOutcome {
 
 /// Compact the partitions a plan identified.
 pub async fn run(
-    table_ref: &TableRef,
     table: &Table,
     ident: &TableIdent,
     committer: &dyn TableCommitter,
     settings: &EffectiveCompaction,
     partitions: &[HealthPartitionKey],
     observer: &dyn MaintenanceObserver,
+    ctx: OperationContext<'_>,
 ) -> Result<OperationResult> {
-    let _ = observer;
+    // One source of the table's identity: the context carries it.
+    let table_ref = ctx.table;
     let metadata = table.metadata();
 
     if metadata.current_snapshot().is_none() {
@@ -100,20 +121,36 @@ pub async fn run(
         ));
     }
 
+    let target = settings.target_file_size.value;
+    let sort: Option<Vec<String>> = settings.sort.as_ref().map(|r| r.value.clone());
+    let sort_budget = settings.max_sort_memory.value;
+
+    // Checked before anything is read: a typo in a policy should cost a
+    // metadata lookup, not a full partition read followed by a failure.
+    if let Some(columns) = &sort {
+        check_sort_columns(table_ref, metadata, columns)?;
+    }
+
     // Plan the whole table once. Two things need this rather than a
     // group-scoped scan: deciding which delete files are exclusive to a group,
     // and refusing partition specs Bergman cannot rewrite correctly.
     let all_tasks = plan_all(table).await?;
-
-    let target = settings.target_file_size.value;
     let mut outcome = CompactOutcome::default();
 
+    let job = Job {
+        table,
+        ident,
+        committer,
+        all_tasks: &all_tasks,
+        target,
+        sort: sort.as_deref(),
+        sort_budget,
+        observer,
+        ctx,
+    };
+
     for partition in partitions {
-        match compact_partition(
-            table_ref, table, ident, committer, &all_tasks, partition, target,
-        )
-        .await
-        {
+        match job.compact_partition(partition).await {
             Ok(Some(stats)) => {
                 outcome.partitions += 1;
                 outcome.files_removed += stats.files_removed;
@@ -189,102 +226,222 @@ async fn plan_all(table: &Table) -> Result<Vec<FileScanTask>> {
     Ok(tasks)
 }
 
-/// Compact one partition, committing on its own.
-async fn compact_partition(
-    table_ref: &TableRef,
-    table: &Table,
-    ident: &TableIdent,
-    committer: &dyn TableCommitter,
-    all_tasks: &[FileScanTask],
-    partition: &HealthPartitionKey,
-    target: u64,
-) -> Result<Option<PartitionStats>> {
-    let metadata = table.metadata();
+impl Job<'_> {
+    /// Compact one partition, committing on its own.
+    async fn compact_partition(
+        &self,
+        partition: &HealthPartitionKey,
+    ) -> Result<Option<PartitionStats>> {
+        let Job {
+            table,
+            ident,
+            committer,
+            all_tasks,
+            target,
+            sort,
+            sort_budget,
+            observer,
+            ctx,
+        } = *self;
+        // One source of the table's identity: the context carries it.
+        let table_ref = ctx.table;
+        let metadata = table.metadata();
 
-    // Bergman renders partition values to strings for grouping and display
-    // (see `crate::health::PartitionKey`), so a group is identified by matching
-    // that rendering back against the planned tasks.
-    let (group, rest): (Vec<&FileScanTask>, Vec<&FileScanTask>) = all_tasks
-        .iter()
-        .partition(|task| task_partition(task) == partition.value);
+        // Bergman renders partition values to strings for grouping and display
+        // (see `crate::health::PartitionKey`), so a group is identified by matching
+        // that rendering back against the planned tasks.
+        let (group, rest): (Vec<&FileScanTask>, Vec<&FileScanTask>) = all_tasks
+            .iter()
+            .partition(|task| task_partition(task) == partition.value);
 
-    if group.is_empty() {
-        return Ok(None);
-    }
+        if group.is_empty() {
+            return Ok(None);
+        }
 
-    // A table whose partition spec has evolved holds files under several specs
-    // at once. Rewriting them together would write output under the *current*
-    // spec while claiming to replace files partitioned differently, which
-    // silently mis-files rows. Refuse, and say so.
-    let spec_ids: HashSet<i32> = group.iter().map(|t| partition_spec_id(t)).collect();
-    if spec_ids.len() > 1 {
-        return Err(Error::refused(
-            "compact",
-            table_ref,
-            format!(
-                "partition {partition} holds files under {} partition specs; \
+        // A table whose partition spec has evolved holds files under several specs
+        // at once. Rewriting them together would write output under the *current*
+        // spec while claiming to replace files partitioned differently, which
+        // silently mis-files rows. Refuse, and say so.
+        let spec_ids: HashSet<i32> = group.iter().map(|t| partition_spec_id(t)).collect();
+        if spec_ids.len() > 1 {
+            return Err(Error::refused(
+                "compact",
+                table_ref,
+                format!(
+                    "partition {partition} holds files under {} partition specs; \
                  rewriting across a spec change is not supported",
-                spec_ids.len()
-            ),
-        ));
+                    spec_ids.len()
+                ),
+            ));
+        }
+
+        // The delete-file rule. A delete file referenced by anything outside this
+        // group is still doing work there, so it stays — and because it stays, the
+        // data files it applies to inside the group are still correct after the
+        // rewrite.
+        let deletes_elsewhere: HashSet<String> = rest
+            .iter()
+            .flat_map(|task| task.deletes.iter())
+            .map(|d| normalize(&d.file_path))
+            .collect();
+
+        let deletes_in_group: HashSet<String> = group
+            .iter()
+            .flat_map(|task| task.deletes.iter())
+            .map(|d| normalize(&d.file_path))
+            .collect();
+
+        let retirable = retirable_deletes(&deletes_in_group, &deletes_elsewhere);
+
+        let bytes_read: u64 = group.iter().map(|t| t.file_size_in_bytes).sum();
+        let input_paths: Vec<String> = group.iter().map(|t| t.data_file_path.clone()).collect();
+
+        // Sorting needs the whole group in memory, and Bergman does not spill.
+        // Refusing is the honest answer: silently writing an unsorted result would
+        // leave a table that looks clustered in its metadata and is not.
+        if sort.is_some() && sort_budget_exceeded(bytes_read, sort_budget) {
+            return Err(Error::refused(
+                "compact",
+                table_ref,
+                format!(
+                    "partition {partition} is {} and sorting needs it in memory, over the {} budget; \
+                 raise compaction.max_sort_memory or drop `sort` for this rule",
+                    human_bytes(bytes_read),
+                    human_bytes(sort_budget),
+                ),
+            ));
+        }
+
+        // Read with deletes applied, write at the target size.
+        let written = rewrite_group(table, &group, target, sort).await?;
+
+        // A group whose rows were entirely deleted produces no files. That is a
+        // legitimate outcome — the rewrite removes the inputs and adds nothing —
+        // and it is how a partition emptied by deletes finally stops being read.
+        let bytes_written: u64 = written.iter().map(|f| f.file_size_in_bytes()).sum();
+        let files_written = written.len();
+
+        let mut removed = input_paths;
+        removed.extend(retirable.iter().cloned());
+
+        let rewrite = RewriteFiles {
+            removed,
+            added: written,
+        };
+
+        let producer = SnapshotProducer::new(table);
+        let Some((requirements, updates)) = producer.rewrite_files(&rewrite).await? else {
+            return Ok(None);
+        };
+
+        // The superseded files are announced before the commit that drops them, so
+        // an observer sees what a rewrite is about to replace — the same contract
+        // the deletion manifest has.
+        observer.deleting_files(ctx, &rewrite.removed).await;
+
+        committer.commit(ident, requirements, updates).await?;
+
+        let _ = metadata;
+        Ok(Some(PartitionStats {
+            files_removed: group.len(),
+            deletes_retired: retirable.len(),
+            files_written,
+            bytes_read,
+            bytes_written,
+        }))
+    }
+}
+
+/// Refuse sort columns the table does not have, before anything is read.
+///
+/// A typo in a policy should cost a metadata check, not a full partition read
+/// followed by a failure.
+fn check_sort_columns(
+    table_ref: &TableRef,
+    metadata: &iceberg::spec::TableMetadata,
+    columns: &[String],
+) -> Result<()> {
+    let schema = metadata.current_schema();
+    for name in columns {
+        if schema.field_by_name(name).is_none() {
+            return Err(Error::refused(
+                "compact",
+                table_ref,
+                format!("sort column {name:?} is not a column of this table"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Sort the buffered batches of one file group.
+///
+/// A *global* sort across the group, not a per-batch one: the point of sorting
+/// on write is that each output file ends up with a tight min/max range for the
+/// sort columns, so a query with a predicate on them can skip whole files.
+/// Sorting each batch independently would leave every output file spanning the
+/// whole key range and buy nothing.
+///
+/// Global sorting means buffering the group. Bergman does not spill, so it
+/// refuses a group that would exceed the memory budget rather than sorting a
+/// prefix and quietly producing an unsorted result (see [`sort_budget_exceeded`]).
+fn sort_batches(batches: Vec<RecordBatch>, columns: &[String]) -> Result<Vec<RecordBatch>> {
+    use arrow::compute::{SortColumn, SortOptions, lexsort_to_indices, take};
+
+    if batches.is_empty() || columns.is_empty() {
+        return Ok(batches);
     }
 
-    // The delete-file rule. A delete file referenced by anything outside this
-    // group is still doing work there, so it stays — and because it stays, the
-    // data files it applies to inside the group are still correct after the
-    // rewrite.
-    let deletes_elsewhere: HashSet<String> = rest
+    let schema = batches[0].schema();
+    let combined = arrow::compute::concat_batches(&schema, &batches)
+        .map_err(|e| Error::Storage(Box::new(arrow_error(e))))?;
+
+    let mut sort_columns = Vec::with_capacity(columns.len());
+    for name in columns {
+        let index = schema.index_of(name).map_err(|_| {
+            // The column list is validated against the schema before any data
+            // is read (see `check_sort_columns`), so reaching here means the
+            // schema changed mid-rewrite.
+            Error::metadata(
+                "table",
+                format!("sort column {name:?} is not in the table schema"),
+            )
+        })?;
+        sort_columns.push(SortColumn {
+            values: combined.column(index).clone(),
+            // Ascending with nulls first, matching Iceberg's own default sort
+            // direction and null ordering. A per-column direction belongs in
+            // the table's `SortOrder`; policy names columns, not orderings.
+            options: Some(SortOptions {
+                descending: false,
+                nulls_first: true,
+            }),
+        });
+    }
+
+    let indices = lexsort_to_indices(&sort_columns, None)
+        .map_err(|e| Error::Storage(Box::new(arrow_error(e))))?;
+
+    let sorted: Vec<_> = combined
+        .columns()
         .iter()
-        .flat_map(|task| task.deletes.iter())
-        .map(|d| normalize(&d.file_path))
-        .collect();
+        .map(|column| take(column.as_ref(), &indices, None))
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| Error::Storage(Box::new(arrow_error(e))))?;
 
-    let deletes_in_group: HashSet<String> = group
-        .iter()
-        .flat_map(|task| task.deletes.iter())
-        .map(|d| normalize(&d.file_path))
-        .collect();
+    let batch = RecordBatch::try_new(schema, sorted)
+        .map_err(|e| Error::Storage(Box::new(arrow_error(e))))?;
 
-    let retirable: Vec<String> = deletes_in_group
-        .difference(&deletes_elsewhere)
-        .cloned()
-        .collect();
+    Ok(vec![batch])
+}
 
-    let bytes_read: u64 = group.iter().map(|t| t.file_size_in_bytes).sum();
-    let input_paths: Vec<String> = group.iter().map(|t| t.data_file_path.clone()).collect();
+/// Whether a group is too large to sort without spilling.
+fn sort_budget_exceeded(bytes: u64, budget: u64) -> bool {
+    bytes > budget
+}
 
-    // Read with deletes applied, write at the target size.
-    let written = rewrite_group(table, &group, target).await?;
-
-    // A group whose rows were entirely deleted produces no files. That is a
-    // legitimate outcome — the rewrite removes the inputs and adds nothing —
-    // and it is how a partition emptied by deletes finally stops being read.
-    let bytes_written: u64 = written.iter().map(|f| f.file_size_in_bytes()).sum();
-    let files_written = written.len();
-
-    let mut removed = input_paths;
-    removed.extend(retirable.iter().cloned());
-
-    let rewrite = RewriteFiles {
-        removed,
-        added: written,
-    };
-
-    let producer = SnapshotProducer::new(table);
-    let Some((requirements, updates)) = producer.rewrite_files(&rewrite).await? else {
-        return Ok(None);
-    };
-
-    committer.commit(ident, requirements, updates).await?;
-
-    let _ = metadata;
-    Ok(Some(PartitionStats {
-        files_removed: group.len(),
-        deletes_retired: retirable.len(),
-        files_written,
-        bytes_read,
-        bytes_written,
-    }))
+fn arrow_error(e: arrow::error::ArrowError) -> iceberg::Error {
+    iceberg::Error::new(iceberg::ErrorKind::Unexpected, e.to_string())
 }
 
 /// Read a file group with its deletes applied and write replacements.
@@ -292,6 +449,7 @@ async fn rewrite_group(
     table: &Table,
     group: &[&FileScanTask],
     target: u64,
+    sort: Option<&[String]>,
 ) -> Result<Vec<iceberg::spec::DataFile>> {
     let metadata = table.metadata();
     let file_io: FileIO = table.file_io().clone();
@@ -343,12 +501,33 @@ async fn rewrite_group(
         .await
         .map_err(|e| Error::Storage(Box::new(e)))?;
 
-    while let Some(batch) = batches.next().await {
-        let batch = batch.map_err(|e| Error::Storage(Box::new(e)))?;
-        writer
-            .write(batch)
-            .await
-            .map_err(|e| Error::Storage(Box::new(e)))?;
+    match sort {
+        // Unsorted: stream straight through, so memory is bounded by one batch
+        // however large the partition is.
+        None => {
+            while let Some(batch) = batches.next().await {
+                let batch = batch.map_err(|e| Error::Storage(Box::new(e)))?;
+                writer
+                    .write(batch)
+                    .await
+                    .map_err(|e| Error::Storage(Box::new(e)))?;
+            }
+        }
+        // Sorted: the whole group must be in hand before any of it can be
+        // written in order. The caller has already refused a group that would
+        // not fit the memory budget.
+        Some(columns) => {
+            let mut buffered = Vec::new();
+            while let Some(batch) = batches.next().await {
+                buffered.push(batch.map_err(|e| Error::Storage(Box::new(e)))?);
+            }
+            for batch in sort_batches(buffered, columns)? {
+                writer
+                    .write(batch)
+                    .await
+                    .map_err(|e| Error::Storage(Box::new(e)))?;
+            }
+        }
     }
 
     writer
@@ -442,35 +621,10 @@ fn writer_properties(
 ///
 /// Split out so the rule can be tested directly: it is the one that resurrects
 /// deleted rows when it is wrong, and nothing fails visibly when it is.
-#[cfg_attr(not(test), allow(dead_code))]
 fn retirable_deletes(in_group: &HashSet<String>, elsewhere: &HashSet<String>) -> Vec<String> {
     let mut out: Vec<String> = in_group.difference(elsewhere).cloned().collect();
     out.sort();
     out
-}
-
-/// Group data files into batches that add up to roughly the target size.
-///
-/// Unused by the current partition-at-a-time path, kept as the seam for
-/// splitting a very large partition into several commits.
-#[cfg_attr(not(test), allow(dead_code))]
-fn bin_pack(sizes: &[u64], target: u64) -> Vec<Vec<usize>> {
-    let mut groups: Vec<Vec<usize>> = Vec::new();
-    let mut current: Vec<usize> = Vec::new();
-    let mut current_bytes = 0u64;
-
-    for (index, size) in sizes.iter().enumerate() {
-        if !current.is_empty() && current_bytes + size > target {
-            groups.push(std::mem::take(&mut current));
-            current_bytes = 0;
-        }
-        current.push(index);
-        current_bytes += size;
-    }
-    if !current.is_empty() {
-        groups.push(current);
-    }
-    groups
 }
 
 #[cfg(test)]
@@ -506,6 +660,108 @@ mod tests {
     }
 
     #[test]
+    fn sorting_orders_rows_across_the_whole_group_not_within_each_batch() {
+        use arrow::array::{Int32Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        // Two batches whose values interleave. A per-batch sort would leave
+        // [1,3,5,2,4,6] — every output file spanning the whole key range, which
+        // is exactly the clustering the sort is supposed to produce.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let first = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![5, 1, 3])),
+                Arc::new(StringArray::from(vec!["e", "a", "c"])),
+            ],
+        )
+        .unwrap();
+        let second = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![2, 6, 4])),
+                Arc::new(StringArray::from(vec!["b", "f", "d"])),
+            ],
+        )
+        .unwrap();
+
+        let sorted = sort_batches(vec![first, second], &["id".to_string()]).unwrap();
+
+        let ids: Vec<i32> = sorted
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(ids, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn sorting_keeps_rows_intact() {
+        use arrow::array::{Int32Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        // Reordering one column and not the others would silently corrupt every
+        // row in the table.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![3, 1, 2])),
+                Arc::new(StringArray::from(vec!["c", "a", "b"])),
+            ],
+        )
+        .unwrap();
+
+        let sorted = sort_batches(vec![batch], &["id".to_string()]).unwrap();
+        let names: Vec<&str> = sorted[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|v| v.unwrap())
+            .collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn no_sort_columns_leaves_the_batches_alone() {
+        // The unsorted path must stream rather than buffer, and this is the
+        // guard that an empty column list does not accidentally take the
+        // buffering branch.
+        assert!(
+            sort_batches(Vec::new(), &["id".to_string()])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_group_over_the_memory_budget_is_refused_rather_than_written_unsorted() {
+        // Bergman does not spill. Writing an unsorted result would leave a
+        // table whose metadata claims a sort order its files do not have.
+        assert!(sort_budget_exceeded(
+            2 * 1024 * 1024 * 1024,
+            1024 * 1024 * 1024
+        ));
+        assert!(!sort_budget_exceeded(512 * 1024 * 1024, 1024 * 1024 * 1024));
+    }
+
+    #[test]
     fn retirement_compares_normalized_paths() {
         // The scan reports `s3://`, the manifest may say `s3a://`. Treating
         // them as different files would retire one that is still in use.
@@ -515,25 +771,5 @@ mod tests {
             .map(|p| normalize(p))
             .collect();
         assert!(retirable_deletes(&in_group, &elsewhere).is_empty());
-    }
-
-    #[test]
-    fn bin_packing_fills_groups_up_to_the_target() {
-        let groups = bin_pack(&[400, 400, 400, 400], 1000);
-        assert_eq!(groups, vec![vec![0, 1], vec![2, 3]]);
-    }
-
-    #[test]
-    fn a_file_larger_than_the_target_gets_its_own_group() {
-        // Never an empty group, and never one that silently drops a file.
-        let groups = bin_pack(&[5000, 100], 1000);
-        assert_eq!(groups, vec![vec![0], vec![1]]);
-    }
-
-    #[test]
-    fn bin_packing_covers_every_file_exactly_once() {
-        let sizes = [100, 200, 300, 400, 500, 600];
-        let covered: Vec<usize> = bin_pack(&sizes, 700).into_iter().flatten().collect();
-        assert_eq!(covered, vec![0, 1, 2, 3, 4, 5]);
     }
 }

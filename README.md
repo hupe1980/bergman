@@ -251,8 +251,8 @@ The contract:
 ```rust
 #[async_trait::async_trait]
 impl MaintenanceObserver for RequireSignoff {
-    async fn operation_starting(&self, table: &TableRef, kind: OperationKind) -> bool {
-        kind != OperationKind::RemoveOrphans || self.approved(table).await
+    async fn operation_starting(&self, ctx: OperationContext<'_>) -> bool {
+        ctx.kind != OperationKind::RemoveOrphans || self.approved(ctx.table).await
     }
 }
 ```

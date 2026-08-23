@@ -89,6 +89,7 @@ enabled                    = false
 target_file_size           = 536870912   # -> write.target-file-size-bytes -> 512 MiB
 max_concurrent_file_groups = 4
 sort                       = ["event_date", "customer_id"]
+max_sort_memory            = 1073741824   # 1 GiB
 
 [defaults.compaction.trigger]
 small_file_ratio    = 0.3     # fraction of small files that triggers a rewrite
@@ -97,7 +98,11 @@ delete_ratio        = 0.1     # delete records as a fraction of rows
 min_file_size_ratio = 0.75    # what counts as "small"
 ```
 
-Ratios outside 0–1 are refused at startup. See [Compaction](@/docs/compaction.md).
+Ratios outside 0–1 are refused at startup, as is an empty `sort` list.
+
+`sort` orders rows globally within each partition, which needs the file group in
+memory. `max_sort_memory` bounds that; a larger partition is refused rather than
+written unsorted. See [Compaction](@/docs/compaction.md#sort-based-clustering).
 
 ### `manifests`
 

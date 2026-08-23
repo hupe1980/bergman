@@ -129,8 +129,12 @@ that then dies describes a world that never existed.
 ```json
 {"at":"2026-08-23T02:14:07Z","run_id":"6f2c…","table":"prod.analytics.events",
  "operation":"expire-snapshots","matched_rule":"prod.analytics.*",
+ "reason":"oldest snapshot is 34d old (> 7d), 61 snapshots retained",
  "result":{"result":"succeeded","detail":"58 snapshots expired, 12043 files deleted"}}
 ```
+
+Every record names the rule that triggered it and the measurement that fired,
+so a line in the trail answers "why did this happen to my table?" on its own.
 
 Deletion manifests carry the complete file list and are written **before** the
 first delete, so a crash halfway through still leaves evidence.
