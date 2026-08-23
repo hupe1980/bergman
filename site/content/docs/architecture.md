@@ -137,6 +137,15 @@ than a correctness requirement. Automatic shard assignment is
 
 ## The executor {#executor}
 
+Partition identity comes from the **manifests**, not from the scan.
+`FileScanTask` has a `partition_spec` field that upstream leaves `None` in every
+scan it performs, so a file's partition tuple cannot be rendered from a task.
+Each manifest carries exactly one spec, which makes reading it there exact for a
+spec-evolved table — and grouping on the task's missing spec instead would put
+every file under `unpartitioned`, match none of the partitions the plan named,
+and compact nothing while reporting success.
+
+
 Compaction is the only operation that reads and writes data, and the only one
 that needs a query engine. The split is deliberate, and each stage goes to
 whichever component does it best:

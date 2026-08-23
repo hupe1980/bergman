@@ -318,10 +318,19 @@ with it if the row was not modified. Iceberg's Java implementation does this —
 Spark since 1.10.0 ([#13555](https://github.com/apache/iceberg/pull/13555)),
 Flink since [#14149](https://github.com/apache/iceberg/pull/14149).
 
-What Bergman lacks is the capability. `iceberg-rust`'s reader does not project
-`_row_id`, and its `RollingFileWriter` will not accept it, so there is nothing
-to copy from and nowhere to copy it to. That is upstream work; until it lands,
-the question is only what Bergman does in the meantime.
+What Bergman lacks is the capability, and the gap is in the *read* path.
+`iceberg-rust` reserves the field ids but populates nothing: the reader resolves
+a projected id against the table schema, so `_row_id` fails with "field not
+found" even when the column is there, and `FileScanTask` carries neither the
+file's `first_row_id` nor its data sequence number, so the inherited values
+cannot be computed either.
+
+Hand-rolling it meanwhile would mean replacing both ends — upstream's reader, to
+recover `_pos` through a positional-delete row selection, and its
+`ParquetWriter`, whose `DataFile` output carries column sizes, value counts and
+per-column bounds Bergman would then have to compute itself. That is a fork in
+all but name. The upstream fix is far smaller: two fields on `FileScanTask`, and
+reader and writer support for two field ids the crate has already reserved.
 
 It refuses, because the alternative fails silently. Three things go wrong:
 

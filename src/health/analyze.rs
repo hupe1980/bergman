@@ -178,6 +178,83 @@ pub async fn analyze(
     })
 }
 
+/// Map every live data file to the partition it belongs to.
+///
+/// Compaction needs this and cannot get it from the scan: `FileScanTask` has a
+/// `partition_spec` field, but upstream's scan leaves it `None` — the value is
+/// only ever set in upstream's own tests, and `scan/context.rs` carries a `TODO`
+/// about passing the real spec through. Without a spec, a file's partition tuple
+/// cannot be rendered, and a rewrite that grouped scanned files by "no spec"
+/// would find no partition matching the plan and quietly compact nothing.
+///
+/// Reading it from the manifests instead is exact rather than a workaround: a
+/// manifest carries exactly one `partition_spec_id`, so each entry is rendered
+/// under the spec that actually produced its tuple — which is what makes a table
+/// whose spec has evolved come out right rather than merely non-empty.
+///
+/// Keyed by [`crate::ops::reachability::normalize`]d path, because the scan and
+/// the manifests need not spell a location the same way.
+pub async fn partition_index(
+    table_ref: &TableRef,
+    table: &Table,
+) -> Result<HashMap<String, PartitionKey>> {
+    let metadata = table.metadata();
+    let Some(snapshot) = metadata.current_snapshot() else {
+        return Ok(HashMap::new());
+    };
+
+    let file_io = table.file_io();
+    let bytes = file_io
+        .new_input(snapshot.manifest_list())
+        .map_err(|e| Error::Storage(Box::new(e)))?
+        .read()
+        .await
+        .map_err(|e| Error::Storage(Box::new(e)))?;
+
+    let manifest_list = ManifestList::parse_with_version(&bytes, metadata.format_version())
+        .map_err(|e| Error::metadata(table_ref, format!("unreadable manifest list: {e}")))?;
+
+    let schema = metadata.current_schema().clone();
+    let per_manifest: Vec<Vec<(String, PartitionKey)>> = stream::iter(manifest_list.entries())
+        .map(|manifest_file| {
+            let file_io = file_io.clone();
+            let schema = schema.clone();
+            let spec = metadata
+                .partition_spec_by_id(manifest_file.partition_spec_id)
+                .cloned();
+            let spec_id = manifest_file.partition_spec_id;
+            async move {
+                let manifest = manifest_file
+                    .load_manifest(&file_io)
+                    .await
+                    .map_err(|e| Error::Storage(Box::new(e)))?;
+
+                Ok::<_, Error>(
+                    manifest
+                        .entries()
+                        .iter()
+                        .filter(|entry| entry.status() != ManifestStatus::Deleted)
+                        .filter(|entry| entry.data_file().content_type() == DataContentType::Data)
+                        .map(|entry| {
+                            let key = match &spec {
+                                Some(spec) => {
+                                    PartitionKey::new(spec, &schema, entry.data_file().partition())
+                                }
+                                None => PartitionKey::unpartitioned(spec_id),
+                            };
+                            (crate::ops::reachability::normalize(entry.file_path()), key)
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            }
+        })
+        .buffer_unordered(MANIFEST_CONCURRENCY)
+        .try_collect()
+        .await?;
+
+    Ok(per_manifest.into_iter().flatten().collect())
+}
+
 /// Per-manifest counts, merged after the concurrent read.
 #[derive(Default)]
 struct ManifestTally {

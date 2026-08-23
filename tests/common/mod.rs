@@ -88,6 +88,45 @@ impl TestTable {
         Self::build(iceberg::spec::FormatVersion::V2, order)
     }
 
+    /// A table partitioned by `id` (identity).
+    ///
+    /// The scan API does not report which partition spec produced a file's
+    /// partition tuple, so anything that groups scanned files by partition has
+    /// to get that from somewhere else. Only a partitioned table shows whether
+    /// it does.
+    pub fn partitioned() -> Result<Self> {
+        use iceberg::spec::{Transform, UnboundPartitionSpec};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let location = format!("file://{}", dir.path().display());
+
+        let spec = UnboundPartitionSpec::builder()
+            .with_spec_id(0)
+            .add_partition_field(1, "id", Transform::Identity)
+            .expect("partition field")
+            .build();
+
+        let metadata = TableMetadataBuilder::new(
+            Self::schema(),
+            spec,
+            iceberg::spec::SortOrder::unsorted_order(),
+            location,
+            iceberg::spec::FormatVersion::V2,
+            HashMap::new(),
+        )
+        .expect("metadata builder")
+        .build()
+        .expect("metadata")
+        .metadata;
+
+        Ok(Self {
+            dir,
+            ident: TableIdent::from_strs(["db", "events"]).expect("ident"),
+            file_io: FileIO::new_with_fs(),
+            committer: Arc::new(InMemoryCommitter::new(metadata)),
+        })
+    }
+
     fn schema() -> Schema {
         Schema::builder()
             .with_schema_id(0)
@@ -169,6 +208,32 @@ impl TestTable {
 
     /// Write one Parquet data file holding these rows.
     pub async fn write_data_file(&self, rows: &[(i32, &str)]) -> Result<DataFile> {
+        self.write_data_file_into(rows, None).await
+    }
+
+    /// The same, into a named partition value.
+    pub async fn write_partitioned_data_file(
+        &self,
+        rows: &[(i32, &str)],
+        partition_id: i32,
+    ) -> Result<DataFile> {
+        use iceberg::spec::{Literal, PartitionKey, Struct};
+
+        let table = self.table();
+        let metadata = table.metadata();
+        let key = PartitionKey::new(
+            metadata.default_partition_spec().as_ref().clone(),
+            metadata.current_schema().clone(),
+            Struct::from_iter([Some(Literal::int(partition_id))]),
+        );
+        self.write_data_file_into(rows, Some(key)).await
+    }
+
+    async fn write_data_file_into(
+        &self,
+        rows: &[(i32, &str)],
+        partition: Option<iceberg::spec::PartitionKey>,
+    ) -> Result<DataFile> {
         let table = self.table();
         let metadata = table.metadata();
 
@@ -218,7 +283,7 @@ impl TestTable {
         );
 
         let mut writer = DataFileWriterBuilder::new(rolling)
-            .build(None)
+            .build(partition)
             .await
             .map_err(|e| Error::Storage(Box::new(e)))?;
 

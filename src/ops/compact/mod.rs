@@ -82,6 +82,12 @@ struct Job<'a> {
     settings: &'a Settings,
     observer: &'a dyn MaintenanceObserver,
     ctx: OperationContext<'a>,
+    /// Which partition each live data file belongs to, read from the manifests.
+    ///
+    /// Not from the scan: `FileScanTask::partition_spec` is `None` in every
+    /// scan upstream actually performs, and without a spec a partition tuple
+    /// cannot be rendered. See [`crate::health::partition_index`].
+    partitions: &'a HashMap<String, HealthPartitionKey>,
 }
 
 /// The resolved knobs a rewrite reads, flattened out of the policy.
@@ -172,6 +178,11 @@ pub async fn run(
     // and finding delete files that apply to nothing at all.
     let all_tasks = plan_all(table).await?;
 
+    // Which partition each file is in, from the manifests. The scan does not
+    // say (see `Job::partitions`), and grouping files by a partition the plan
+    // never named would compact nothing while reporting success.
+    let partition_index = crate::health::partition_index(table_ref, table).await?;
+
     let job = Job {
         ident: env.ident,
         loader: env.loader,
@@ -179,6 +190,7 @@ pub async fn run(
         settings: &resolved,
         observer: env.observer,
         ctx: env.ctx,
+        partitions: &partition_index,
     };
 
     let groups = job.build_groups(table, &all_tasks, partitions)?;
@@ -304,7 +316,6 @@ impl Job<'_> {
         partitions: &[HealthPartitionKey],
     ) -> Result<Vec<FileGroup>> {
         let metadata = table.metadata();
-        let schema = metadata.current_schema();
         let current_spec_id = metadata.default_partition_spec_id();
 
         // Index the table's files by partition once, rather than re-scanning
@@ -312,10 +323,19 @@ impl Job<'_> {
         // partitions would otherwise cost ten thousand full passes.
         let mut by_partition: HashMap<HealthPartitionKey, Vec<&FileScanTask>> = HashMap::new();
         for task in all_tasks {
-            by_partition
-                .entry(task_partition(task, schema))
-                .or_default()
-                .push(task);
+            let Some(key) = self.partition_of(task) else {
+                // The scan saw a file the manifests did not. Both read the same
+                // snapshot, so this means the table moved underneath the plan;
+                // rewriting a file whose partition is unknown could file its
+                // rows anywhere.
+                tracing::debug!(
+                    table = %self.ctx.table,
+                    file = %task.data_file_path,
+                    "scanned file is not in the manifest partition index; skipping"
+                );
+                continue;
+            };
+            by_partition.entry(key).or_default().push(task);
         }
 
         let mut groups = Vec::new();
@@ -483,8 +503,12 @@ impl Job<'_> {
 
         // A group must never span partition specs: output goes out under one
         // spec, and a commit claiming it replaces files partitioned differently
-        // mis-files every row in it.
-        let spec_ids: HashSet<i32> = tasks.iter().map(partition_spec_id).collect();
+        // mis-files every row in it. The spec id comes from the manifest index
+        // rather than the task, which never carries one.
+        let spec_ids: HashSet<i32> = tasks
+            .iter()
+            .filter_map(|t| self.partition_of(t).map(|k| k.spec_id))
+            .collect();
         if spec_ids.len() > 1 {
             return Err(Error::refused(
                 "compact",
@@ -697,7 +721,18 @@ fn expected_rows(tasks: &[FileScanTask]) -> Option<ExpectedRows> {
     }
 }
 
-impl Job<'_> {}
+impl Job<'_> {
+    /// The partition a scanned file belongs to, as the manifests record it.
+    ///
+    /// The key is rendered by [`crate::health`], which is also what the planner
+    /// carries, so the plan and the rewrite agree on what a partition is by
+    /// construction rather than by two implementations happening to match.
+    fn partition_of(&self, task: &FileScanTask) -> Option<HealthPartitionKey> {
+        self.partitions
+            .get(&normalize(&task.data_file_path))
+            .cloned()
+    }
+}
 
 /// Refuse sort columns the table does not have, before anything is read.
 ///
@@ -722,25 +757,6 @@ fn check_sort_columns(
         }
     }
     Ok(())
-}
-
-/// The key a scanned file belongs under, rendered exactly as
-/// [`crate::health`] renders it so the plan and the rewrite agree on what a
-/// partition is.
-fn task_partition(task: &FileScanTask, schema: &iceberg::spec::Schema) -> HealthPartitionKey {
-    match (&task.partition_spec, &task.partition) {
-        (Some(spec), Some(value)) => HealthPartitionKey::new(spec, schema, value),
-        // A task with no spec belongs to an unpartitioned table, whose only
-        // spec is 0.
-        (spec, _) => HealthPartitionKey::unpartitioned(spec.as_ref().map_or(0, |s| s.spec_id())),
-    }
-}
-
-fn partition_spec_id(task: &FileScanTask) -> i32 {
-    task.partition_spec
-        .as_ref()
-        .map(|s| s.spec_id())
-        .unwrap_or(0)
 }
 
 /// Which delete files a group may retire.
@@ -848,6 +864,7 @@ mod tests {
             settings: &settings,
             observer: &crate::obs::NoopObserver,
             ctx,
+            partitions: &HashMap::new(),
         };
 
         let tasks: Vec<FileScanTask> = (0..5).map(|_| task(100)).collect();
@@ -881,6 +898,7 @@ mod tests {
             settings: &settings,
             observer: &crate::obs::NoopObserver,
             ctx,
+            partitions: &HashMap::new(),
         };
 
         let tasks: Vec<FileScanTask> = (0..7).map(|_| task(1)).collect();
