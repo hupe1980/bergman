@@ -297,7 +297,7 @@ Bergman declines rather than guessing, and every refusal names its reason:
   silently change a table's format.
 - **An Iceberg format v3 table.** Its row lineage cannot survive a rewrite
   Bergman performs, and a v3 snapshot Bergman could author would be rejected by
-  a spec-correct catalog anyway — see [below](#format-v3).
+  `iceberg-rust` outright — see [below](#format-v3).
 - **A rewrite whose row count is wrong**, as above.
 
 Each is reported per group, and the rest of the table is still compacted — every
@@ -323,9 +323,10 @@ entries count from. Three things follow, and each on its own is disqualifying:
 2. A manifest holding *existing* files, written fresh, has no `first-row-id` of
    its own, so the manifest-list writer assigns it a new range — moving files
    that were never rewritten to row ids they never had.
-3. `TableMetadataBuilder::add_snapshot` rejects a v3 snapshot carrying no
-   `first-row-id`. Such a commit does not merely risk being wrong: **no
-   spec-correct catalog applies it at all.**
+3. `iceberg-rust`'s `TableMetadataBuilder::add_snapshot` rejects a v3 snapshot
+   carrying no `first-row-id`. Such a commit does not merely risk being wrong:
+   **against a catalog applying commits through that crate it does not apply at
+   all.**
 
 The refusal is scoped to what Bergman authors itself, so it covers compaction,
 dangling-delete removal and manifest rewriting. **Snapshot expiration and orphan

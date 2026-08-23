@@ -218,7 +218,7 @@ broken, and none of them fails visibly:
 5. **A snapshot Bergman authors is v1 or v2.** A format v3 table's row lineage
    cannot survive a rewrite, and `TableMetadataBuilder::add_snapshot` rejects a
    v3 snapshot with no `first-row-id` outright — so such a commit does not
-   merely risk being wrong, no spec-correct catalog applies it. Refused with a
+   merely risk being wrong, `iceberg-rust` will not apply it. Refused with a
    reason, per operation, so expiration and orphan removal still run. See
    [Compaction](@/docs/compaction.md#format-v3).
 

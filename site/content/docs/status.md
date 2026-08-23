@@ -23,7 +23,7 @@ read as a healthy one:
 
 | | |
 |---|---|
-| **Rewriting a format v3 table** | Its row lineage cannot survive a rewrite, and a v3 snapshot Bergman could author would be rejected by a spec-correct catalog anyway. Expiration and orphan removal still run on it — see [Compaction](@/docs/compaction.md#format-v3) |
+| **Rewriting a format v3 table** | Preserving row lineage needs `_row_id` projected out of the scan and written back, which upstream does not offer; `iceberg-rust` rejects a v3 snapshot with no `first-row-id` outright. Expiration and orphan removal still run on it — see [Compaction](@/docs/compaction.md#format-v3) |
 | **Non-Parquet writes** | It reads Parquet, Avro and ORC but writes only Parquet, and refuses a table whose `write.format.default` is something else |
 | **Rewriting across a partition-spec change** | Output goes out under the current spec; a commit claiming it replaces files partitioned differently would mis-file every row |
 | **Catalogs other than REST** | Each additional protocol is a second commit path to keep correct |
