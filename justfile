@@ -100,6 +100,11 @@ msrv:
     rustup toolchain install "$msrv" --profile minimal 2>/dev/null || true; \
     cargo "+$msrv" check --all-features
 
+# Build the container image. Distroless and statically linked, so it needs no
+# base-image patching and runs anywhere.
+image tag="bergman:dev":
+    docker build -t {{tag}} .
+
 # ============================================================================
 # Release
 # ============================================================================

@@ -102,6 +102,15 @@ impl TestTable {
         format!("file://{}", self.dir.path().display())
     }
 
+    /// A catalog over this fixture's metadata.
+    pub fn catalog(&self) -> Arc<dyn iceberg::Catalog> {
+        Arc::new(FixtureCatalog {
+            committer: Arc::clone(&self.committer),
+            file_io: self.file_io.clone(),
+            location: self.location(),
+        })
+    }
+
     /// A loader over this fixture's metadata.
     pub fn loader(&self) -> FixtureLoader {
         FixtureLoader {
@@ -242,6 +251,11 @@ pub struct InMemoryCommitter {
     pub commits: Mutex<usize>,
     /// When set, the next commit is rejected as a conflict.
     pub fail_next_as_conflict: Mutex<bool>,
+    /// When set, every commit is rejected as a conflict.
+    ///
+    /// For exercising the give-up path: a table being written hard keeps
+    /// winning, and the right response is to come back next cycle.
+    pub always_conflict: Mutex<bool>,
 }
 
 impl InMemoryCommitter {
@@ -250,6 +264,7 @@ impl InMemoryCommitter {
             metadata: Mutex::new(metadata),
             commits: Mutex::new(0),
             fail_next_as_conflict: Mutex::new(false),
+            always_conflict: Mutex::new(false),
         }
     }
 
@@ -270,7 +285,9 @@ impl TableCommitter for InMemoryCommitter {
         requirements: Vec<TableRequirement>,
         updates: Vec<TableUpdate>,
     ) -> Result<()> {
-        if std::mem::replace(&mut *self.fail_next_as_conflict.lock().unwrap(), false) {
+        if *self.always_conflict.lock().unwrap()
+            || std::mem::replace(&mut *self.fail_next_as_conflict.lock().unwrap(), false)
+        {
             return Err(Error::CommitConflict {
                 table: ident.to_string(),
                 detail: "injected".into(),
@@ -297,6 +314,126 @@ impl TableCommitter for InMemoryCommitter {
         *current = builder.build().map_err(Error::from)?.metadata;
         *self.commits.lock().unwrap() += 1;
         Ok(())
+    }
+}
+
+/// A catalog over the fixture's metadata.
+///
+/// Snapshot expiration goes through upstream's `Transaction`, which commits to
+/// an `iceberg::Catalog` — so unlike orphan removal, it cannot be tested through
+/// a narrower seam. Only two methods carry weight: `load_table` and
+/// `update_table`, the latter doing exactly what a REST catalog does with a
+/// commit. The rest are unreachable from any path under test, and saying so
+/// loudly beats returning a plausible wrong answer.
+#[derive(Debug)]
+pub struct FixtureCatalog {
+    committer: Arc<InMemoryCommitter>,
+    file_io: FileIO,
+    location: String,
+}
+
+impl FixtureCatalog {
+    fn table_for(&self, ident: &TableIdent) -> Result<Table> {
+        Table::builder()
+            .identifier(ident.clone())
+            .metadata(self.committer.metadata())
+            .file_io(self.file_io.clone())
+            .runtime(iceberg::Runtime::try_current().expect("inside a tokio runtime"))
+            .metadata_location(format!("{}/metadata/v1.metadata.json", self.location))
+            .build()
+            .map_err(Into::into)
+    }
+}
+
+#[async_trait::async_trait]
+impl iceberg::Catalog for FixtureCatalog {
+    async fn load_table(&self, ident: &TableIdent) -> iceberg::Result<Table> {
+        self.table_for(ident)
+            .map_err(|e| iceberg::Error::new(iceberg::ErrorKind::Unexpected, e.to_string()))
+    }
+
+    async fn update_table(&self, mut commit: iceberg::TableCommit) -> iceberg::Result<Table> {
+        let ident = commit.identifier().clone();
+        let requirements = commit.take_requirements();
+        let updates = commit.take_updates();
+
+        self.committer
+            .commit(&ident, requirements, updates)
+            .await
+            .map_err(|e| {
+                // Conflicts keep their identity across the boundary, or the
+                // retry logic under test would see a generic failure.
+                let kind = if e.is_replan() {
+                    iceberg::ErrorKind::CatalogCommitConflicts
+                } else {
+                    iceberg::ErrorKind::Unexpected
+                };
+                iceberg::Error::new(kind, e.to_string())
+            })?;
+
+        self.load_table(&ident).await
+    }
+
+    async fn list_namespaces(
+        &self,
+        _parent: Option<&iceberg::NamespaceIdent>,
+    ) -> iceberg::Result<Vec<iceberg::NamespaceIdent>> {
+        unimplemented!("no path under test lists namespaces")
+    }
+    async fn create_namespace(
+        &self,
+        _ns: &iceberg::NamespaceIdent,
+        _props: HashMap<String, String>,
+    ) -> iceberg::Result<iceberg::Namespace> {
+        unimplemented!("no path under test creates namespaces")
+    }
+    async fn get_namespace(
+        &self,
+        _ns: &iceberg::NamespaceIdent,
+    ) -> iceberg::Result<iceberg::Namespace> {
+        unimplemented!("no path under test reads namespaces")
+    }
+    async fn namespace_exists(&self, _ns: &iceberg::NamespaceIdent) -> iceberg::Result<bool> {
+        unimplemented!("no path under test checks namespaces")
+    }
+    async fn update_namespace(
+        &self,
+        _ns: &iceberg::NamespaceIdent,
+        _props: HashMap<String, String>,
+    ) -> iceberg::Result<()> {
+        unimplemented!("no path under test updates namespaces")
+    }
+    async fn drop_namespace(&self, _ns: &iceberg::NamespaceIdent) -> iceberg::Result<()> {
+        unimplemented!("no path under test drops namespaces")
+    }
+    async fn list_tables(&self, _ns: &iceberg::NamespaceIdent) -> iceberg::Result<Vec<TableIdent>> {
+        unimplemented!("no path under test lists tables")
+    }
+    async fn create_table(
+        &self,
+        _ns: &iceberg::NamespaceIdent,
+        _creation: iceberg::TableCreation,
+    ) -> iceberg::Result<Table> {
+        unimplemented!("no path under test creates tables")
+    }
+    async fn drop_table(&self, _ident: &TableIdent) -> iceberg::Result<()> {
+        unimplemented!("no path under test drops tables")
+    }
+    async fn purge_table(&self, _ident: &TableIdent) -> iceberg::Result<()> {
+        unimplemented!("no path under test purges tables")
+    }
+    async fn table_exists(&self, _ident: &TableIdent) -> iceberg::Result<bool> {
+        unimplemented!("no path under test checks tables")
+    }
+    async fn rename_table(&self, _src: &TableIdent, _dst: &TableIdent) -> iceberg::Result<()> {
+        unimplemented!("no path under test renames tables")
+    }
+    async fn register_table(
+        &self,
+        _ident: &TableIdent,
+        _location: String,
+    ) -> iceberg::Result<Table> {
+        unimplemented!("no path under test registers tables")
     }
 }
 

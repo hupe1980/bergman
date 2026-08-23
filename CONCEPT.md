@@ -136,7 +136,7 @@ every hard problem. Bergman's concept exists to close those gaps:
    table-health metrics cross thresholds, not on every tick (§5.1, §7).
 6. **"Web dashboard" before correctness.** Bergman's v1 UI is a CLI with
    `plan`/`--dry-run` output and Prometheus metrics. A dashboard is a
-   later luxury, not Phase 2.
+   later luxury.
 
 ---
 
@@ -589,7 +589,7 @@ version coupling beyond the REST spec both already implement. Consequences:
   write into somebody else's catalog and *should* be refused.
 - **Snapshot expiration is catalog-mediated by design.** `expireSnapshots`
   arrives as ordinary `TableUpdate`s, which Rustberg serves natively — so
-  Phase 1 works against Rustberg unchanged.
+  expiration works against Rustberg unchanged.
 
 ### 10.2 Governed maintenance (the joint story neither has alone)
 
@@ -680,54 +680,26 @@ between them relearns nothing:
 
 ---
 
-## 12. Roadmap
+## 12. Not built
 
-**Phase 0 — trust before writes. ✅ Implemented.** `bergman inspect` +
-`bergman plan`: catalog discovery, the metadata-only health analyzer, the
-policy engine with layered resolution and `policy explain` provenance,
-planners for all four operations, `policy lint` (offline, for CI). Read-only,
-immediately useful, and it validated the `iceberg-rust` integration depth
-risk-free — which is how §1's corrections were found.
+Scope, stated forward. What *is* built is the operations of §5, which all
+execute.
 
-**Phase 1 — metadata operations. ✅ Implemented, minus manifest rewrite.**
-Snapshot expiration via upstream's action, plus the file cleanup upstream
-delegates; orphan-file removal with the full §5.4 safety model, on Bergman's
-own object-store layer (upstream `FileIO` cannot list); JSONL audit trail;
-the `MaintenanceObserver` hook. REST catalog + S3/GCS/Azure/local fs. The
-library API ships here and the CLI is written against it, so embeddability is
-enforced by construction rather than retrofitted. **Manifest rewrite is
-implemented too**, on Bergman's own commit layer (§4.2).
+- **Z-order clustering.** Sorting works; z-order is an optimization rather
+  than table health, and it comes after bin-pack and sort are proven.
+- **Spilling.** A sorted partition must fit `compaction.max_sort_memory`; a
+  larger one is refused with a named reason rather than written unsorted.
+- **A NATS or Kafka client.** Bergman accepts change notifications and leaves
+  the bridge to the deployment — a maintenance engine that carried a broker
+  client would import the operational footprint it exists to avoid, into a
+  default build almost nobody would use.
+- **Rewriting across a partition-spec change**, and **non-Parquet writes**.
+  Both refused with a named reason rather than guessed at.
+- **Glue and HMS catalogs.** REST reaches every catalog Bergman targets.
+- **Stateless replica sharding** (§8 v2), cost-based prioritization, policy
+  recommendations, and `bergman-py` bindings (§14.4).
 
-**Phase 2 — compaction. ✅ Implemented.** Bin-pack with positional- and
-equality-delete application (upstream's scan applies both), partition-grained
-commits with pre-commit re-validation, and the delete-file retirement rule:
-a delete file is retired only when every data file it applies to is inside the
-group. Not gated on #2185 after all — §1 explains why. Still absent: the sort
-stage (output is bin-packed, `sort` is accepted and reported but not applied),
-z-order, memory budget and spill.
-
-**Phase 2b — daemon.** `bergman daemon`: cron and event triggers, Prometheus
-`/metrics`, maintenance windows. Deliberately after the operations rather
-than alongside them: a scheduler for work that does not yet run is a
-scheduler nobody can test.
-
-**Phase 3 — hardening.** Chaos tests (kill -9 mid-run, concurrent-writer
-fuzzing against Spark and Flink writers); cross-engine round-trip gate;
-Glue/HMS catalogs.
-
-**Phase 4 — scale & intelligence.** Stateless replica sharding; z-order;
-event-trigger integrations (Lakekeeper CloudEvents webhook); cost-based
-prioritization ("which table's compaction buys the most scan improvement
-per byte written"); policy recommendations from observed access patterns;
-deletion-vector (v3) native handling as upstream lands it; optional
-`bergman-py` bindings if Phase 2 proves out (§14.4).
-
-Every phase ships with correctness tests against reference tables written by
-Spark and read back by Spark/Trino after Bergman maintenance — **cross-engine
-round-trip is the release gate**, not unit tests alone.
-
----
-
+Correctness tests run against reference tables written by
 ## 13. Risks — stated honestly
 
 1. **`iceberg-rust` maturity is the load-bearing wall — and it is currently
@@ -735,14 +707,11 @@ round-trip is the release gate**, not unit tests alone.
    file, and the commit API is crate-private, so the entire data plane is
    blocked on #2185/#2752 landing. This is the project's single largest risk
    and it is not hypothetical: it is the present state.
-   Mitigation, in force today: Phase 0/1 depend only on what exists and are
-   implemented; compaction and manifest rewriting are planned, reported, and
-   marked `Blocked` with the issue number rather than silently omitted, so the
-   product is honest at every stage; and the value that sits *above* the
-   commit — policy layering, triggers, health analysis, the safety model,
-   audit — is complete and independent of when upstream lands. If #2185 stalls
-   indefinitely, the fallback is to contribute it, which is a better use of
-   effort than routing around it.
+   Mitigation, in force today: Bergman owns the commit layer (§4.2), so the
+   data plane is not gated on upstream at all, and the value that sits *above*
+   the commit — policy layering, triggers, health analysis, the safety model,
+   audit — is independent of it either way. When #2185 lands, the transport
+   swaps behind a trait and nothing above `src/commit` changes.
 2. **Equality-delete application at scale is genuinely hard** (the 20GB
    eq-delete benchmark that OOMs Spark). Mitigation: file-group sizing
    against a memory budget, spill, and refusing (with a clear diagnostic)
@@ -757,7 +726,7 @@ round-trip is the release gate**, not unit tests alone.
    treating it and RisingWave's published results as the benchmark bar:
    **Bergman's compaction must be within 10% of iceberg-compaction's
    throughput on the same hardware, or we adopt it as a dependency and
-   contribute instead.** Revisit at Phase 2 start.
+   contribute instead.**
 5. **Catalogs are already absorbing metadata maintenance.** Not
    hypothetical: Lakekeeper ships expire-snapshots, orphan removal, and
    metadata cleanup built-in with event-driven scheduling; S3 Tables
@@ -765,7 +734,7 @@ round-trip is the release gate**, not unit tests alone.
    accepts openly: (a) the durable moat is the **data plane** — compaction,
    delete-file retirement, clustering — which Lakekeeper explicitly leaves
    to external engines and signals via CloudEvents; (b) metadata ops
-   (Phase 1) are table stakes for the *other* catalogs (REST/Glue/HMS
+   are table stakes for the *other* catalogs (REST/Glue/HMS
    fleets, Polaris, Nessie) and for teams wanting one auditable tool across
    heterogeneous catalogs; (c) the policy layer defers to catalog-owned
    policies rather than fighting them. Bergman's posture toward Lakekeeper
@@ -782,33 +751,25 @@ round-trip is the release gate**, not unit tests alone.
 
 ## 14. Open questions
 
-1. ~~Should Phase 1 snapshot expiration delete data files itself or defer all
-   file deletion to the orphan scanner?~~ **Settled** (§1): upstream deletes
-   nothing, so Bergman owns deletion regardless. It is implemented once, and
-   expiration opts in per policy (`snapshots.delete_files`) or leaves the
-   files for the scanner. One deleter, one safety model.
-2. Policy layering vs. Polaris/REST catalog policy entities — read them as
+1. Policy layering vs. Polaris/REST catalog policy entities — read them as
    another layer below local rules once the spec stabilizes?
-3. Minimum viable v3 (deletion vectors, row lineage) support level for
-   Phase 2, given upstream flux?
-4. Python bindings (pyo3): PyIceberg has expire-snapshots but no native
-   compaction — a `bergman`-backed compactor for Python would fill a real
-   gap. Separate `bergman-py` packaging crate post-Phase 2, or leave it to
-   downstream?
-5. Event-trigger transport: is a webhook receiver for Lakekeeper
-   CloudEvents enough for v1 daemon mode, or is a pull-based fallback
-   (metadata-log diffing) needed for catalogs without events? Rustberg
-   currently emits no commit events — worth proposing there (a webhook is
-   cheap and fits its audit pipeline) rather than polling around it.
-6. Orphan deletion under vended credentials: does the vended write
-   credential (STS inline policy / SAS permissions) include delete on the
-   table prefix everywhere? If not, orphan removal needs either a direct
-   credential (weakening §10.2's no-ambient-secret story for that one op)
-   or a catalog-side delete API.
-7. Single-process pairing: an adapter implementing `iceberg::Catalog` over
-   Rustberg's embedded `Session` would let one Rust binary host catalog and
-   maintenance together with no HTTP hop. Feasible (the trait's
-   implementor-side API is open); worth building only when a real embedder
+2. Minimum viable v3 support (deletion vectors, row lineage), given upstream
+   flux?
+3. Python bindings (pyo3): PyIceberg has expire-snapshots but no native
+   compaction, so a `bergman`-backed compactor would fill a real gap. A
+   separate `bergman-py` packaging crate, or leave it downstream?
+4. A pull-based change source (metadata-log diffing) for catalogs that emit
+   no events at all — worth it, or is the cadence enough? Rustberg emits none
+   today; a webhook is cheap there and fits its audit pipeline, so proposing
+   it upstream beats polling around it.
+5. Orphan deletion under vended credentials: does the vended write credential
+   (STS inline policy, SAS permissions) include delete on the table prefix
+   everywhere? If not, orphan removal needs either a direct credential —
+   weakening §10.2's no-ambient-secret story for that one operation — or a
+   catalog-side delete API.
+6. Single-process pairing: an adapter implementing `iceberg::Catalog` over
+   Rustberg's embedded `Session` would let one binary host catalog and
+   maintenance with no HTTP hop. Feasible; worth building when an embedder
    asks.
 
 ---

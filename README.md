@@ -41,23 +41,17 @@ Bergman is pre-release. All four maintenance operations execute.
 
 `iceberg::Transaction` has no action that removes a data file, and both
 `TransactionAction` and `TableCommit`'s builder are `pub(crate)` — so
-compaction and manifest rewriting cannot be expressed through it at all.
+compaction and manifest rewriting cannot be expressed through it at all. The
+common answer is to fork; [`nimtable/iceberg-compaction`](https://github.com/nimtable/iceberg-compaction)
+pins `risingwavelabs/iceberg-rust` at a git revision, which costs a rebase
+forever and a crate that cannot be published.
 
-The common answer is to fork: [`nimtable/iceberg-compaction`](https://github.com/nimtable/iceberg-compaction)
-pins `risingwavelabs/iceberg-rust` at a git revision. That costs a rebase
-forever and a crate that cannot be published, since Cargo rejects git
-dependencies on crates.io.
-
-Bergman owns the one blocked layer instead. Every piece of a commit is already
-public — `ManifestWriterBuilder`, `ManifestListWriter`, `Snapshot::builder`,
-`TableUpdate`/`TableRequirement` — so bergman builds the commit with upstream's
-own writers and `POST`s it to the table endpoint itself. The bytes are the same
-ones `iceberg-catalog-rest` sends.
-
-Operations commit through a `TableCommitter` trait, not a transport, so when
-[#2185](https://github.com/apache/iceberg-rust/pull/2185) lands a second
-implementation wraps it and nothing above `src/commit` changes.
-[More →](https://hupe1980.github.io/bergman/docs/status/)
+Bergman owns just that layer instead. Every piece of a commit is already public,
+so it builds one with upstream's own writers and `POST`s it to the table
+endpoint. Operations commit through a `TableCommitter` trait rather than a
+transport, so an upstream action that can express a rewrite becomes a second
+implementation and nothing above `src/commit` changes.
+[Detail →](https://hupe1980.github.io/bergman/docs/status/)
 
 ---
 
@@ -67,7 +61,15 @@ implementation wraps it and nothing above `src/commit` changes.
 cargo install bergman
 ```
 
-Or build from source (requires Rust 1.94+):
+Or as a container — distroless, non-root, statically linked:
+
+```bash
+docker run --rm \
+  -v ./bergman.toml:/etc/bergman/bergman.toml:ro \
+  ghcr.io/hupe1980/bergman:latest plan
+```
+
+Or from source (requires Rust 1.94+):
 
 ```bash
 git clone https://github.com/hupe1980/bergman && cd bergman

@@ -263,10 +263,11 @@ narrow the rule.
 
 Step 4 is the one people skip. Do not skip it.
 
-## Observability
+## Logs
 
-The library emits `tracing` spans and installs no subscriber. The binary sets one
-up from `--log`/`BERGMAN_LOG`, writing to stderr.
+The library emits `tracing` spans and installs no subscriber; the binary sets one
+up from `--log`/`BERGMAN_LOG`, writing to stderr so `--format json` on stdout
+stays machine-readable.
 
 ```bash
 BERGMAN_LOG=info bergman run

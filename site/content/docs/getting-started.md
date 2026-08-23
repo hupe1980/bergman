@@ -12,7 +12,15 @@ write access by first showing you it understands your tables.
 cargo install bergman
 ```
 
-Or build from source — Rust 1.94 or later:
+Or as a container — distroless, non-root, statically linked, no shell:
+
+```bash
+docker run --rm \
+  -v ./bergman.toml:/etc/bergman/bergman.toml:ro \
+  ghcr.io/hupe1980/bergman:latest inspect
+```
+
+Or from source — Rust 1.94 or later:
 
 ```bash
 git clone https://github.com/hupe1980/bergman && cd bergman
