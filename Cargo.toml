@@ -134,6 +134,11 @@ comfy-table = { version = "7", optional = true }
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
+# The end-to-end tests build a real Iceberg table on the local filesystem and
+# read it back, which needs the same writer and Arrow stack the library uses.
+async-trait = "0.1"
+futures = { version = "0.3", default-features = false, features = ["std"] }
+uuid = { version = "1", features = ["v4"] }
 
 [profile.release]
 lto = "thin"

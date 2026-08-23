@@ -176,7 +176,7 @@ pub async fn run(
         ]),
     };
 
-    let (requirements, updates) = producer.install(parent, manifests, summary).await?;
+    let (requirements, updates) = producer.install(Some(parent), manifests, summary).await?;
     committer.commit(ident, requirements, updates).await?;
 
     Ok(OperationResult::Succeeded {

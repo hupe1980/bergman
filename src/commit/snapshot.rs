@@ -14,7 +14,7 @@
 use std::collections::HashSet;
 
 use iceberg::spec::{
-    DataContentType, DataFile, FormatVersion, MAIN_BRANCH, ManifestEntry, ManifestFile,
+    DataFile, FormatVersion, MAIN_BRANCH, ManifestContentType, ManifestEntry, ManifestFile,
     ManifestListWriter, ManifestStatus, ManifestWriterBuilder, Operation, Snapshot, Summary,
 };
 use iceberg::table::Table;
@@ -41,6 +41,15 @@ impl RewriteFiles {
     pub fn is_empty(&self) -> bool {
         self.removed.is_empty() && self.added.is_empty()
     }
+}
+
+/// One manifest of the parent snapshot, with its live entries.
+pub(crate) struct LoadedManifest {
+    /// The manifest as the parent's manifest list records it, so an untouched
+    /// manifest can be carried forward without being rewritten.
+    pub file: ManifestFile,
+    /// Its entries, excluding ones a previous snapshot marked deleted.
+    pub entries: Vec<ManifestEntry>,
 }
 
 /// Builds the manifests, manifest list and snapshot for a commit.
@@ -73,17 +82,25 @@ impl<'a> SnapshotProducer<'a> {
         let metadata = self.table.metadata();
         let ident = self.table.identifier().to_string();
 
-        let Some(parent) = metadata.current_snapshot() else {
+        // A table with no current snapshot has nothing to carry forward, and a
+        // rewrite of it is an append. Refusing here instead would make the
+        // producer unable to write a table's first snapshot, which is a strange
+        // hole in something called a snapshot producer.
+        let parent = metadata.current_snapshot();
+        if parent.is_none() && !rewrite.removed.is_empty() {
             return Err(Error::refused(
                 "rewrite",
                 &ident,
-                "the table has no current snapshot; there is nothing to rewrite",
+                "the table has no snapshots, so the files to remove do not exist",
             ));
-        };
+        }
 
         let removed: HashSet<String> = rewrite.removed.iter().map(|p| normalize(p)).collect();
 
-        let existing = self.load_live_entries(parent).await?;
+        let existing = match parent {
+            Some(parent) => self.load_manifests(parent).await?,
+            None => Vec::new(),
+        };
 
         // Invariant 1, checked rather than assumed: everything we were asked to
         // remove must actually be live. A path we cannot find means the plan
@@ -91,6 +108,7 @@ impl<'a> SnapshotProducer<'a> {
         // apply a decision to a world it was not made for.
         let live_paths: HashSet<String> = existing
             .iter()
+            .flat_map(|m| m.entries.iter())
             .map(|entry| normalize(entry.file_path()))
             .collect();
         let missing = removed.difference(&live_paths).count();
@@ -105,17 +123,20 @@ impl<'a> SnapshotProducer<'a> {
             });
         }
 
-        let survivors: Vec<&ManifestEntry> = existing
-            .iter()
-            .filter(|entry| !removed.contains(&normalize(entry.file_path())))
-            .collect();
-
         if removed.is_empty() && rewrite.added.is_empty() {
             return Ok(None);
         }
 
-        let manifests = self.write_manifests(&survivors, &rewrite.added).await?;
-        let summary = self.summary(rewrite, survivors.len());
+        let survivor_count = existing
+            .iter()
+            .flat_map(|m| m.entries.iter())
+            .filter(|entry| !removed.contains(&normalize(entry.file_path())))
+            .count();
+
+        let manifests = self
+            .write_manifests(&existing, &removed, &rewrite.added)
+            .await?;
+        let summary = self.summary(rewrite, survivor_count);
 
         Ok(Some(self.install(parent, manifests, summary).await?))
     }
@@ -133,16 +154,17 @@ impl<'a> SnapshotProducer<'a> {
     /// both cases, and having one implementation is what keeps them that way.
     pub(crate) async fn install(
         &self,
-        parent: &iceberg::spec::SnapshotRef,
+        parent: Option<&iceberg::spec::SnapshotRef>,
         manifests: Vec<ManifestFile>,
         summary: Summary,
     ) -> Result<(Vec<TableRequirement>, Vec<TableUpdate>)> {
+        let parent_id = parent.map(|p| p.snapshot_id());
         let metadata = self.table.metadata();
         let manifest_list = self.write_manifest_list(parent, manifests).await?;
 
         let snapshot = Snapshot::builder()
             .with_snapshot_id(self.snapshot_id)
-            .with_parent_snapshot_id(Some(parent.snapshot_id()))
+            .with_parent_snapshot_id(parent_id)
             .with_sequence_number(metadata.next_sequence_number())
             .with_timestamp_ms(chrono::Utc::now().timestamp_millis())
             .with_manifest_list(manifest_list)
@@ -155,9 +177,11 @@ impl<'a> SnapshotProducer<'a> {
                 // The compare-and-swap. If `main` has moved since the plan was
                 // built, the catalog rejects this and Bergman replans — it
                 // never re-submits (see `crate::ops`).
+                // `None` asserts the ref does not exist yet, which is the
+                // right precondition for a table's first snapshot.
                 TableRequirement::RefSnapshotIdMatch {
                     r#ref: MAIN_BRANCH.to_string(),
-                    snapshot_id: Some(parent.snapshot_id()),
+                    snapshot_id: parent_id,
                 },
                 // Guards against the table being dropped and recreated in
                 // between, which the ref check alone would not catch.
@@ -185,11 +209,16 @@ impl<'a> SnapshotProducer<'a> {
         ))
     }
 
-    /// Every live manifest entry of the parent snapshot.
-    pub(crate) async fn load_live_entries(
+    /// The parent snapshot's manifests, each with its live entries.
+    ///
+    /// Grouped rather than flattened, because a rewrite must know *which*
+    /// manifest an entry came from: a manifest none of whose files are being
+    /// removed is carried into the new snapshot by reference, and never
+    /// rewritten.
+    pub(crate) async fn load_manifests(
         &self,
         parent: &iceberg::spec::SnapshotRef,
-    ) -> Result<Vec<ManifestEntry>> {
+    ) -> Result<Vec<LoadedManifest>> {
         let file_io = self.table.file_io();
         let metadata = self.table.metadata();
 
@@ -206,31 +235,46 @@ impl<'a> SnapshotProducer<'a> {
                     Error::metadata(self.table.identifier().to_string(), format!("{e}"))
                 })?;
 
-        let mut entries = Vec::new();
+        let mut loaded = Vec::with_capacity(manifest_list.entries().len());
         for manifest_file in manifest_list.entries() {
             let manifest = manifest_file
                 .load_manifest(file_io)
                 .await
                 .map_err(|e| Error::Storage(Box::new(e)))?;
-            for entry in manifest.entries() {
+
+            let entries: Vec<ManifestEntry> = manifest
+                .entries()
+                .iter()
                 // `Deleted` entries describe files a previous snapshot removed.
                 // They are history, not content, and carrying them forward
                 // would resurrect files this table no longer has.
-                if entry.status() != ManifestStatus::Deleted {
-                    entries.push(entry.as_ref().clone());
-                }
-            }
+                .filter(|e| e.status() != ManifestStatus::Deleted)
+                .map(|e| e.as_ref().clone())
+                .collect();
+
+            loaded.push(LoadedManifest {
+                file: manifest_file.clone(),
+                entries,
+            });
         }
-        Ok(entries)
+        Ok(loaded)
     }
 
-    /// Write one data manifest and one delete manifest.
+    /// Build the new snapshot's manifest set.
     ///
-    /// Iceberg requires data and delete files to live in separate manifests, so
-    /// the split is structural rather than an optimisation.
+    /// A manifest none of whose files are being removed is **carried by
+    /// reference**: its bytes are not read again and not rewritten, only its
+    /// entry in the new manifest list. Only the manifests that actually lost a
+    /// file are rebuilt, plus one new manifest for the added files.
+    ///
+    /// Rewriting every manifest instead would be correct but ruinous: a
+    /// hundred-thousand-file table would have its whole metadata rewritten to
+    /// compact one partition, and the result would be a single enormous
+    /// manifest rather than the target-sized ones the table asked for.
     async fn write_manifests(
         &self,
-        survivors: &[&ManifestEntry],
+        existing: &[LoadedManifest],
+        removed: &HashSet<String>,
         added: &[DataFile],
     ) -> Result<Vec<ManifestFile>> {
         let metadata = self.table.metadata();
@@ -240,30 +284,52 @@ impl<'a> SnapshotProducer<'a> {
 
         let mut manifests = Vec::new();
 
-        let data_survivors: Vec<&&ManifestEntry> = survivors
-            .iter()
-            .filter(|e| e.content_type() == DataContentType::Data)
-            .collect();
-        let delete_survivors: Vec<&&ManifestEntry> = survivors
-            .iter()
-            .filter(|e| e.content_type() != DataContentType::Data)
-            .collect();
+        for loaded in existing {
+            let touched = loaded
+                .entries
+                .iter()
+                .any(|entry| removed.contains(&normalize(entry.file_path())));
 
-        if !data_survivors.is_empty() || !added.is_empty() {
-            let output = self.new_manifest_output("data")?;
+            if !touched {
+                manifests.push(loaded.file.clone());
+                continue;
+            }
+
+            let survivors: Vec<&ManifestEntry> = loaded
+                .entries
+                .iter()
+                .filter(|entry| !removed.contains(&normalize(entry.file_path())))
+                .collect();
+
+            // A manifest whose every file was removed simply disappears.
+            if survivors.is_empty() {
+                continue;
+            }
+
+            let is_delete_manifest = loaded.file.content == ManifestContentType::Deletes;
+            let output =
+                self.new_manifest_output(if is_delete_manifest { "delete" } else { "data" })?;
             let builder = ManifestWriterBuilder::new(
                 output,
                 Some(self.snapshot_id),
                 schema.clone(),
                 spec.clone(),
             );
-            let mut writer = match format_version {
-                FormatVersion::V1 => builder.build_v1(),
-                FormatVersion::V2 => builder.build_v2_data(),
-                FormatVersion::V3 => builder.build_v3_data(),
+            let mut writer = match (is_delete_manifest, format_version) {
+                (false, FormatVersion::V1) => builder.build_v1(),
+                (false, FormatVersion::V2) => builder.build_v2_data(),
+                (false, FormatVersion::V3) => builder.build_v3_data(),
+                (true, FormatVersion::V2) => builder.build_v2_deletes(),
+                (true, FormatVersion::V3) => builder.build_v3_deletes(),
+                (true, FormatVersion::V1) => {
+                    return Err(Error::metadata(
+                        self.table.identifier().to_string(),
+                        "format v1 table carries delete files",
+                    ));
+                }
             };
 
-            for entry in &data_survivors {
+            for entry in survivors {
                 // Invariant 2. `add_existing_file` preserves the entry's own
                 // sequence number and snapshot id; `add_file` would stamp this
                 // snapshot's, making an untouched file look newer than the
@@ -272,22 +338,9 @@ impl<'a> SnapshotProducer<'a> {
                     .add_existing_file(
                         entry.data_file().clone(),
                         entry.snapshot_id().unwrap_or(self.snapshot_id),
-                        // A v1 entry carries no sequence number; the spec reads
-                        // that as 0, and inventing this snapshot's would make
-                        // an untouched file look newer than the deletes that
-                        // apply to it.
                         entry.sequence_number().unwrap_or(0),
                         entry.file_sequence_number,
                     )
-                    .map_err(|e| Error::Storage(Box::new(e)))?;
-            }
-
-            for file in added {
-                // Newly written files genuinely belong to this snapshot, so
-                // they take its sequence number — which upstream assigns by
-                // passing the "inherit" sentinel.
-                writer
-                    .add_file(file.clone(), metadata.next_sequence_number())
                     .map_err(|e| Error::Storage(Box::new(e)))?;
             }
 
@@ -299,30 +352,20 @@ impl<'a> SnapshotProducer<'a> {
             );
         }
 
-        if !delete_survivors.is_empty() {
-            let output = self.new_manifest_output("delete")?;
+        if !added.is_empty() {
+            let output = self.new_manifest_output("data")?;
             let builder = ManifestWriterBuilder::new(output, Some(self.snapshot_id), schema, spec);
             let mut writer = match format_version {
-                // V1 has no delete files at all, so a surviving delete entry
-                // here would mean the metadata contradicts its own version.
-                FormatVersion::V1 => {
-                    return Err(Error::metadata(
-                        self.table.identifier().to_string(),
-                        "format v1 table carries delete files",
-                    ));
-                }
-                FormatVersion::V2 => builder.build_v2_deletes(),
-                FormatVersion::V3 => builder.build_v3_deletes(),
+                FormatVersion::V1 => builder.build_v1(),
+                FormatVersion::V2 => builder.build_v2_data(),
+                FormatVersion::V3 => builder.build_v3_data(),
             };
 
-            for entry in &delete_survivors {
+            for file in added {
+                // Newly written files genuinely belong to this snapshot, so they
+                // take its sequence number.
                 writer
-                    .add_existing_file(
-                        entry.data_file().clone(),
-                        entry.snapshot_id().unwrap_or(self.snapshot_id),
-                        entry.sequence_number().unwrap_or(0),
-                        entry.file_sequence_number,
-                    )
+                    .add_file(file.clone(), metadata.next_sequence_number())
                     .map_err(|e| Error::Storage(Box::new(e)))?;
             }
 
@@ -340,9 +383,10 @@ impl<'a> SnapshotProducer<'a> {
     /// Write the manifest list, returning its location.
     pub(crate) async fn write_manifest_list(
         &self,
-        parent: &iceberg::spec::SnapshotRef,
+        parent: Option<&iceberg::spec::SnapshotRef>,
         manifests: Vec<ManifestFile>,
     ) -> Result<String> {
+        let parent_id = parent.map(|p| p.snapshot_id());
         let metadata = self.table.metadata();
         let location = format!(
             "{}/metadata/snap-{}-{}.avro",
@@ -362,19 +406,14 @@ impl<'a> SnapshotProducer<'a> {
 
         let sequence_number = metadata.next_sequence_number();
         let mut writer = match metadata.format_version() {
-            FormatVersion::V1 => {
-                ManifestListWriter::v1(output, self.snapshot_id, Some(parent.snapshot_id()))
+            FormatVersion::V1 => ManifestListWriter::v1(output, self.snapshot_id, parent_id),
+            FormatVersion::V2 => {
+                ManifestListWriter::v2(output, self.snapshot_id, parent_id, sequence_number)
             }
-            FormatVersion::V2 => ManifestListWriter::v2(
-                output,
-                self.snapshot_id,
-                Some(parent.snapshot_id()),
-                sequence_number,
-            ),
             FormatVersion::V3 => ManifestListWriter::v3(
                 output,
                 self.snapshot_id,
-                Some(parent.snapshot_id()),
+                parent_id,
                 sequence_number,
                 Some(metadata.next_row_id()),
             ),
