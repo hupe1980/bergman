@@ -1,0 +1,243 @@
+{% extends "base.html" %}
+
+{% block body_class %}page-home{% endblock body_class %}
+
+{% block content %}
+<main id="content">
+
+<section class="hero">
+  <div class="hero__inner">
+    <p class="hero__eyebrow">Apache Iceberg maintenance · Rust · Apache-2.0 OR MIT</p>
+    <h1 class="hero__title">Iceberg maintenance<br><span class="grad">without the JVM</span></h1>
+    <p class="hero__lede">
+      Bergman keeps Iceberg tables healthy — expiring snapshots, reclaiming what
+      that leaves behind, and removing orphans — driven by declarative policies
+      and built on <code>iceberg-rust</code>. No Spark, no Trino, no cluster.
+      One crate, one binary, and a library any Rust service can embed.
+    </p>
+
+    <div class="hero__actions">
+      <a class="btn btn--primary" href="{{ get_url(path='@/docs/getting-started.md') }}">Get started</a>
+      <a class="btn" href="{{ config.extra.repo }}" rel="noopener">View source</a>
+    </div>
+
+    <div class="hero__terminal" role="group" aria-label="Quickstart">
+      <div class="terminal">
+        <div class="terminal__bar" aria-hidden="true"><span></span><span></span><span></span></div>
+<pre class="terminal__body"><code><span class="c">$</span> bergman inspect
+
+ TABLE                        FILES   SIZE       AVG FILE   DELETES     SNAPSHOTS
+ prod.analytics.events        480     2.14 GiB   4.56 MiB   —           61 / 34d
+ prod.streaming.events_raw    92      8.11 GiB   90.2 MiB   1204 (23%)  8 / 2h
+ prod.finance.ledger          12      6.02 GiB   513 MiB    —           4 / 6d</code></pre>
+      </div>
+      <p class="hero__note">
+        Reads only, changes nothing. The first command answers what is wrong
+        before Bergman is trusted to write anything.
+      </p>
+    </div>
+  </div>
+</section>
+
+<section class="strip" aria-label="At a glance">
+  <div class="strip__inner">
+    <div class="stat"><span class="stat__n">0</span><span class="stat__l">JVMs required</span></div>
+    <div class="stat"><span class="stat__n">0</span><span class="stat__l">clusters to run</span></div>
+    <div class="stat"><span class="stat__n">1</span><span class="stat__l">static binary</span></div>
+    <div class="stat"><span class="stat__n">5</span><span class="stat__l">checks before a delete</span></div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="wrap">
+    <h2 class="section__title">Maintenance is a background tenant.</h2>
+    <p class="section__lede">
+      It must never win against a foreground writer, and never corrupt one. Every
+      design decision below follows from that — triggers instead of schedules,
+      replan instead of retry, and a deletion path with five independent checks
+      standing in front of it.
+    </p>
+
+    <div class="pillars">
+      <article class="pillar">
+        <h3>Policies declare intent</h3>
+        <p>
+          Every setting resolves through four layers: the matching rule, your
+          defaults, <em>the table's own Iceberg properties</em>, then the
+          specification default. A table already carries its owner's intent, and
+          Bergman reads it rather than competing with it.
+        </p>
+        <a class="pillar__link" href="{{ get_url(path='@/docs/policies.md') }}">How layering works →</a>
+      </article>
+
+      <article class="pillar">
+        <h3>Triggered, not scheduled</h3>
+        <p>
+          A schedule decides when a table is <em>evaluated</em>; measurements decide
+          whether anything runs. A table already at target file size costs a handful
+          of metadata reads and no data I/O — which is what makes it safe to evaluate
+          thousands of tables often.
+        </p>
+        <a class="pillar__link" href="{{ get_url(path='@/docs/compaction.md') }}">What triggers a rewrite →</a>
+      </article>
+
+      <article class="pillar">
+        <h3>Every decision is legible</h3>
+        <p>
+          Each planned operation carries the measurement that crossed a threshold and
+          the threshold it crossed. <code>policy explain</code> prints every effective
+          value together with the layer it came from. An operation you cannot
+          interrogate is one you cannot trust with your data.
+        </p>
+        <a class="pillar__link" href="{{ get_url(path='@/docs/policies.md') }}#provenance">See provenance →</a>
+      </article>
+
+      <article class="pillar">
+        <h3>Deletion is the hard part</h3>
+        <p>
+          Dry run by default; a grace period with a hard 24-hour floor that cannot be
+          configured away; unknown file age means too young; segment-wise containment;
+          and re-verification against freshly loaded metadata before the first delete.
+        </p>
+        <a class="pillar__link" href="{{ get_url(path='@/docs/orphans.md') }}">The safety model →</a>
+      </article>
+
+      <article class="pillar">
+        <h3>Replan, never re-commit</h3>
+        <p>
+          Losing a compare-and-swap to a foreground writer is reported as
+          <em>conflicted</em>, not failed — it is the design working. Each retry
+          reloads the table, because re-submitting a commit computed against a table
+          that has since moved is how deleted rows come back.
+        </p>
+        <a class="pillar__link" href="{{ get_url(path='@/docs/architecture.md') }}#commits">The commit model →</a>
+      </article>
+
+      <article class="pillar">
+        <h3>A library first</h3>
+        <p>
+          The binary is a thin consumer of the same public API you get. No global
+          state, no logger it installs, no runtime it creates. Planning is pure, so
+          dry-run is not a mode to remember — it is what happens when you stop before
+          <code>run()</code>.
+        </p>
+        <a class="pillar__link" href="{{ get_url(path='@/docs/library.md') }}">Embed it →</a>
+      </article>
+    </div>
+  </div>
+</section>
+
+<section class="section section--alt">
+  <div class="wrap">
+    <h2 class="section__title">A plan states the need, and what it will actually do</h2>
+    <p class="section__lede">
+      Compaction and manifest rewriting are <strong>planned but not executed</strong>:
+      committing them means removing data files, and <code>iceberg-rust</code> has no
+      transaction action that does. Bergman reports the need and marks the operation
+      blocked rather than pretending.
+    </p>
+
+<pre class="code-showcase"><code class="language-text">$ bergman plan
+
+prod.analytics.events
+  rule: prod.analytics.*
+  !! compact
+     why: partition d=2026-08-20: 412 of 480 files below 384 MiB (86% &ge; 30%)
+     reads 480 files (2.14 GiB), writes ~5 files
+     BLOCKED: compaction needs a commit that removes data files; iceberg-rust
+     0.10 has no such transaction action and its commit API is crate-private
+     (apache/iceberg-rust#2186). Planned and reported only.
+  -&gt; expire-snapshots
+     why: oldest snapshot is 34d old (&gt; 7d), 61 snapshots retained (keeping at least 3)
+     removes up to 58 snapshots
+
+1 tables, 2 operations (1 will run, 1 blocked), 2.14 GiB to read</code></pre>
+
+    <p class="section__foot">
+      A tool that silently did nothing about a need it had just reported would be
+      worse than one that never looked.
+      <a href="{{ get_url(path='@/docs/status.md') }}">What works today →</a>
+    </p>
+  </div>
+</section>
+
+<section class="section">
+  <div class="wrap">
+    <h2 class="section__title">Policies, in one file</h2>
+
+<pre class="code-showcase"><code class="language-toml">[[catalogs]]
+name      = "prod"
+uri       = "http://localhost:8181/catalog"
+warehouse = "s3://lake/warehouse"
+token_env = "BERGMAN_CATALOG_TOKEN"   # a name, never a value
+
+[defaults.snapshots]
+max_age     = "7d"        # omitted -&gt; history.expire.max-snapshot-age-ms
+min_to_keep = 3
+
+# A streaming target: files are the right size, but equality deletes
+# amplify every read. Trigger on the delete ratio, not on file sizes.
+[[rules]]
+match    = "prod.streaming.events_*"
+schedule = "0 */2 * * *"
+[rules.compaction.trigger]
+delete_ratio = 0.05
+
+[[rules]]
+match = "prod.tmp.**"
+skip  = true              # explicit exclusion beats implicit</code></pre>
+
+    <p class="section__foot">
+      Validate it offline — no catalog, no credentials, suitable for CI:
+      <code>bergman policy lint</code>.
+      <a href="{{ get_url(path='@/docs/configuration.md') }}">Configuration reference →</a>
+    </p>
+  </div>
+</section>
+
+<section class="section section--alt">
+  <div class="wrap">
+    <h2 class="section__title">Pick your shape</h2>
+    <div class="shapes">
+      <article class="shape">
+        <h3>Cron job</h3>
+        <p>One cycle, then exit. A Kubernetes <code>CronJob</code>, an ECS scheduled task, or a line in a crontab. Exits <code>2</code> when something needs attention, so a broken job cannot look healthy.</p>
+<pre><code class="language-bash">bergman run \
+  --config /etc/bergman.toml \
+  --audit-log /var/log/bergman.jsonl</code></pre>
+      </article>
+      <article class="shape">
+        <h3>Read-only first</h3>
+        <p>Report health and plan work without writing anything, until the plans look right. The same code path <code>run</code> uses — what you were shown is what happens.</p>
+<pre><code class="language-bash">bergman inspect
+bergman plan --format json \
+  | jq '.tables[].operations[]'</code></pre>
+      </article>
+      <article class="shape">
+        <h3>Embedded</h3>
+        <p>A Rust service holding the engine in-process — a catalog, a streaming writer, a control plane — with an observer for metrics or an approval gate.</p>
+<pre><code class="language-rust">let bergman = Bergman::builder(config)
+    .with_observer(observer)
+    .build()
+    .await?;
+
+let plan = bergman.plan().await?;
+let report = bergman.run(&amp;plan).await?;</code></pre>
+      </article>
+    </div>
+  </div>
+</section>
+
+<section class="cta">
+  <div class="wrap cta__inner">
+    <h2>Start by looking, not writing</h2>
+    <p><code>bergman inspect</code> reads your catalog and changes nothing.</p>
+    <div class="hero__actions">
+      <a class="btn btn--primary" href="{{ get_url(path='@/docs/getting-started.md') }}">Read the guide</a>
+      <a class="btn" href="{{ get_url(path='@/docs/_index.md') }}">Browse the docs</a>
+    </div>
+  </div>
+</section>
+
+</main>
+{% endblock content %}

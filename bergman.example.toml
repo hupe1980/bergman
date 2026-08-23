@@ -1,0 +1,180 @@
+# Bergman configuration.
+#
+# Every setting is optional. What a policy does not state falls through to the
+# table's own Iceberg properties, and then to the Iceberg specification
+# default — so this file says only what differs from what the tables already
+# declare. `bergman policy explain <table>` prints the resolved result together
+# with the origin of every value.
+#
+# Validate offline (no catalog, no credentials — suitable for CI):
+#
+#     bergman policy lint
+
+# ---------------------------------------------------------------------------
+# Catalogs
+# ---------------------------------------------------------------------------
+
+[[catalogs]]
+# The name is the first segment of every table reference, and therefore what
+# rule patterns match against. It may not contain a dot.
+name = "prod"
+
+# The only protocol implemented. It reaches every catalog Bergman targets:
+# Rustberg, Polaris, Lakekeeper, Nessie, Unity.
+kind = "rest"
+
+uri = "http://localhost:8181/catalog"
+
+# The warehouse, when the catalog serves several. Also used to check at startup
+# that this build carries the right object-store feature.
+warehouse = "s3://lake/warehouse"
+
+# The *name* of the environment variable holding the bearer token. Never the
+# token: a credential in a config file is a credential in version control.
+# token_env = "BERGMAN_CATALOG_TOKEN"
+
+# Restrict discovery to these namespaces instead of walking the whole catalog.
+# Nested namespaces are dotted, as in rule patterns. On a large catalog this
+# turns an O(catalog) tree walk into an O(subtree) one.
+# namespaces = ["analytics", "streaming.raw"]
+
+# Storage configuration, using Iceberg's own property names — so `s3.endpoint`
+# means here what it means in Spark, Trino, and PyIceberg. These reach both the
+# catalog's file client and the object-store client orphan scanning needs.
+[catalogs.properties]
+"s3.region" = "eu-central-1"
+# "s3.endpoint"          = "http://minio:9000"
+# "s3.path-style-access" = "true"          # MinIO and most S3-compatible stores
+#
+# Credentials are best left to the provider chain (instance role, workload
+# identity, `aws configure`) or vended by the catalog. Set them here only if
+# there is no alternative:
+# "s3.access-key-id"     = "..."
+# "s3.secret-access-key" = "..."
+
+# ---------------------------------------------------------------------------
+# Defaults — layered under every rule that does not override them
+# ---------------------------------------------------------------------------
+
+[defaults.snapshots]
+# Falls back to the table's `history.expire.max-snapshot-age-ms`, then to the
+# Iceberg default of 5 days.
+max_age = "7d"
+
+# Falls back to `history.expire.min-snapshots-to-keep`, then to 1.
+min_to_keep = 3
+
+# Delete the files expiration orphans. Off by default: with it off, expiration
+# is a pure metadata operation and the orphan scanner reclaims the files later
+# — one deleter, one safety model. Turning it on reclaims storage immediately,
+# without waiting out the orphan grace period.
+# delete_files = true
+
+[defaults.orphans]
+# The scanner is off unless a rule enables it.
+# enabled = true
+
+# "dry-run" reports; "delete" removes. Deleting is opt-in, and deliberately so:
+# this is the one operation that can destroy a healthy table.
+mode = "dry-run"
+
+# Only consider files older than this. Bounded below by a hard 24-hour floor
+# that cannot be configured away — writers stage files before the commit that
+# references them, so a young unreferenced file is more likely a live write
+# than garbage.
+older_than = "7d"
+
+[defaults.compaction]
+# Compaction rewrites data, so it never arrives by accident.
+#
+# NOTE: compaction is planned and reported but NOT executed in this release.
+# Committing a rewrite means removing data files, and iceberg-rust 0.10 has no
+# transaction action that does — see the status table in the README.
+# enabled = true
+
+# Falls back to the table's `write.target-file-size-bytes`, then to 512 MiB.
+# target_file_size = 536870912
+
+max_concurrent_file_groups = 4
+
+[defaults.compaction.trigger]
+# Compaction is *triggered*, not scheduled: a table already at target size
+# costs one metadata read per cycle and no data I/O at all.
+
+# Rewrite when this fraction of a partition's files are below the small-file
+# threshold (`min_file_size_ratio` of the target size).
+small_file_ratio = 0.3
+
+# Never rewrite fewer than this many files. Matches Spark's
+# `rewrite_data_files` default, so behaviour is unsurprising.
+min_input_files = 5
+
+# Rewrite when delete records exceed this fraction of a partition's rows, even
+# when file sizes are fine. This is the trigger that matters for streaming and
+# CDC targets, where read amplification comes from delete files rather than
+# from small ones.
+delete_ratio = 0.1
+
+# What counts as "small", as a fraction of the target file size.
+min_file_size_ratio = 0.75
+
+[defaults.manifests]
+# NOTE: also planned-but-not-executed — no upstream action rewrites manifests.
+# rewrite = true
+
+# Falls back to `commit.manifest.target-size-bytes`, then to 8 MiB.
+# target_size = 8388608
+
+# ---------------------------------------------------------------------------
+# Rules — evaluated in order, first match wins
+# ---------------------------------------------------------------------------
+#
+# Patterns are globs over `catalog.namespace....table` with `.` as the
+# separator. `*` stops at a namespace boundary, `**` crosses it:
+#
+#   prod.analytics.*    matches prod.analytics.events
+#                       but NOT  prod.analytics.web.events
+#   prod.analytics.**   matches both
+
+[[rules]]
+match = "prod.analytics.*"
+
+# A streaming target: files are the right size, but equality deletes amplify
+# every read. Evaluate often and trigger on the delete ratio rather than on
+# file sizes.
+[[rules]]
+match = "prod.streaming.events_*"
+# `schedule` governs when evaluation runs, not whether anything executes —
+# the health analyzer decides that.
+schedule = "0 */2 * * *"
+
+[rules.compaction]
+enabled = true
+sort = ["event_date", "customer_id"]
+
+[rules.compaction.trigger]
+delete_ratio = 0.05
+
+# Scratch tables: excluded on purpose. An explicit exclusion is reported as
+# "skipped", where a table no rule matches is reported as "unmatched" — so a
+# pattern that does not do what you thought is visible.
+[[rules]]
+match = "prod.tmp.**"
+skip = true
+
+# ---------------------------------------------------------------------------
+# Global limits
+# ---------------------------------------------------------------------------
+
+[limits]
+# How many tables are examined and maintained concurrently.
+max_parallel_tables = 4
+
+# Ceiling on bytes read by rewrites in one cycle. When the budget cannot cover
+# everything, tables are ordered most-fragmented-first and the remainder is
+# reported as deferred — never silently dropped. Metadata-only work is never
+# charged against it, so a rewrite ceiling cannot block snapshot expiration.
+# max_rewrite_bytes_per_run = 536870912000   # 500 GiB
+
+# Only begin work inside this window.
+# maintenance_window = "22:00-06:00 Europe/Berlin"

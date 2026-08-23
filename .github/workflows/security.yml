@@ -1,0 +1,29 @@
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Advisories land between pull requests, so the tree is re-checked weekly
+    # rather than only when someone happens to push.
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Run each check separately so a licence problem and an advisory are
+        # two distinct red marks rather than one opaque failure.
+        checks: [advisories, licenses, bans, sources]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check ${{ matrix.checks }}

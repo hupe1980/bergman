@@ -1,0 +1,68 @@
+# cargo-deny configuration.
+#
+# Four independent checks: security advisories, licence compatibility, banned
+# crates, and where sources come from. Run with `just deny`.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# Bergman is Apache-2.0 OR MIT, so the dependency tree must stay compatible
+# with both. Permissive licences only — nothing copyleft, and nothing that
+# would surprise someone vendoring the binary.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "BSL-1.0",
+    "MPL-2.0",
+]
+confidence-threshold = 0.9
+
+[[licenses.exceptions]]
+# The `ring` crate carries a compound licence whose OpenSSL-derived portion
+# has no SPDX identifier. It is ubiquitous in the rustls stack and the terms
+# are permissive; this is the standard exception rather than a judgement call
+# specific to Bergman.
+name = "ring"
+allow = ["OpenSSL"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+deny = [
+    # TLS is rustls throughout. A native-tls dependency creeping in would mean
+    # the static musl build stops being static, which is one of the reasons to
+    # write this in Rust at all.
+    { name = "openssl" },
+    { name = "openssl-sys" },
+    { name = "native-tls" },
+]
+
+skip-tree = [
+    # The AWS and OpenDAL trees pull in overlapping versions of small utility
+    # crates on their own schedule. Nothing here can fix that, and failing the
+    # build over it would mean pinning transitive dependencies Bergman does not
+    # own.
+    { name = "opendal" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

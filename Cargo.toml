@@ -1,0 +1,125 @@
+[package]
+name = "bergman"
+version = "0.1.0"
+edition = "2024"
+authors = ["hupe1980"]
+description = "A Rust-native maintenance engine for Apache Iceberg — policy-driven compaction, snapshot expiration, and orphan cleanup with no JVM"
+readme = "README.md"
+keywords = ["bergman", "iceberg", "maintenance", "compaction", "lakehouse"]
+categories = ["database", "command-line-utilities"]
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/hupe1980/bergman"
+homepage = "https://hupe1980.github.io/bergman/"
+# The floor the dependency tree imposes, not an aspiration: `iceberg` 0.10.1
+# declares 1.94. `just msrv` checks this against a real toolchain rather than
+# trusting the number.
+rust-version = "1.94"
+
+[features]
+# Optional dependencies are referenced as `dep:name`. Without the prefix Cargo
+# implicitly exposes each optional dependency as a public feature of the same
+# name, so `--features clap` would be a supported knob we never intended and
+# could not later rename. `dep:` keeps the feature surface exactly this list.
+#
+# Embedders take `default-features = false` and add only the backends they use;
+# the library core has no CLI, no catalog client and no cloud object store.
+default = ["cli", "catalog-rest", "storage-all"]
+
+# Command-line interface. Gates the binary (see `[[bin]]`), the terminal
+# rendering, and process-level concerns the library deliberately does not own:
+# logging initialization, config file discovery, exit codes.
+cli = ["dep:clap", "dep:tracing-subscriber", "dep:comfy-table"]
+
+# Iceberg REST catalog client. The only catalog protocol that reaches every
+# implementation Bergman targets (Rustberg, Polaris, Lakekeeper, Nessie, Unity).
+catalog-rest = ["dep:iceberg-catalog-rest"]
+
+# Cloud object stores for table data and metadata. The local filesystem and
+# in-memory backends are always available, which is what keeps the test suite
+# free of containers.
+#
+# Each switches the backend on in both clients: `iceberg-storage-opendal` for
+# the reads and writes the catalog drives, and `opendal` directly for the
+# listing orphan removal needs. Enabling only one of the pair would produce a
+# build that can read a table it cannot scan for orphans.
+storage-s3 = ["iceberg-storage-opendal/opendal-s3", "opendal/services-s3"]
+storage-gcs = ["iceberg-storage-opendal/opendal-gcs", "opendal/services-gcs"]
+storage-azure = ["iceberg-storage-opendal/opendal-azdls", "opendal/services-azdls"]
+storage-all = ["storage-s3", "storage-gcs", "storage-azure"]
+
+[[bin]]
+name = "bergman"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[lib]
+name = "bergman"
+path = "src/lib.rs"
+
+[dependencies]
+# Core async runtime. The library takes the caller's runtime and spawns onto
+# it; only the binary constructs one.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+async-trait = "0.1"
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+
+# Iceberg. 0.10 split storage backends out of the core crate: `iceberg` itself
+# ships only the local-filesystem and in-memory backends, and cloud object
+# stores come from `iceberg-storage-opendal`. That split is what lets this
+# build stay rustls-only.
+iceberg = "0.10"
+iceberg-catalog-rest = { version = "0.10", optional = true }
+iceberg-storage-opendal = { version = "0.10", default-features = false, features = [
+    "opendal-memory",
+    "opendal-fs",
+] }
+
+# Object listing, which `iceberg::io::FileIO` does not offer: its `Storage`
+# trait has read, write, delete and delete_prefix, but no `list`. Orphan-file
+# removal is *defined* by listing storage and subtracting what metadata
+# reaches, so Bergman owns that layer until upstream grows one. Pinned to the
+# same version `iceberg-storage-opendal` uses so the tree holds one copy and
+# the credentials Iceberg properties describe reach the same client.
+opendal = { version = "0.57", default-features = false, features = [
+    "services-memory",
+    "services-fs",
+] }
+
+# Serialization. Configuration is TOML, matching the sister project Rustberg;
+# audit records and `--format json` are JSON.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+
+# Table matching. `globset` compiles a pattern once into a matcher rather than
+# re-walking a glob per table, which matters when a rule set meets a catalog of
+# thousands of tables.
+globset = "0.4"
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+humantime-serde = "1"
+
+# Cron expressions. Used today to validate a rule's `schedule` at startup, so a
+# malformed expression fails before a cycle runs rather than during one.
+cron = "0.15"
+
+# Observability. The library emits `tracing` spans and never installs a
+# subscriber; the binary does that.
+tracing = "0.1"
+
+# CLI (optional)
+clap = { version = "4", features = ["derive", "env"], optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
+comfy-table = { version = "7", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
