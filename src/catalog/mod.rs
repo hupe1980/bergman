@@ -133,6 +133,42 @@ impl CatalogConfig {
         )))
     }
 
+    /// Build Bergman's commit path for this catalog.
+    ///
+    /// Separate from [`CatalogConfig::connect`] because it answers a different
+    /// question: `connect` gives a client for everything `iceberg::Catalog` can
+    /// already do, and this gives one for the commits it cannot express — see
+    /// [`crate::commit`] for why that is a whole module rather than a method.
+    pub async fn committer(&self) -> Result<Arc<dyn crate::commit::TableCommitter>> {
+        match self.kind {
+            CatalogKind::Rest => {
+                let token = match &self.token_env {
+                    Some(var) => Some(std::env::var(var).map_err(|_| {
+                        Error::config(format!(
+                            "catalog \"{}\": token_env names ${var}, which is not set",
+                            self.name
+                        ))
+                    })?),
+                    // Some deployments put the token straight in `properties`,
+                    // which `iceberg-catalog-rest` also accepts. Reading it here
+                    // keeps both clients authenticating identically — one that
+                    // authenticated and one that did not would fail only on the
+                    // first commit, long after startup.
+                    None => self.properties.get("token").cloned(),
+                };
+
+                Ok(Arc::new(
+                    crate::commit::RestCommitter::connect(
+                        &self.uri,
+                        self.warehouse.as_deref(),
+                        token,
+                    )
+                    .await?,
+                ))
+            }
+        }
+    }
+
     /// Check that this build carries the object store this catalog will need.
     ///
     /// Storage is resolved per path at read time, so this cannot be exhaustive

@@ -83,22 +83,15 @@ bergman plan
 ```text
 prod.analytics.events
   rule: prod.**
-  !! compact
+  -> compact
      why: partition d=2026-08-20: 412 of 480 files below 384 MiB (86% ≥ 30%)
      reads 480 files (2.14 GiB), writes ~5 files
-     BLOCKED: compaction needs a commit that removes data files; iceberg-rust
-     0.10 has no such transaction action and its commit API is crate-private
-     (apache/iceberg-rust#2186). Planned and reported only.
   -> expire-snapshots
      why: oldest snapshot is 34d old (> 7d), 61 snapshots retained (keeping at least 3)
      removes up to 58 snapshots
 
-1 tables, 2 operations (1 will run, 1 blocked), 2.14 GiB to read
+1 tables, 2 operations (2 will run, 0 blocked), 2.14 GiB to read
 ```
-
-`->` will run. `!!` is a real need Bergman cannot yet meet — see
-[Status](@/docs/status.md) for why, and note that it is reported rather than
-hidden.
 
 Every operation carries the measurement that triggered it and the threshold it
 crossed. If a plan surprises you, [`policy explain`](@/docs/policies.md#provenance)
@@ -112,10 +105,10 @@ bergman run --audit-log /var/log/bergman.jsonl
 
 ```text
 prod.analytics.events
-  [!!] compact: compaction needs a commit that removes data files; …
+  [ok] compact: 1 partitions: 480 files (2.14 GiB) rewritten into 5 (2.09 GiB)
   [ok] expire-snapshots: 58 snapshots expired
 
-1 tables, 1 operations succeeded in 3s
+1 tables, 2 operations succeeded in 47s
 ```
 
 `run` builds the plan through exactly the same code `plan` does, then executes
@@ -141,4 +134,4 @@ Almost nothing destructive:
 
 - [Policies](@/docs/policies.md) — how a setting is resolved, and how to find out why
 - [Orphan files](@/docs/orphans.md) — read this before enabling deletion
-- [Status](@/docs/status.md) — what executes today, and what is blocked upstream
+- [Status](@/docs/status.md) — what executes, and what is not built

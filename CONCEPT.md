@@ -53,13 +53,9 @@ job, a sidecar, or a long-lived daemon — and one library any Rust service
 can embed — for the 95% of tables that do not need a distributed shuffle to
 stay healthy.
 
-### What is feasible now — verified against `iceberg-rust` 0.10.1
+### What upstream provides, and what it does not
 
-An earlier draft of this document claimed `RewriteFilesAction` had landed
-upstream and that compaction commits were therefore unblocked. **That was
-wrong**, and since it was the load-bearing feasibility claim it is corrected
-here in full. Verified against the released crate and the upstream repository
-on 2026-08-23:
+Verified against `iceberg-rust` 0.10.1 and `main`:
 
 | Capability | Upstream state | Bergman |
 |---|---|---|
@@ -67,20 +63,29 @@ on 2026-08-23:
 | Expiration *file cleanup* | ❌ Explicitly out of scope — its docs call physical cleanup "the responsibility of a higher-level maintenance operation built on top of this action" | **Implemented** — Bergman is that operation |
 | Orphan-file removal | ❌ No API, and no way to build one: `FileIO`/`Storage` have read, write, delete, `delete_prefix` — **no `list`** | **Implemented**, on Bergman's own object-store layer |
 | Table health analysis | ✅ Manifests readable via `ManifestList::parse_with_version` + `ManifestFile::load_manifest` | **Implemented** |
-| Compaction (rewrite data files) | ❌ **No action removes data files.** `RewriteFilesAction` (#1606) was **closed unmerged**; `OverwriteAction` (#2185) and the CoW rewrite primitive (#2752) are **open**; #2186 lists "compaction via rewrite" unchecked | **Planned and reported, not executed** |
-| Manifest rewrite | ❌ No action; #1237 closed unmerged | **Planned and reported, not executed** |
+| Compaction (rewrite data files) | ⚠️ **No action removes data files** — `RewriteFilesAction` (#1606) closed unmerged, `OverwriteAction` (#2185) and the CoW primitive (#2752) open. But the *pieces* are public: `ManifestWriterBuilder`, `ManifestListWriter`, `Snapshot::builder`, `TableUpdate`/`TableRequirement` (both `Serialize`), `ArrowReader` (applies positional **and** equality deletes), `ParquetWriterBuilder` → `RollingFileWriter` → `DataFileWriter` | **Implemented**, on Bergman's own commit layer |
+| Manifest rewrite | ⚠️ No action; #1237 closed unmerged. Same public pieces | **Implemented**, same way |
+| Delivering a commit | ❌ `TableCommit`'s builder and `TransactionAction` are both `pub(crate)` | **Bergman owns this** (§4.2) |
 | Custom commits as a workaround | ❌ Closed off: `TransactionAction` is `pub(crate)`, and `TableCommit`'s builder is `#[builder(build_method(vis = "pub(crate)"))]` with the comment *"dangerous and error-prone to construct directly"* | — |
 
 Two consequences shape everything below.
 
-**First, the data plane is genuinely blocked, and no amount of cleverness in
-this crate unblocks it.** An external crate cannot construct an Iceberg commit
-that removes a file. Bergman therefore *plans* compaction and manifest
-rewriting — the analysis is real, the triggers fire, the plan states the
-table's actual need — and marks each such operation `Blocked` with the
-upstream issue number, refusing to pretend. A maintenance tool that silently
-did nothing about a need it had just reported would be worse than one that
-never looked.
+**First, the blocker is narrower than it looks, and Bergman routes around it
+rather than waiting.** An external crate cannot *deliver* an Iceberg commit —
+but it can build every byte of one, because the manifest writers, the snapshot
+builder, and `TableUpdate`/`TableRequirement` are all public and serializable.
+So Bergman owns the commit layer (§4.2) and delivers `(requirements, updates)`
+over the REST protocol itself. The bytes on the wire are identical to what
+`iceberg-catalog-rest` sends, because they are the same serialized types going
+to the same endpoint.
+
+This is what the rest of the market did too, only worse: `nimtable/iceberg-
+compaction` pins a **fork** (`risingwavelabs/iceberg-rust` at a git rev), and
+RisingWave vendored the logic into its engine. A fork costs a rebase forever
+*and* a crate that cannot be published, since Cargo rejects git dependencies on
+crates.io — fatal for a library-first project. Owning one small layer is the
+cheaper trade, and it is the same call Rustberg made when `iceberg::Catalog`
+proved structurally unusable for a catalog server.
 
 **Second, the metadata plane is not just feasible, it is where upstream is
 explicitly asking for a partner.** `ExpireSnapshotsAction`'s own
@@ -692,13 +697,15 @@ own object-store layer (upstream `FileIO` cannot list); JSONL audit trail;
 the `MaintenanceObserver` hook. REST catalog + S3/GCS/Azure/local fs. The
 library API ships here and the CLI is written against it, so embeddability is
 enforced by construction rather than retrofitted. **Manifest rewrite is
-blocked upstream** (§1) and is planned-and-reported only.
+implemented too**, on Bergman's own commit layer (§4.2).
 
-**Phase 2 — compaction.** Bin-pack with positional-delete application;
-equality-delete application; partition-grained commits with full
-re-validation; memory budget + spill; sort-based clustering. **Gated on
-upstream #2185 / #2752** — the planner, triggers and reporting are already
-implemented, so this phase is the execution half alone.
+**Phase 2 — compaction. ✅ Implemented.** Bin-pack with positional- and
+equality-delete application (upstream's scan applies both), partition-grained
+commits with pre-commit re-validation, and the delete-file retirement rule:
+a delete file is retired only when every data file it applies to is inside the
+group. Not gated on #2185 after all — §1 explains why. Still absent: the sort
+stage (output is bin-packed, `sort` is accepted and reported but not applied),
+z-order, memory budget and spill.
 
 **Phase 2b — daemon.** `bergman daemon`: cron and event triggers, Prometheus
 `/metrics`, maintenance windows. Deliberately after the operations rather

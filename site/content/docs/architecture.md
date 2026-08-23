@@ -18,9 +18,12 @@ is no separate planner service, no work queue, and no worker tier.
   ├────────────────────────────────────────────────────┤
   │ plan        triggers · estimates · executability   │
   ├────────────────────────────────────────────────────┤
-  │ ops         expire · orphans · reachability        │
+  │ ops         compact · manifests · expire · orphans │
   ├────────────────────────────────────────────────────┤
-  │ iceberg-rust    catalogs · FileIO                  │
+  │ commit      manifests + snapshot -> REST commit    │
+  │             (iceberg cannot express a rewrite)     │
+  ├────────────────────────────────────────────────────┤
+  │ iceberg-rust    catalogs · FileIO · scan · writers │
   │ opendal         object listing (FileIO has none)   │
   └────────────────────────────────────────────────────┘
 ```
@@ -118,9 +121,41 @@ broker, no consensus service. Optimistic catalog commits already make
 double-execution safe, so sharding is a cost optimization rather than a
 correctness requirement.
 
+## The commit layer {#commit-layer}
+
+An Iceberg commit is `(requirements, updates)` applied atomically, and the
+`iceberg` crate cannot express one from outside: `TableCommit`'s builder and
+`TransactionAction` are both `pub(crate)`, and no built-in action removes a data
+file. Compaction and manifest rewriting are therefore unreachable through it.
+
+Bergman owns that layer rather than forking (see
+[Status](@/docs/status.md#why-bergman-owns-its-commit-layer) for why the
+alternative is worse). The split is deliberate:
+
+- **Everything a commit is made of** comes from upstream's public writers —
+  `ManifestWriterBuilder`, `ManifestListWriter`, `Snapshot::builder`,
+  `TableUpdate`, `TableRequirement`.
+- **Only the delivery** is Bergman's: a `POST` of `{identifier, requirements,
+  updates}` to the table endpoint, with the catalog's routing prefix discovered
+  once from `/v1/config`. The bytes are identical to what
+  `iceberg-catalog-rest` sends, because they are the same serialized types.
+
+Operations are written against a `TableCommitter` trait rather than the
+transport, so when upstream lands `OverwriteAction` a second implementation
+wraps it and nothing above `src/commit` changes.
+
+Two invariants govern a rewrite commit, and both lose data when broken:
+
+1. **Every live file not being removed is carried forward.** A manifest set that
+   omits one silently deletes those rows.
+2. **Sequence numbers are inherited, never reassigned.** A file carried through
+   a rewrite keeps the sequence number of the file it replaces, so delete files
+   written *later* still apply to it. Stamping the new snapshot's number on it
+   would make it look newer than the deletes that should remove its rows.
+
 ## What Bergman owns, and why
 
-Two layers exist here only because upstream has no equivalent:
+Three layers exist here only because upstream has no equivalent:
 
 **Object listing.** `iceberg::io::FileIO` has read, write, delete and
 `delete_prefix` — but no `list`. Orphan removal is defined by listing storage, so
@@ -132,8 +167,10 @@ logic can be tested against an in-memory store rather than a cloud account.
 physical cleanup as a higher-level responsibility. Bergman computes the reachable
 set before and after the commit and deletes the difference.
 
-Both are temporary implementations while the gap exists, and both are the natural
-things to contribute back.
+**Commit delivery**, as above.
+
+All three are temporary implementations while the gap exists, and the first two
+are the natural things to contribute back.
 
 ## Errors carry a disposition
 

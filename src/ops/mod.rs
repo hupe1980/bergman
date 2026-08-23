@@ -6,7 +6,9 @@
 //! current snapshot. That is what "crash-only" means here, and it is why there
 //! is no journal, no lock file, and nothing to repair after a `kill -9`.
 
+pub mod compact;
 pub mod expire;
+pub mod manifests;
 pub mod orphans;
 pub mod reachability;
 pub mod store;

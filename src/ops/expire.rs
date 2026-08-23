@@ -164,22 +164,21 @@ fn cutoff_millis(now: DateTime<Utc>, max_age: Duration) -> i64 {
     now.timestamp_millis().saturating_sub(age_ms)
 }
 
-/// Whether a catalog error means the table moved rather than that something
-/// broke.
+/// Whether an error means the table moved rather than that something broke.
 ///
-/// The REST spec answers a failed requirement check with 409, and upstream
-/// surfaces that as a message rather than a typed variant. Matching on text is
-/// unpleasant, and it is bounded here by what it costs to be wrong: a conflict
-/// mistaken for a failure is reported as a failure and retried next cycle; a
-/// failure mistaken for a conflict costs at most `MAX_COMMIT_ATTEMPTS`
-/// reload-and-retry rounds before being reported anyway. Neither loses data.
+/// Classified by type, never by message text: the commit layer maps HTTP 409
+/// and 412 to [`Error::CommitConflict`], and upstream tags its own with
+/// `ErrorKind::CatalogCommitConflicts`.
+///
+/// A conflict misread as a failure wastes a cycle; a failure misread as a
+/// conflict makes Bergman reload and retry against a world that will refuse it
+/// again.
 fn is_conflict(err: &Error) -> bool {
-    let text = err.to_string().to_ascii_lowercase();
-    text.contains("conflict")
-        || text.contains("409")
-        || text.contains("requirement failed")
-        || text.contains("commitfailed")
-        || text.contains("commit failed")
+    match err {
+        Error::CommitConflict { .. } | Error::StalePlan { .. } => true,
+        Error::Catalog(inner) => inner.kind() == iceberg::ErrorKind::CatalogCommitConflicts,
+        _ => false,
+    }
 }
 
 /// Delete the files that expiration made unreachable.
@@ -276,29 +275,40 @@ mod tests {
     }
 
     #[test]
-    fn conflicts_are_recognised_from_the_shapes_rest_catalogs_use() {
-        for text in [
-            "catalog error: conflict detected",
-            "catalog error: 409 Conflict",
-            "catalog error: requirement failed: branch main has changed",
-            "catalog error: CommitFailedException",
-        ] {
-            assert!(
-                is_conflict(&Error::Config(text.into())),
-                "not recognised: {text}"
-            );
-        }
+    fn conflicts_are_recognised_by_kind_not_by_text() {
+        // The commit layer classifies 409/412 itself...
+        assert!(is_conflict(&Error::CommitConflict {
+            table: "db.t".into(),
+            detail: "ref moved".into(),
+        }));
+        assert!(is_conflict(&Error::StalePlan {
+            table: "db.t".into(),
+            detail: "inputs gone".into(),
+        }));
+
+        // ...and upstream tags its own.
+        assert!(is_conflict(&Error::Catalog(Box::new(iceberg::Error::new(
+            iceberg::ErrorKind::CatalogCommitConflicts,
+            "one or more requirements failed",
+        )))));
     }
 
     #[test]
     fn ordinary_failures_are_not_conflicts() {
-        // Misclassifying these would burn the retry budget reaching the same
-        // conclusion.
-        for text in ["connection refused", "403 Forbidden", "no such table"] {
-            assert!(
-                !is_conflict(&Error::Config(text.into())),
-                "wrongly a conflict: {text}"
-            );
-        }
+        // A failure misread as a conflict makes Bergman reload and retry
+        // against a world that will refuse it again.
+        assert!(!is_conflict(&Error::Catalog(Box::new(
+            iceberg::Error::new(iceberg::ErrorKind::Unexpected, "connection refused",)
+        ))));
+        assert!(!is_conflict(&Error::config("bad config")));
+        assert!(!is_conflict(&Error::refused("compact", "db.t", "no")));
+
+        // Text that merely *mentions* a conflict is not one.
+        assert!(!is_conflict(&Error::Catalog(Box::new(
+            iceberg::Error::new(
+                iceberg::ErrorKind::Unexpected,
+                "no table named conflict_log",
+            )
+        ))));
     }
 }

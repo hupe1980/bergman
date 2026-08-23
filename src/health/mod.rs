@@ -14,7 +14,7 @@
 mod analyze;
 mod partition;
 
-pub use analyze::analyze;
+pub use analyze::{analyze, render_literal};
 pub use partition::{PartitionHealth, PartitionKey};
 
 use std::time::Duration;

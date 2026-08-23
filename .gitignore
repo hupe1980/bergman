@@ -22,3 +22,7 @@ target
 
 # Zola build output
 site/public/
+
+# Custom
+CONCEPT.md
+.DS_Store

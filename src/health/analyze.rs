@@ -257,7 +257,7 @@ fn render_partition(partition: &Struct) -> String {
 /// operator reading a plan expects to see. Anything more structured (a nested
 /// struct, a list) keeps its debug form: it still groups correctly, which is
 /// the only thing this value is load-bearing for.
-fn render_literal(literal: &iceberg::spec::Literal) -> String {
+pub fn render_literal(literal: &iceberg::spec::Literal) -> String {
     let debug = format!("{literal:?}");
     let Some(inner) = debug
         .strip_prefix("Primitive(")

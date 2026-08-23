@@ -87,9 +87,9 @@ older_than = "7d"
 [defaults.compaction]
 # Compaction rewrites data, so it never arrives by accident.
 #
-# NOTE: compaction is planned and reported but NOT executed in this release.
-# Committing a rewrite means removing data files, and iceberg-rust 0.10 has no
-# transaction action that does — see the status table in the README.
+# Files are read with their delete files applied and written back at the target
+# size, and a delete file is retired only when every data file it applies to is
+# inside the group being rewritten.
 # enabled = true
 
 # Falls back to the table's `write.target-file-size-bytes`, then to 512 MiB.
@@ -119,7 +119,8 @@ delete_ratio = 0.1
 min_file_size_ratio = 0.75
 
 [defaults.manifests]
-# NOTE: also planned-but-not-executed — no upstream action rewrites manifests.
+# Pure metadata: the same manifest entries re-packed into fewer, larger files.
+# No data file is read or written. The cheapest real win available.
 # rewrite = true
 
 # Falls back to `commit.manifest.target-size-bytes`, then to 8 MiB.
@@ -150,6 +151,8 @@ schedule = "0 */2 * * *"
 
 [rules.compaction]
 enabled = true
+# Accepted, validated and reported — but the sort stage is not implemented yet,
+# so output is bin-packed rather than sorted.
 sort = ["event_date", "customer_id"]
 
 [rules.compaction.trigger]

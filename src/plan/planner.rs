@@ -11,23 +11,6 @@ use crate::plan::{Estimate, Executability, Operation, OperationKind, TablePlan};
 use crate::policy::{EffectivePolicy, OrphanMode};
 use crate::util::{human_bytes, human_duration};
 
-/// Why compaction cannot execute today.
-///
-/// Compaction commits a snapshot that *removes* data files and adds
-/// replacements. Upstream `iceberg-rust` 0.10 has no action that removes files:
-/// `Transaction` offers append, expire-snapshots and the metadata updates, and
-/// both `TransactionAction` and `TableCommit`'s builder are `pub(crate)`, so no
-/// external crate can supply one. Bergman plans compaction, reports it, and
-/// declines to execute it rather than pretending otherwise.
-const COMPACTION_BLOCKED: &str = "compaction needs a commit that removes data files; \
-     iceberg-rust 0.10 has no such transaction action and its commit API is \
-     crate-private (apache/iceberg-rust#2186). Planned and reported only.";
-
-/// Why manifest rewriting cannot execute today.
-const MANIFEST_REWRITE_BLOCKED: &str = "rewriting manifests needs a commit that replaces \
-     the snapshot's manifest set; iceberg-rust 0.10 has no such transaction action \
-     (apache/iceberg-rust#1237 was closed unmerged). Planned and reported only.";
-
 /// Plan one table.
 ///
 /// Returns `None` when nothing should happen — an empty table, or one already
@@ -152,13 +135,17 @@ fn plan_compaction(health: &TableHealth, policy: &EffectivePolicy) -> Option<Ope
     Some(Operation {
         kind: OperationKind::Compact,
         reason,
+        // The exact partitions the triggers fired on. Carried on the operation
+        // so `run` rewrites precisely what `plan` displayed, rather than
+        // re-deciding against a table that has moved since.
+        targets: triggered.iter().map(|(p, _, _)| p.key.clone()).collect(),
         estimate: Estimate {
             input_files,
             input_bytes,
             output_files,
             snapshots_removed: 0,
         },
-        executability: Executability::blocked(COMPACTION_BLOCKED),
+        executability: Executability::Executable,
     })
 }
 
@@ -178,6 +165,7 @@ fn plan_manifest_rewrite(health: &TableHealth, policy: &EffectivePolicy) -> Opti
 
     Some(Operation {
         kind: OperationKind::RewriteManifests,
+        targets: Vec::new(),
         reason: format!(
             "{undersized} of {} manifests below {} (≥ {} to merge)",
             health.manifests.count,
@@ -190,7 +178,7 @@ fn plan_manifest_rewrite(health: &TableHealth, policy: &EffectivePolicy) -> Opti
             output_files,
             snapshots_removed: 0,
         },
-        executability: Executability::blocked(MANIFEST_REWRITE_BLOCKED),
+        executability: Executability::Executable,
     })
 }
 
@@ -226,6 +214,7 @@ fn plan_expiration(
 
     Some(Operation {
         kind: OperationKind::ExpireSnapshots,
+        targets: Vec::new(),
         reason: format!(
             "oldest snapshot is {} old (> {}), {} snapshots retained (keeping at least {})",
             human_duration(oldest),
@@ -262,6 +251,7 @@ fn plan_orphan_removal(health: &TableHealth, policy: &EffectivePolicy) -> Option
 
     Some(Operation {
         kind: OperationKind::RemoveOrphans,
+        targets: Vec::new(),
         reason: format!(
             "scan {} and {action} files older than {} that no retained snapshot references",
             health.location,
@@ -412,23 +402,51 @@ mod tests {
     }
 
     #[test]
-    fn compaction_is_planned_but_reported_as_blocked() {
-        // The honesty requirement: the plan states the table's real need and is
-        // unambiguous that Bergman will not act on it yet.
+    fn compaction_is_executable_and_names_its_partitions() {
+        // The plan must carry the partitions it will rewrite, so `run` acts on
+        // what `plan` displayed rather than re-deciding against a table that
+        // has moved since.
         let health = health_with(
             vec![partition("d=1", &[10; 10], 100, 0, 0)],
             snapshots(1, Duration::from_secs(60)),
         );
         let plan = plan_table(&health, &effective(COMPACT_ON), Utc::now()).unwrap();
 
-        assert_eq!(plan.executable().count(), 0);
-        assert_eq!(plan.blocked().count(), 1);
-        match &plan.operations[0].executability {
-            Executability::Blocked { reason } => {
-                assert!(reason.contains("iceberg-rust"), "got: {reason}")
-            }
-            other => panic!("expected Blocked, got {other:?}"),
-        }
+        assert_eq!(plan.executable().count(), 1);
+        assert_eq!(plan.blocked().count(), 0);
+
+        let op = &plan.operations[0];
+        assert_eq!(op.executability, Executability::Executable);
+        assert_eq!(
+            op.targets
+                .iter()
+                .map(|k| k.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["d=1"]
+        );
+    }
+
+    #[test]
+    fn table_wide_operations_carry_no_partition_targets() {
+        // Expiration and orphan removal act on the whole table, so a target
+        // list would be a promise about granularity they do not have.
+        let policy = effective(
+            r#"
+            [[rules]]
+            match = "prod.db.t"
+            [rules.snapshots]
+            max_age = "7d"
+            min_to_keep = 1
+            [rules.orphans]
+            enabled = true
+            "#,
+        );
+        let health = health_with(
+            vec![partition("d=1", &[1000], 100, 0, 0)],
+            snapshots(10, Duration::from_secs(30 * 86400)),
+        );
+        let plan = plan_table(&health, &policy, Utc::now()).unwrap();
+        assert!(plan.operations.iter().all(|op| op.targets.is_empty()));
     }
 
     #[test]

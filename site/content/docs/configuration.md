@@ -83,9 +83,6 @@ older_than = "7d"        # hard floor of 24h
 
 ### `compaction`
 
-> [!WARNING]
-> Planned and reported, [not executed](@/docs/status.md).
-
 ```toml
 [defaults.compaction]
 enabled                    = false
@@ -103,9 +100,6 @@ min_file_size_ratio = 0.75    # what counts as "small"
 Ratios outside 0–1 are refused at startup. See [Compaction](@/docs/compaction.md).
 
 ### `manifests`
-
-> [!WARNING]
-> Planned and reported, [not executed](@/docs/status.md).
 
 ```toml
 [defaults.manifests]

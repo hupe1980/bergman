@@ -107,6 +107,13 @@ pub struct Operation {
     pub kind: OperationKind,
     /// Why it was planned: the measurement, and the threshold it crossed.
     pub reason: String,
+    /// The partitions this operation acts on, where it is partition-grained.
+    ///
+    /// Carried on the plan rather than recomputed at execution time, so that
+    /// `run` acts on exactly what `plan` displayed. Empty for table-wide
+    /// operations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<crate::health::PartitionKey>,
     /// What it is expected to change.
     pub estimate: Estimate,
     /// Whether Bergman can execute it, and if not, why not.
@@ -311,6 +318,7 @@ mod tests {
     fn blocked_operations_are_not_executable() {
         let op = Operation {
             kind: OperationKind::Compact,
+            targets: Vec::new(),
             reason: "60% small files".into(),
             estimate: Estimate::default(),
             executability: Executability::blocked("no upstream commit path"),

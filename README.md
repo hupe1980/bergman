@@ -17,7 +17,7 @@ bergman plan           # what would maintenance do?      (reads only)
 bergman run            # do it
 ```
 
-- **Concept and design:** [CONCEPT.md](CONCEPT.md)
+- **Documentation:** <https://hupe1980.github.io/bergman/>
 - **Sister project:** [Rustberg](https://github.com/hupe1980/rustberg), an
   authenticated, policy-controlled Iceberg REST catalog. The two are designed
   to pair (§10 of the concept) and each works fully without the other.
@@ -26,40 +26,38 @@ bergman run            # do it
 
 ## Status
 
-Bergman is pre-release, and the table below is the honest state rather than the
-intended one. The reason for the gaps is upstream and specific: **no
-`iceberg-rust` API removes a data file**, and the commit API is crate-private
-(`TransactionAction` and `TableCommit`'s builder are both `pub(crate)`), so no
-external crate can construct such a commit.
+Bergman is pre-release. All four maintenance operations execute.
 
-| Operation | Planned | Executed | Why |
-|---|:--:|:--:|---|
-| Table health analysis | ✅ | ✅ | Metadata-only; no data file is opened |
-| Snapshot expiration | ✅ | ✅ | Upstream `ExpireSnapshotsAction` |
-| Expiration file cleanup | ✅ | ✅ | Upstream delegates physical cleanup upward — this is that |
-| Orphan-file removal | ✅ | ✅ | On Bergman's own object-store layer; `FileIO` has no `list` |
-| Compaction | ✅ | ❌ | Blocked: [apache/iceberg-rust#2185](https://github.com/apache/iceberg-rust/pull/2185), [#2752](https://github.com/apache/iceberg-rust/pull/2752) |
-| Manifest rewrite | ✅ | ❌ | Blocked: no upstream action ([#1237](https://github.com/apache/iceberg-rust/pull/1237) closed unmerged) |
+| Operation | Executes | Built on |
+|---|:--:|---|
+| Table health analysis | ✅ | Manifest metadata only; no data file is opened |
+| Snapshot expiration | ✅ | Upstream `ExpireSnapshotsAction` |
+| Expiration file cleanup | ✅ | Bergman — upstream documents this as a higher-level responsibility |
+| Orphan-file removal | ✅ | Bergman's object-store layer — `FileIO` has no `list` |
+| Manifest rewrite | ✅ | Bergman's commit layer — no upstream action exists |
+| Compaction | ✅ | Upstream's scan + writers, Bergman's commit layer |
 
-Blocked operations are still **planned and reported**. `bergman plan` states
-the table's real need and marks the operation `BLOCKED` with the reason:
+### Why bergman owns its commit layer
 
-```
-prod.analytics.events
-  rule: prod.analytics.*
-  !! compact
-     why: partition d=2026-08-20: 412 of 480 files below 384 MiB (86% ≥ 30%)
-     reads 480 files (2.14 GiB), writes ~5 files
-     BLOCKED: compaction needs a commit that removes data files; iceberg-rust
-     0.10 has no such transaction action and its commit API is crate-private
-     (apache/iceberg-rust#2186). Planned and reported only.
-  -> expire-snapshots
-     why: oldest snapshot is 34d old (> 7d), 61 snapshots retained (keeping at least 3)
-     removes up to 58 snapshots
-```
+`iceberg::Transaction` has no action that removes a data file, and both
+`TransactionAction` and `TableCommit`'s builder are `pub(crate)` — so
+compaction and manifest rewriting cannot be expressed through it at all.
 
-A tool that silently did nothing about a need it had just reported would be
-worse than one that never looked.
+The common answer is to fork: [`nimtable/iceberg-compaction`](https://github.com/nimtable/iceberg-compaction)
+pins `risingwavelabs/iceberg-rust` at a git revision. That costs a rebase
+forever and a crate that cannot be published, since Cargo rejects git
+dependencies on crates.io.
+
+Bergman owns the one blocked layer instead. Every piece of a commit is already
+public — `ManifestWriterBuilder`, `ManifestListWriter`, `Snapshot::builder`,
+`TableUpdate`/`TableRequirement` — so bergman builds the commit with upstream's
+own writers and `POST`s it to the table endpoint itself. The bytes are the same
+ones `iceberg-catalog-rest` sends.
+
+Operations commit through a `TableCommitter` trait, not a transport, so when
+[#2185](https://github.com/apache/iceberg-rust/pull/2185) lands a second
+implementation wraps it and nothing above `src/commit` changes.
+[More →](https://hupe1980.github.io/bergman/docs/status/)
 
 ---
 
@@ -190,6 +188,18 @@ that can destroy a healthy table:
 Path comparison is normalized throughout (`s3://` vs `s3a://`, doubled slashes,
 trailing slashes), because a live file spelled differently from its metadata
 would otherwise look exactly like garbage.
+
+**A rewrite never drops a delete file another file still needs.** Compaction
+retires a delete file only when *every* data file it applies to is inside the
+group being rewritten. One shared with a file outside the group is still hiding
+rows there, and dropping it would bring them back — so the whole table is
+planned before anything is rewritten, because that question cannot be answered
+from inside the group.
+
+**Rewritten files inherit their sequence numbers.** A data file carried through
+a rewrite keeps the sequence number of the file it replaces, so delete files
+written *later* still apply to it. Stamping the new snapshot's number on it
+would make it look newer than the deletes that should remove its rows.
 
 **Commits are compare-and-swap with replan-on-conflict.** Losing to a foreground
 writer is reported as `conflicted`, not failed — it is the design working. Each

@@ -53,16 +53,15 @@
 //! # }
 //! ```
 //!
-//! ## Status
+//! ## Commits
 //!
-//! Snapshot expiration, expiration file cleanup, and orphan-file removal are
-//! implemented. Compaction and manifest rewriting are **planned but not
-//! executed**: both require committing a snapshot that *removes* files, and
-//! upstream `iceberg-rust` has no such action — `TransactionAction` is
-//! `pub(crate)` and `TableCommit`'s builder is `pub(crate)`, so no external
-//! crate can construct one. Bergman plans and reports those operations today
-//! and refuses to execute them, naming the reason, rather than pretending. See
-//! `CONCEPT.md` §13 for the tracking detail.
+//! `iceberg::Transaction` has no action that removes a data file, and its
+//! commit API is crate-private, so compaction and manifest rewriting cannot be
+//! expressed through it. Bergman builds those commits from upstream's public
+//! writers and delivers them itself — see [`commit`].
+//!
+//! Not implemented: the sort stage of compaction (output is bin-packed),
+//! z-order, and daemon mode.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -71,6 +70,7 @@
 pub mod catalog;
 #[cfg(feature = "cli")]
 pub mod cli;
+pub mod commit;
 pub mod error;
 pub mod health;
 pub mod obs;

@@ -198,12 +198,21 @@ fn lint(config: &Config, format: Format) -> Result<()> {
             })
         ),
         Format::Text => println!(
-            "ok: {} catalogs, {} rules",
-            config.catalogs.len(),
-            patterns.len()
+            "ok: {}, {}",
+            plural(config.catalogs.len(), "catalog"),
+            plural(patterns.len(), "rule")
         ),
     }
     Ok(())
+}
+
+/// `1 catalog`, `2 catalogs`.
+fn plural(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("{n} {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
 }
 
 /// Parse `catalog.namespace…​.table`.
@@ -268,6 +277,13 @@ mod tests {
         assert!(Cli::try_parse_from(["bergman", "run", "--dry-run"]).is_ok());
         assert!(Cli::try_parse_from(["bergman", "policy", "lint"]).is_ok());
         assert!(Cli::try_parse_from(["bergman", "policy", "explain", "prod.db.t"]).is_ok());
+    }
+
+    #[test]
+    fn counts_read_as_english() {
+        assert_eq!(plural(1, "catalog"), "1 catalog");
+        assert_eq!(plural(0, "rule"), "0 rules");
+        assert_eq!(plural(3, "rule"), "3 rules");
     }
 
     #[test]

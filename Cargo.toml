@@ -85,6 +85,17 @@ opendal = { version = "0.57", default-features = false, features = [
     "services-fs",
 ] }
 
+# The commit layer talks the Iceberg REST protocol directly (see `src/commit`),
+# so it needs its own HTTP client rather than reaching through a catalog client
+# that cannot express the commit. rustls only: a native-tls dependency would
+# make the static musl build stop being static.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+
+# Parquet writer properties. Bergman does not encode Parquet itself — the
+# iceberg writer does — but it must express the table's own compression codec,
+# and that vocabulary is parquet's. Version-matched to what iceberg 0.10 uses.
+parquet = "58"
+
 # Serialization. Configuration is TOML, matching the sister project Rustberg;
 # audit records and `--format json` are JSON.
 serde = { version = "1", features = ["derive"] }

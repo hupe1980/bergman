@@ -9,6 +9,7 @@ use iceberg::Catalog;
 use uuid::Uuid;
 
 use crate::catalog::CatalogConfig;
+use crate::commit::TableCommitter;
 use crate::error::{Error, Result};
 use crate::health::TableHealth;
 use crate::obs::{MaintenanceObserver, NoopObserver};
@@ -34,6 +35,9 @@ pub struct Bergman {
 struct ConnectedCatalog {
     config: CatalogConfig,
     client: Arc<dyn Catalog>,
+    /// Bergman's own commit path, for the operations `iceberg::Transaction`
+    /// cannot express (see [`crate::commit`]).
+    committer: Arc<dyn TableCommitter>,
 }
 
 /// Builder for [`Bergman`].
@@ -86,9 +90,11 @@ impl BergmanBuilder {
         let mut catalogs = Vec::with_capacity(self.config.catalogs.len());
         for config in &self.config.catalogs {
             let client = config.connect().await?;
+            let committer = config.committer().await?;
             catalogs.push(ConnectedCatalog {
                 config: config.clone(),
                 client,
+                committer,
             });
         }
 
@@ -332,7 +338,13 @@ impl Bergman {
             }
 
             let result = self
-                .execute(catalog, &table, table_plan, operation.kind)
+                .execute(
+                    catalog,
+                    &table,
+                    table_plan,
+                    operation.kind,
+                    &operation.targets,
+                )
                 .await
                 .unwrap_or_else(|e| match e {
                     Error::Refused { reason, .. } => OperationResult::Refused { reason },
@@ -365,6 +377,7 @@ impl Bergman {
         table: &iceberg::table::Table,
         table_plan: &TablePlan,
         kind: OperationKind,
+        targets: &[crate::health::PartitionKey],
     ) -> Result<OperationResult> {
         let now = Utc::now();
         match kind {
@@ -392,11 +405,30 @@ impl Bergman {
                 )
                 .await
             }
-            // Reached only if a planner starts marking these executable; the
-            // plan marks them blocked and `run_table` short-circuits above.
-            OperationKind::Compact | OperationKind::RewriteManifests => Err(Error::Unsupported(
-                format!("{kind} has no commit path in this build"),
-            )),
+            OperationKind::RewriteManifests => {
+                crate::ops::manifests::run(
+                    &table_plan.table,
+                    table,
+                    &crate::catalog::to_table_ident(&table_plan.table)?,
+                    catalog.committer.as_ref(),
+                    &table_plan.policy.manifests,
+                )
+                .await
+            }
+            OperationKind::Compact => {
+                crate::ops::compact::run(
+                    &table_plan.table,
+                    table,
+                    &crate::catalog::to_table_ident(&table_plan.table)?,
+                    catalog.committer.as_ref(),
+                    &table_plan.policy.compaction,
+                    // Exactly the partitions the plan named, so `run` rewrites
+                    // what `plan` displayed rather than re-deciding.
+                    targets,
+                    self.observer.as_ref(),
+                )
+                .await
+            }
         }
     }
 

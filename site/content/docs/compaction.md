@@ -1,14 +1,16 @@
 +++
 title = "Compaction"
-description = "What triggers a rewrite, why triggers beat schedules, and why Bergman plans compaction it cannot yet execute."
+description = "What triggers a rewrite, how delete files are retired, and what Bergman refuses to rewrite."
 weight = 8
 +++
-> [!WARNING]
-> Compaction is **planned and reported but not executed**. Committing a rewrite
-> means removing data files, and `iceberg-rust` has no transaction action that
-> does. See [Status](@/docs/status.md#why-compaction-does-not-execute) for the
-> detail. Everything on this page about *measurement and triggering* works
-> today; only the commit is missing.
+Compaction rewrites a partition's small files into larger ones, with its delete
+files applied — so the rows that survive are written back plainly and the delete
+files that hid the rest are retired.
+
+Committing that means committing a snapshot which *removes* data files, and
+`iceberg-rust` has no transaction action for it. Bergman
+[owns that layer](@/docs/status.md#why-bergman-owns-its-commit-layer) rather
+than forking, which is what the rest of the market did.
 
 ## Triggers, not schedules {#triggers}
 
@@ -83,36 +85,64 @@ the half it is not solving is the one that makes Spark run out of memory.
 ```text
 prod.streaming.events_raw
   rule: prod.streaming.events_*
-  !! compact
+  -> compact
      why: 3 partitions; e.g. d=2026-08-20: 1204 of 5230 rows deleted (23% ≥ 10%) across 12 delete files
      reads 92 files (8.11 GiB), writes ~17 files
-     BLOCKED: compaction needs a commit that removes data files; …
 ```
+
+The plan carries the exact partitions it will rewrite, so `run` acts on what
+`plan` displayed rather than re-deciding against a table that has moved since.
 
 The output-file estimate accounts for the delete ratio — rows removed by deletes
 do not appear in the output — and is labelled an estimate, because the exact
 figure is not knowable without reading the data.
 
-## Seeing the problem without fixing it
+## The delete-file rule
 
-Until the commit path lands upstream, `inspect` and `plan` are still the fastest
-way to find out how bad the problem is and where:
+This is the part that loses data when it is wrong, and nothing fails visibly
+when it is.
 
-```bash
-bergman inspect --format json \
-  | jq -r '.[] | select(.files.data_file_count > 100)
-           | "\(.table) \(.files.data_file_count) files, avg \(.files.data_bytes / .files.data_file_count | floor)"'
+A rewrite may retire a delete file **only if every data file that delete file
+applies to is inside the group being rewritten**. One shared with a file outside
+the group is still hiding rows there, and dropping it brings them back.
+
+Bergman therefore plans the *whole table* before rewriting anything: the
+question "does this delete file apply anywhere else?" cannot be answered from
+inside the group. A delete file exclusive to the group is retired; a shared one
+stays, and the data files it applies to inside the group remain correct because
+it stayed.
+
+```text
+  [ok] compact: 3 partitions: 92 files (8.11 GiB) rewritten into 17 (7.94 GiB),
+       12 delete files retired
 ```
 
-and then fix it with the engine you already have:
+## Sequence numbers
 
-```sql
-CALL prod.system.rewrite_data_files(table => 'analytics.events');
-```
+A data file carried through a rewrite untouched keeps the sequence number of the
+file it replaces. Stamping the new snapshot's number on it would make it look
+*newer* than the delete files that should remove its rows — which resurrects
+deleted rows.
 
-The measurement is the part Bergman does better than a query engine — it is
-metadata-only, it is partition-grained, and it costs nothing to run against your
-whole catalog.
+Newly written files genuinely belong to the new snapshot and take its number.
+The distinction is the difference between a correct rewrite and a silent
+correctness bug, and it is why the commit layer uses `add_existing_file` for
+survivors and `add_file` for replacements.
+
+## What is refused
+
+Bergman declines rather than guessing:
+
+- **A partition holding files under two partition specs.** Rewriting them
+  together would write output under the *current* spec while claiming to replace
+  files partitioned differently, which silently mis-files rows.
+- **A table whose `write.format.default` is not Parquet.** Bergman reads
+  Parquet, Avro and ORC but writes only Parquet, and a rewrite must not
+  silently change a table's format.
+
+Both are reported with the reason, per partition, and the rest of the table is
+still compacted — each partition commits on its own, so partial progress is real
+progress.
 
 ## Sort-based clustering
 
@@ -121,7 +151,7 @@ whole catalog.
 sort = ["event_date", "customer_id"]
 ```
 
-Accepted, validated, and reported in plans. It rides on the same blocked commit
-path, so it does not execute either. Z-ordering is not implemented at all: it is
-an optimization rather than table health, and it comes after bin-packing and
-sorting are proven.
+Accepted, validated and reported in plans, but **output is bin-packed rather
+than sorted** — the sort stage is not implemented yet. Z-ordering is not
+implemented at all: it is an optimization rather than table health, and it comes
+after bin-packing and sorting are proven.
