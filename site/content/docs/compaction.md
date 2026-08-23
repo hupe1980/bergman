@@ -308,18 +308,27 @@ fragmented table as healthy.
 
 ## Format v3 {#format-v3}
 
-Bergman rewrites v1 and v2 tables. A **v3** table is refused, with a reason.
+Bergman rewrites v1 and v2 tables. A **v3** table is refused, with a reason —
+and the reason is a gap, not an impossibility.
 
-v3 introduces row lineage: every row carries a `_row_id` and a
-`_last_updated_sequence_number`, a snapshot must declare the `first-row-id` it
-starts from and how many rows it added, and each manifest carries the base its
-entries count from. Three things follow, and each on its own is disqualifying:
+Compaction of a v3 table is perfectly possible while spec-compliant. The spec
+says how: when a row moves to a different data file, its existing `_row_id`
+"must be copied into the new data file", and its `_last_updated_sequence_number`
+with it if the row was not modified. Iceberg's Java implementation does this —
+Spark since 1.10.0 ([#13555](https://github.com/apache/iceberg/pull/13555)),
+Flink since [#14149](https://github.com/apache/iceberg/pull/14149).
 
-1. A rewrite must carry every row's existing `_row_id` through to the file
-   replacing it. Upstream's reader does not project the field and its
-   `RollingFileWriter` will not accept it, so a rewrite would **renumber every
-   row it touched** — and a `MERGE` or a CDC consumer joining on row id would
-   then match the wrong rows, with nothing failing.
+What Bergman lacks is the capability. `iceberg-rust`'s reader does not project
+`_row_id`, and its `RollingFileWriter` will not accept it, so there is nothing
+to copy from and nowhere to copy it to. That is upstream work; until it lands,
+the question is only what Bergman does in the meantime.
+
+It refuses, because the alternative fails silently. Three things go wrong:
+
+1. Without the projection, output files carry no `_row_id`, so readers fall
+   back to inheritance — `first_row_id + _pos` of the *new* file. Every row the
+   rewrite touched is **renumbered**, and a `MERGE` or a CDC consumer joining on
+   row id starts matching the wrong rows, with nothing failing.
 2. A manifest holding *existing* files, written fresh, has no `first-row-id` of
    its own, so the manifest-list writer assigns it a new range — moving files
    that were never rewritten to row ids they never had.

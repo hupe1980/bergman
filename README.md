@@ -40,14 +40,13 @@ Bergman is pre-release. All four maintenance operations execute.
 | Dangling delete-file removal | ✅ | Bergman's commit layer — nothing else ever cleans these up |
 
 Format **v1 and v2** tables are rewritten. A **v3** table's data-plane
-operations are refused with a named reason: preserving row lineage through a
-rewrite needs `_row_id` projected out of the scan and written back, which
-upstream's reader and writer do not yet offer — so a rewrite would renumber
-every row it touched. The snapshot would also be invalid: the spec makes
-`first-row-id` a *required* field of a v3 snapshot. Snapshot expiration and
-orphan removal still run, so a v3 table's history stays bounded and its storage
-still gets reclaimed. The refusal appears in `bergman plan`, not only in a log
-line.
+operations are refused with a named reason — a **gap, not an impossibility**.
+The spec requires a rewrite to copy each row's `_row_id` into the file replacing
+it, and Iceberg's Java implementation does exactly that (Spark since 1.10.0).
+`iceberg-rust` does not yet expose the field to project or to write, so Bergman
+would renumber every row it touched. Snapshot expiration and orphan removal
+still run, so a v3 table's history stays bounded and its storage still gets
+reclaimed. The refusal appears in `bergman plan`, not only in a log line.
 
 ### Why bergman owns its commit layer
 
