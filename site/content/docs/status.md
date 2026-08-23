@@ -83,5 +83,3 @@ there:
   Parquet, and refuses a table whose `write.format.default` is something else.
 - **Event triggers.** The daemon follows the schedules rules declare; it does
   not yet react to catalog commit events.
-- **A metrics endpoint.** Metrics reach a `MaintenanceObserver`; nothing serves
-  them over HTTP.

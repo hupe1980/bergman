@@ -56,6 +56,9 @@ storage-gcs = ["iceberg-storage-opendal/opendal-gcs", "opendal/services-gcs"]
 storage-azure = ["iceberg-storage-opendal/opendal-azdls", "opendal/services-azdls"]
 storage-all = ["storage-s3", "storage-gcs", "storage-azure"]
 
+# Prometheus metrics, and the endpoint that serves them in daemon mode.
+metrics = ["dep:prometheus-client", "dep:axum"]
+
 [[bin]]
 name = "bergman"
 path = "src/main.rs"
@@ -140,6 +143,16 @@ cron = "0.15"
 # subscriber; the binary does that.
 tracing = "0.1"
 
+# Metrics (optional)
+prometheus-client = { version = "0.24", optional = true }
+# Serves `/metrics` and `/health` in daemon mode. `http1` and `tokio` only —
+# no routing extras, no JSON, no tracing layer, because two handlers need none
+# of it.
+axum = { version = "0.8", default-features = false, features = [
+    "http1",
+    "tokio",
+], optional = true }
+
 # CLI (optional)
 clap = { version = "4", features = ["derive", "env"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
@@ -150,6 +163,8 @@ humantime = { version = "2", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+# Drives the metrics router in-process, so the endpoint tests need no socket.
+tower = { version = "0.5", default-features = false, features = ["util"] }
 tempfile = "3"
 # The end-to-end tests build a real Iceberg table on the local filesystem and
 # read it back, which needs the same writer and Arrow stack the library uses.

@@ -11,8 +11,16 @@
 //! the binary is what turns those into stdout, a file, or Prometheus.
 
 mod audit;
+#[cfg(feature = "metrics")]
+mod metrics;
+#[cfg(feature = "metrics")]
+mod serve;
 
 pub use audit::{AuditObserver, AuditRecord, AuditSink, JsonlSink, NullSink};
+#[cfg(feature = "metrics")]
+pub use metrics::{Metrics, OperationLabels};
+#[cfg(feature = "metrics")]
+pub use serve::{router, serve};
 
 use std::sync::Arc;
 

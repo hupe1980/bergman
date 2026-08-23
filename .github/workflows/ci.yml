@@ -58,7 +58,7 @@ jobs:
       # failure appears in this build and nowhere else.
       - name: Each feature alone
         run: |
-          for feature in cli catalog-rest storage-s3 storage-gcs storage-azure; do
+          for feature in cli catalog-rest storage-s3 storage-gcs storage-azure metrics; do
             echo "::group::$feature"
             cargo check --no-default-features --features "$feature"
             echo "::endgroup::"

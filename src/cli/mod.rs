@@ -94,6 +94,11 @@ enum Command {
         /// Stop after this many cycles.
         #[arg(long)]
         max_cycles: Option<u64>,
+
+        /// Serve `/metrics` and `/health` on this address.
+        #[cfg(feature = "metrics")]
+        #[arg(long, env = "BERGMAN_METRICS_ADDR")]
+        metrics_addr: Option<std::net::SocketAddr>,
     },
 
     /// Policy inspection.
@@ -133,6 +138,17 @@ pub async fn main() -> Result<()> {
     let mut observers = Observers::new();
     if let Some(path) = &cli.audit_log {
         observers = observers.with(Arc::new(AuditObserver::new(JsonlSink::open(path)?)));
+    }
+
+    // Always recorded, even without an endpoint to scrape them from: the cost
+    // is a few counters, and a `--metrics-addr` added later then has history
+    // from the moment it is enabled rather than from the next restart.
+    #[cfg(feature = "metrics")]
+    let metrics = Arc::new(crate::obs::Metrics::new());
+    #[cfg(feature = "metrics")]
+    {
+        observers =
+            observers.with(Arc::clone(&metrics) as Arc<dyn crate::obs::MaintenanceObserver>);
     }
 
     let bergman = Bergman::builder(config)
@@ -176,6 +192,8 @@ pub async fn main() -> Result<()> {
         Command::Daemon {
             interval,
             max_cycles,
+            #[cfg(feature = "metrics")]
+            metrics_addr,
         } => {
             let daemon = crate::sched::Daemon::new(
                 Arc::new(bergman),
@@ -184,6 +202,19 @@ pub async fn main() -> Result<()> {
                     max_cycles,
                 },
             )?;
+
+            // Served on the same runtime as the cycles, and stopped by the same
+            // signal. A metrics endpoint that outlived the work it describes
+            // would keep a pod "ready" after it stopped maintaining anything.
+            #[cfg(feature = "metrics")]
+            let metrics_server = metrics_addr.map(|addr| {
+                let metrics = Arc::clone(&metrics);
+                tokio::spawn(async move {
+                    if let Err(e) = crate::obs::serve(addr, metrics, shutdown_signal()).await {
+                        eprintln!("bergman: {e}");
+                    }
+                })
+            });
 
             let format = cli.format;
             let completed = daemon
@@ -217,6 +248,11 @@ pub async fn main() -> Result<()> {
                     shutdown_signal(),
                 )
                 .await?;
+
+            #[cfg(feature = "metrics")]
+            if let Some(server) = metrics_server {
+                server.abort();
+            }
 
             tracing::info!(cycles = completed, "shutting down");
             Ok(())

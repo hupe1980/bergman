@@ -286,6 +286,7 @@ cron job does not look healthy.
 | `cli` | ✅ | The binary, terminal rendering, logging setup |
 | `catalog-rest` | ✅ | Iceberg REST catalog client |
 | `storage-s3` / `-gcs` / `-azure` | ✅ via `storage-all` | Cloud object stores |
+| `metrics` | — | Prometheus metrics and the `/metrics` endpoint |
 
 Local filesystem and in-memory storage are always available, which is what keeps
 the test suite free of containers. Embedders take `default-features = false`.

@@ -75,7 +75,7 @@ fmt:
 check-all:
     cargo check --no-default-features
     cargo check --all-features
-    @for feature in cli catalog-rest storage-s3 storage-gcs storage-azure; do \
+    @for feature in cli catalog-rest storage-s3 storage-gcs storage-azure metrics; do \
         echo "--- checking feature: $feature (alone) ---"; \
         cargo check --no-default-features --features "$feature" || exit 1; \
     done

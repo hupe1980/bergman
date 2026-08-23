@@ -81,6 +81,17 @@ match    = "prod.archive.**"
 schedule = "0 3 * * *"         # this one does not push it back out
 ```
 
+```yaml
+# As a Deployment rather than a CronJob, when you want the metrics endpoint.
+containers:
+  - name: bergman
+    args: ["daemon", "--interval", "1h", "--metrics-addr", "0.0.0.0:9090"]
+    ports:
+      - { name: metrics, containerPort: 9090 }
+    livenessProbe:
+      httpGet: { path: /health, port: metrics }
+```
+
 With a `maintenance_window` set, the daemon sleeps to the window's edge rather
 than waking every interval to find it shut — a daemon that logged "outside the
 window" sixty times a night is a daemon whose logs nobody reads.
@@ -224,6 +235,46 @@ BERGMAN_LOG=info bergman run
 BERGMAN_LOG=bergman::ops=debug bergman run   # per-module filtering
 ```
 
-For metrics today, parse `--format json` output or implement a
-[`MaintenanceObserver`](@/docs/library.md#observers). A Prometheus endpoint
-arrives with daemon mode.
+## Metrics
+
+Built with the `metrics` feature and served by the daemon:
+
+```bash
+bergman daemon --metrics-addr 0.0.0.0:9090
+```
+
+| Metric | Labels | What it is |
+|---|---|---|
+| `bergman_operations` | table, operation, outcome | Operations, counted by how they ended |
+| `bergman_operation_duration_seconds` | table, operation, outcome | How long each took |
+| `bergman_files_deleted` | table, operation | Files a deletion was announced for |
+
+`outcome` is `succeeded`, `no-op`, `blocked`, `refused`, `conflicted` or
+`failed`. The distinctions matter for alerting: a `no-op` is a healthy table, a
+`conflicted` is maintenance yielding to a writer as designed, and only `failed`
+and `refused` need anyone's attention.
+
+```promql
+# Something needs looking at.
+sum by (table) (rate(bergman_operations{outcome=~"failed|refused"}[1h])) > 0
+
+# Losing to writers repeatedly — the window is probably wrong.
+sum by (table) (rate(bergman_operations{outcome="conflicted"}[6h])) > 0.5
+```
+
+> [!NOTE]
+> The policy rule is deliberately **not** a label. Rule patterns are
+> low-cardinality today and unbounded tomorrow, and a label that grows without
+> limit takes a Prometheus server down. The rule is in the audit trail, where
+> unbounded values are fine.
+
+Metrics are recorded whether or not an endpoint serves them, so adding
+`--metrics-addr` later gives you history from that moment rather than from the
+next restart.
+
+`/health` reports **liveness, not readiness** — that the process is up. Whether
+the catalog is reachable is not answered there: a probe failing during a brief
+catalog outage would have Kubernetes restart a process that is working perfectly,
+and restarting would not help.
+
+For anything else, implement a [`MaintenanceObserver`](@/docs/library.md#observers).
