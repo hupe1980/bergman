@@ -63,9 +63,10 @@ use crate::error::Result;
 /// 2. A manifest holding *existing* files, written fresh, has no `first-row-id`
 ///    of its own, so `ManifestListWriter` assigns it a new range — moving files
 ///    that were never rewritten to row ids they never had.
-/// 3. `iceberg-rust`'s `TableMetadataBuilder::add_snapshot` rejects a v3
-///    snapshot carrying no `first-row-id` outright, so such a commit does not
-///    merely risk being wrong — it does not apply at all.
+/// 3. The snapshot would be invalid, not merely wrong: the spec lists
+///    `first-row-id` and `added-rows` as *required* fields of a v3 snapshot.
+///    `iceberg-rust` enforces that, so the commit is refused outright by any
+///    catalog applying updates through it.
 ///
 /// Operations that do not go through Bergman's snapshot producer — expiration,
 /// which is upstream's own action, and orphan removal, which commits nothing —

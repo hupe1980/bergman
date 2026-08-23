@@ -42,11 +42,12 @@ Bergman is pre-release. All four maintenance operations execute.
 Format **v1 and v2** tables are rewritten. A **v3** table's data-plane
 operations are refused with a named reason: preserving row lineage through a
 rewrite needs `_row_id` projected out of the scan and written back, which
-upstream's reader and writer do not yet offer — and `iceberg-rust` rejects a v3
-snapshot carrying no `first-row-id` outright, so such a commit does not apply at
-all. Snapshot expiration and orphan removal still run, so a v3 table's history
-stays bounded and its storage still gets reclaimed. The refusal appears in
-`bergman plan`, not only in a log line.
+upstream's reader and writer do not yet offer — so a rewrite would renumber
+every row it touched. The snapshot would also be invalid: the spec makes
+`first-row-id` a *required* field of a v3 snapshot. Snapshot expiration and
+orphan removal still run, so a v3 table's history stays bounded and its storage
+still gets reclaimed. The refusal appears in `bergman plan`, not only in a log
+line.
 
 ### Why bergman owns its commit layer
 
