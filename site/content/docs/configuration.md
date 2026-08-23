@@ -121,9 +121,14 @@ match    = "prod.streaming.**"
 schedule = "0 */2 * * *"
 ```
 
-Governs when evaluation runs, not whether anything executes. Both the five-field
-crontab form everyone writes and the six-field form with seconds are accepted;
-a five-field expression means "at second zero".
+Governs when evaluation runs, not whether anything executes — the health
+analyzer decides that. Both the five-field crontab form everyone writes and the
+six-field form with seconds are accepted; a five-field expression means "at
+second zero".
+
+Read by [`bergman daemon`](@/docs/operating.md#as-a-daemon), which wakes at the
+earliest schedule any rule declares. Under `bergman run` the whole cycle is
+driven by whatever scheduler invoked it, so `schedule` is inert.
 
 ### `skip`
 

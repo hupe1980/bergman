@@ -81,6 +81,21 @@ enum Command {
         dry_run: bool,
     },
 
+    /// Run maintenance repeatedly until stopped.
+    ///
+    /// One cycle and exit (`run`) is the right shape for cron, and most
+    /// deployments should use it. The daemon is for a long-lived process that
+    /// follows the schedules rules declare.
+    Daemon {
+        /// How often to run for tables whose rule declares no `schedule`.
+        #[arg(long, default_value = "1h", value_parser = parse_duration)]
+        interval: std::time::Duration,
+
+        /// Stop after this many cycles.
+        #[arg(long)]
+        max_cycles: Option<u64>,
+    },
+
     /// Policy inspection.
     #[command(subcommand)]
     Policy(PolicyCommand),
@@ -158,6 +173,55 @@ pub async fn main() -> Result<()> {
             Ok(())
         }
 
+        Command::Daemon {
+            interval,
+            max_cycles,
+        } => {
+            let daemon = crate::sched::Daemon::new(
+                Arc::new(bergman),
+                crate::sched::DaemonConfig {
+                    interval,
+                    max_cycles,
+                },
+            )?;
+
+            let format = cli.format;
+            let completed = daemon
+                .run(
+                    |cycle| match cycle.outcome {
+                        Ok(report) => {
+                            // Rendered as it happens rather than accumulated:
+                            // a daemon whose output only appears at shutdown is
+                            // a daemon nobody can watch.
+                            if let Err(e) = render::report(&report, format) {
+                                eprintln!("bergman: {e}");
+                            }
+                            tracing::info!(
+                                cycle = cycle.number,
+                                trigger = %cycle.trigger,
+                                "cycle finished"
+                            );
+                        }
+                        Err(e) => {
+                            // One failed cycle does not stop the daemon: the
+                            // catalog may simply have been unreachable, and the
+                            // next cycle is the retry.
+                            tracing::error!(
+                                cycle = cycle.number,
+                                trigger = %cycle.trigger,
+                                error = %e,
+                                "cycle failed"
+                            );
+                        }
+                    },
+                    shutdown_signal(),
+                )
+                .await?;
+
+            tracing::info!(cycles = completed, "shutting down");
+            Ok(())
+        }
+
         Command::Policy(PolicyCommand::Explain { table }) => {
             let table = parse_table_ref(&table)?;
             let decision = bergman.explain(&table).await?;
@@ -203,6 +267,40 @@ fn lint(config: &Config, format: Format) -> Result<()> {
         ),
     }
     Ok(())
+}
+
+/// Resolve when the process is asked to stop.
+///
+/// A daemon that ignored `SIGTERM` would be killed mid-cycle by every
+/// orchestrator on earth. Bergman survives that — a killed run leaves only
+/// unreferenced files — but finishing the cycle in hand is tidier, and it is
+/// what a container runtime's grace period is for.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(term) => term,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot listen for SIGTERM; Ctrl-C only");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Parse `30s`, `5m`, `1h`.
+fn parse_duration(raw: &str) -> std::result::Result<std::time::Duration, String> {
+    humantime::parse_duration(raw).map_err(|e| format!("{raw:?} is not a duration: {e}"))
 }
 
 /// `1 catalog`, `2 catalogs`.
@@ -275,7 +373,28 @@ mod tests {
         assert!(Cli::try_parse_from(["bergman", "plan", "--format", "json"]).is_ok());
         assert!(Cli::try_parse_from(["bergman", "run", "--dry-run"]).is_ok());
         assert!(Cli::try_parse_from(["bergman", "policy", "lint"]).is_ok());
+        assert!(Cli::try_parse_from(["bergman", "daemon"]).is_ok());
+        assert!(Cli::try_parse_from(["bergman", "daemon", "--interval", "15m"]).is_ok());
         assert!(Cli::try_parse_from(["bergman", "policy", "explain", "prod.db.t"]).is_ok());
+    }
+
+    #[test]
+    fn daemon_intervals_are_written_the_way_everything_else_is() {
+        // The same spellings policy durations use, so `1h` means one thing
+        // across the whole tool.
+        assert_eq!(
+            parse_duration("30s").unwrap(),
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(
+            parse_duration("5m").unwrap(),
+            std::time::Duration::from_secs(300)
+        );
+        assert_eq!(
+            parse_duration("1h").unwrap(),
+            std::time::Duration::from_secs(3600)
+        );
+        assert!(parse_duration("soon").is_err());
     }
 
     #[test]

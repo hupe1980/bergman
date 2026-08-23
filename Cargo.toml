@@ -28,7 +28,16 @@ default = ["cli", "catalog-rest", "storage-all"]
 # Command-line interface. Gates the binary (see `[[bin]]`), the terminal
 # rendering, and process-level concerns the library deliberately does not own:
 # logging initialization, config file discovery, exit codes.
-cli = ["dep:clap", "dep:tracing-subscriber", "dep:comfy-table"]
+# `tokio/signal` belongs here rather than in the base dependency: only the
+# daemon listens for SIGTERM, and a library that installed a signal handler
+# would be taking over its host's process.
+cli = [
+    "dep:clap",
+    "dep:tracing-subscriber",
+    "dep:comfy-table",
+    "dep:humantime",
+    "tokio/signal",
+]
 
 # Iceberg REST catalog client. The only catalog protocol that reaches every
 # implementation Bergman targets (Rustberg, Polaris, Lakekeeper, Nessie, Unity).
@@ -130,6 +139,9 @@ tracing = "0.1"
 clap = { version = "4", features = ["derive", "env"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
 comfy-table = { version = "7", optional = true }
+# Parses `--interval 15m`. The policy file already speaks this vocabulary
+# through `humantime-serde`, so the CLI should too.
+humantime = { version = "2", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

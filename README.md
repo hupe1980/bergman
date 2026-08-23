@@ -267,6 +267,7 @@ impl MaintenanceObserver for RequireSignoff {
 | `bergman plan` | no | The operations maintenance would perform, and why |
 | `bergman run` | **yes** | Executes the plan |
 | `bergman run --dry-run` | no | Identical to `plan` |
+| `bergman daemon` | **yes** | Runs cycles on the schedules rules declare |
 | `bergman policy lint` | no | Validates config offline — for CI |
 | `bergman policy explain <table>` | no | Effective policy with per-value provenance |
 | `bergman policy match` | no | Which tables each rule matches |

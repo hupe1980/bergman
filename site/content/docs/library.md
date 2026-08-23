@@ -164,6 +164,32 @@ should not have to.
 `iceberg-compaction` the same way; Bergman offers the full operation set —
 expiration, cleanup, orphans — rather than compaction alone.
 
+## Running on a schedule
+
+`Daemon` wraps the same engine and calls back after each cycle. It has no
+opinion about output — returning the report rather than logging it is what keeps
+that true.
+
+```rust
+use bergman::sched::{Daemon, DaemonConfig};
+
+let daemon = Daemon::new(Arc::new(bergman), DaemonConfig {
+    interval: Duration::from_secs(3600),
+    max_cycles: None,
+})?;
+
+daemon
+    .run(
+        |cycle| tracing::info!(n = cycle.number, trigger = %cycle.trigger, "cycle done"),
+        shutdown_signal(),
+    )
+    .await?;
+```
+
+`shutdown` is any future; the loop checks it before each sleep and prefers it
+over a ready timer, so a stop is noticed promptly rather than after several
+cycles.
+
 ## Errors
 
 One error type, and the most useful thing on it is what to *do*:

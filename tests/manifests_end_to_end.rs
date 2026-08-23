@@ -7,7 +7,7 @@
 
 mod common;
 
-use bergman::obs::{NoopObserver, OperationContext};
+use bergman::obs::OperationContext;
 use bergman::ops::manifests;
 use bergman::plan::{OperationKind, OperationResult};
 use bergman::policy::{Config, Decision, Policy, TableRef};

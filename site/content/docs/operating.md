@@ -56,6 +56,45 @@ spec:
 are compare-and-swap and the loser replans — but they waste work competing with
 each other.
 
+## As a daemon
+
+One cycle and exit is the right shape for most deployments. The daemon is for a
+long-lived process that follows the schedules your rules declare:
+
+```bash
+bergman daemon --interval 1h
+```
+
+It sleeps until the **earliest** trigger fires — the interval, or the soonest
+rule `schedule` — because a cycle evaluates every table anyway and the health
+analyzer is what decides whether a given one has work. Waking more often than
+the busiest rule asks for would be waste; waking less often would silently
+stretch that rule's cadence.
+
+```toml
+[[rules]]
+match    = "prod.streaming.**"
+schedule = "*/15 * * * *"      # this rule pulls the daemon to 15 minutes
+
+[[rules]]
+match    = "prod.archive.**"
+schedule = "0 3 * * *"         # this one does not push it back out
+```
+
+`SIGTERM` and Ctrl-C stop it after the cycle in hand. A cycle killed outright is
+safe too — it leaves only files nothing references, which the orphan scanner
+reclaims — but finishing is tidier, and it is what a container runtime's grace
+period is for.
+
+A failed cycle does not stop the daemon: the catalog may simply have been
+unreachable, and the next cycle is the retry. Failures are logged with the
+trigger that fired.
+
+> [!NOTE]
+> Prefer `run` under a scheduler you already operate. A `CronJob` gives you
+> retries, history, alerting and resource limits that the daemon does not
+> reimplement.
+
 ## Exit codes
 
 | Code | Meaning |

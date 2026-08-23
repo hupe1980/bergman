@@ -77,6 +77,7 @@ pub mod obs;
 pub mod ops;
 pub mod plan;
 pub mod policy;
+pub mod sched;
 pub mod util;
 
 mod engine;

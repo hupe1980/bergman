@@ -81,5 +81,7 @@ there:
   current spec, which would mis-file rows.
 - **Non-Parquet writes.** Bergman reads Parquet, Avro and ORC but writes only
   Parquet, and refuses a table whose `write.format.default` is something else.
-- **Daemon mode.** `run` executes one cycle and exits. Cron triggers, event
-  triggers and a Prometheus endpoint are not shipped.
+- **Event triggers.** The daemon follows the schedules rules declare; it does
+  not yet react to catalog commit events.
+- **A metrics endpoint.** Metrics reach a `MaintenanceObserver`; nothing serves
+  them over HTTP.

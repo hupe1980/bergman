@@ -294,6 +294,19 @@ impl Policy {
         )))
     }
 
+    /// The cron expressions rules declare, with the pattern that declared each.
+    ///
+    /// A rule's `schedule` governs when its tables are *evaluated*; whether
+    /// anything executes is the health analyzer's decision.
+    pub fn schedules(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.rules.iter().filter_map(|rule| {
+            rule.settings
+                .schedule
+                .as_deref()
+                .map(|schedule| (rule.pattern.as_str(), schedule))
+        })
+    }
+
     /// The patterns this policy carries, in evaluation order.
     pub fn patterns(&self) -> impl Iterator<Item = &str> {
         self.rules.iter().map(|r| r.pattern.as_str())
