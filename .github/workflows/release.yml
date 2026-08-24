@@ -37,6 +37,9 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
 
+      # The build images are pinned in `Cross.toml`, not taken from cross's
+      # defaults: its last release still ships an Ubuntu 18.04 image for
+      # aarch64, too old to run the host binaries a current Rust emits.
       - uses: taiki-e/install-action@cross
         if: matrix.cross
 
