@@ -114,9 +114,7 @@ pub fn next_open(window: &MaintenanceWindow, now: DateTime<Utc>) -> DateTime<Utc
         let Some(date) = today.checked_add_signed(chrono::Duration::days(days)) else {
             break;
         };
-        let Some(naive) = date.and_time(window.start).into() else {
-            continue;
-        };
+        let naive = date.and_time(window.start);
         // A local time can be ambiguous or non-existent across a DST boundary.
         // `latest()` picks a real instant in both cases rather than failing, so
         // a clock change costs at most an hour of window rather than a panic.

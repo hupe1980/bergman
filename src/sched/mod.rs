@@ -68,7 +68,7 @@ pub struct Daemon {
 impl Daemon {
     /// Build a daemon around a configured engine.
     pub fn new(bergman: Arc<Bergman>, config: DaemonConfig) -> Result<Self> {
-        let triggers = TriggerSet::from_policy(bergman.policy(), config.interval)?;
+        let triggers = TriggerSet::from_policy(bergman.policy())?;
         Ok(Self {
             bergman,
             config,
@@ -77,8 +77,18 @@ impl Daemon {
     }
 
     /// The next moment any trigger fires, and which one.
-    pub fn next_wakeup(&self, now: chrono::DateTime<chrono::Utc>) -> (Duration, Trigger) {
-        self.triggers.next_after(now)
+    ///
+    /// `interval_due` is when the daemon's own interval next comes round — an
+    /// absolute moment the caller carries across wake-ups rather than a fresh
+    /// `now + interval`. See [`TriggerSet::next_after`] for why that difference
+    /// is the difference between a periodic sweep that happens and one that
+    /// never does.
+    pub fn next_wakeup(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        interval_due: chrono::DateTime<chrono::Utc>,
+    ) -> (Duration, Trigger) {
+        self.triggers.next_after(now, interval_due)
     }
 
     /// Run cycles until `shutdown` resolves, or the cycle limit is reached.
@@ -113,13 +123,23 @@ impl Daemon {
         let shutdown = std::pin::pin!(shutdown);
         let mut shutdown = shutdown;
 
+        // The interval's deadline is *absolute* and survives every wake-up that
+        // is not the interval itself. A relative one would restart on each
+        // commit notification, and a table written to more often than the
+        // interval would then keep the periodic sweep from ever running — so
+        // the tables that stopped being written would never have their
+        // snapshots expired and no orphan scan would ever happen. Events are an
+        // addition to the cadence, never a replacement for it.
+        let mut interval_due = chrono::Utc::now()
+            + chrono::Duration::from_std(self.config.interval).unwrap_or(chrono::Duration::MAX);
+
         loop {
             if self.config.max_cycles.is_some_and(|max| completed >= max) {
                 return Ok(completed);
             }
 
             let now = chrono::Utc::now();
-            let (delay, trigger) = self.next_wakeup(now);
+            let (delay, trigger) = self.next_wakeup(now, interval_due);
 
             // Sleeping to the window's edge rather than waking every interval
             // to find it shut. A daemon that logged "outside the window" sixty
@@ -151,7 +171,19 @@ impl Daemon {
                         continue;
                     }
                 },
-                () = tokio::time::sleep(delay) => Scope::Everything,
+                () = tokio::time::sleep(delay) => {
+                    // A timer fired. Only the daemon's own interval moves its
+                    // deadline: a rule's cron schedule has an absolute next
+                    // occurrence of its own, and advancing the interval because
+                    // a schedule fired would stretch the sweep every time a
+                    // frequent rule ran.
+                    if trigger == Trigger::Interval {
+                        interval_due = chrono::Utc::now()
+                            + chrono::Duration::from_std(self.config.interval)
+                                .unwrap_or(chrono::Duration::MAX);
+                    }
+                    Scope::Everything
+                }
             };
 
             // A rule's schedule scopes the cycle to that rule's tables. A rule
@@ -185,6 +217,14 @@ impl Daemon {
 
     /// Plan and run once, over whatever the trigger scoped it to.
     async fn cycle(&self, scope: &Scope) -> Result<RunReport> {
+        // Before reading anything. The catalog client exchanges its credential
+        // once at construction and never again, so a daemon holding a one-hour
+        // token would otherwise keep this cadence perfectly while failing to
+        // read a single table — see [`Bergman::refresh_credentials`]. One small
+        // form post per catalog per cycle, against a cycle that reads every
+        // table's manifests.
+        self.bergman.refresh_credentials().await;
+
         let plan = match scope {
             Scope::Everything => self.bergman.plan().await?,
             Scope::Matching(pattern) => self.bergman.plan_matching(pattern).await?,

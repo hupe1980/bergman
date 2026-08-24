@@ -59,7 +59,7 @@ pub async fn run(env: &OpEnv<'_>, settings: &EffectiveManifests) -> Result<Opera
     let mut current = env.table.clone();
 
     for attempt in 0..MAX_COMMIT_ATTEMPTS {
-        match attempt_rewrite(&current, ident, env.committer, settings).await {
+        match attempt_rewrite(&current, ident, env.committer, settings, ctx).await {
             Ok(result) => return Ok(result),
             Err(e) if e.is_replan() && attempt + 1 < MAX_COMMIT_ATTEMPTS => {
                 tracing::debug!(
@@ -90,6 +90,7 @@ async fn attempt_rewrite(
     ident: &TableIdent,
     committer: &dyn TableCommitter,
     settings: &EffectiveManifests,
+    ctx: crate::obs::OperationContext<'_>,
 ) -> Result<OperationResult> {
     let metadata = table.metadata();
 
@@ -208,7 +209,7 @@ async fn attempt_rewrite(
     };
 
     let (requirements, updates) = producer.install(Some(parent), manifests, summary).await?;
-    committer.commit(ident, requirements, updates).await?;
+    committer.commit(ident, requirements, updates, ctx).await?;
 
     Ok(OperationResult::Succeeded {
         detail: format!(

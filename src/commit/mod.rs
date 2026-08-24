@@ -95,11 +95,20 @@ pub trait TableCommitter: Send + Sync + std::fmt::Debug {
     /// [`crate::Error::CommitConflict`] rather than a generic failure: the
     /// caller's response to a conflict is to *replan*, and to any other error
     /// is not (see [`crate::error::Disposition`]).
+    ///
+    /// `ctx` is why this commit exists — the run, the table, the operation and
+    /// the rule that triggered it. It is not decoration: a governing catalog
+    /// records an authorization decision per commit, and correlating that
+    /// decision with Bergman's own reason for the commit needs an identifier
+    /// both sides wrote down. [`RestCommitter`] sends `ctx.run_id` as
+    /// `X-Request-Id`, which is the same value every audit record of the run
+    /// carries (see [`crate::obs::AuditRecord`]).
     async fn commit(
         &self,
         ident: &TableIdent,
         requirements: Vec<TableRequirement>,
         updates: Vec<TableUpdate>,
+        ctx: crate::obs::OperationContext<'_>,
     ) -> Result<()>;
 }
 
@@ -122,6 +131,7 @@ mod tests {
             _ident: &TableIdent,
             requirements: Vec<TableRequirement>,
             updates: Vec<TableUpdate>,
+            _ctx: crate::obs::OperationContext<'_>,
         ) -> Result<()> {
             self.calls.lock().unwrap().push((requirements, updates));
             Ok(())
@@ -132,6 +142,14 @@ mod tests {
     async fn a_committer_receives_requirements_and_updates_unchanged() {
         let committer = RecordingCommitter::default();
         let ident = TableIdent::from_strs(["db", "t"]).unwrap();
+        let table = crate::policy::TableRef::new("prod", ["db"], "t");
+        let ctx = crate::obs::OperationContext {
+            run_id: "run-1",
+            table: &table,
+            kind: crate::plan::OperationKind::Compact,
+            matched_rule: "prod.**",
+            reason: "test",
+        };
 
         committer
             .commit(
@@ -143,6 +161,7 @@ mod tests {
                 vec![TableUpdate::SetLocation {
                     location: "s3://b/t".into(),
                 }],
+                ctx,
             )
             .await
             .unwrap();

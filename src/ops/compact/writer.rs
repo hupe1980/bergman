@@ -7,7 +7,7 @@
 //! encoded, which a rewrite must not quietly override.
 
 use iceberg::scan::FileScanTask;
-use iceberg::spec::{DataFileFormat, PartitionKey, Struct};
+use iceberg::spec::{DataFileFormat, PartitionKey};
 use iceberg::table::Table;
 use iceberg::writer::IcebergWriterBuilder;
 use iceberg::writer::base_writer::data_file_writer::{DataFileWriter, DataFileWriterBuilder};
@@ -64,8 +64,20 @@ pub(super) async fn open(
 
 /// The partition value every file in the group shares.
 ///
-/// `None` for an unpartitioned table. The group is built by partition value, so
-/// they do share one — this reads it back off the first task.
+/// `None` for an unpartitioned table.
+///
+/// This is the tuple stamped on every output file, so getting it wrong files
+/// every row of the group under the wrong partition value, and nothing fails.
+/// Two things are therefore checked rather than assumed, and both are refusals
+/// rather than fallbacks:
+///
+/// - **The tasks carry a partition at all.** An absent one means the scan and
+///   the manifests disagree about a file; defaulting to an empty tuple would
+///   write a partitioned table's data under it.
+/// - **They all carry the same one.** Equal rendered keys mean equal tuples
+///   because [`crate::health::partition_path`] is injective — an argument about
+///   another module, verified here because this is where it being wrong destroys
+///   data.
 fn partition_key_for(table: &Table, group: &[&FileScanTask]) -> Result<Option<PartitionKey>> {
     let metadata = table.metadata();
     let spec = metadata.default_partition_spec();
@@ -74,15 +86,33 @@ fn partition_key_for(table: &Table, group: &[&FileScanTask]) -> Result<Option<Pa
         return Ok(None);
     }
 
-    let value = group
-        .first()
-        .and_then(|t| t.partition.clone())
-        .unwrap_or_else(Struct::empty);
+    let refuse = |reason: String| Error::refused("compact", table.identifier().to_string(), reason);
+
+    let mut tuples = group.iter().map(|task| task.partition.as_ref());
+
+    let Some(Some(value)) = tuples.next() else {
+        return Err(refuse(
+            "a file in this group carries no partition tuple, so its rows cannot be \
+             written back to the partition they came from"
+                .to_string(),
+        ));
+    };
+
+    for other in tuples {
+        if other != Some(value) {
+            return Err(refuse(
+                "this group's files do not all share one partition tuple; rewriting \
+                 them together would file some of their rows under another partition's \
+                 value"
+                    .to_string(),
+            ));
+        }
+    }
 
     Ok(Some(PartitionKey::new(
         spec.as_ref().clone(),
         metadata.current_schema().clone(),
-        value,
+        value.clone(),
     )))
 }
 

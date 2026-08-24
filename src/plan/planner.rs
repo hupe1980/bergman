@@ -112,10 +112,11 @@ fn plan_compaction(
         return None;
     }
 
-    // Bergman reads Parquet, Avro and ORC but writes only Parquet, so a table
-    // asking for anything else would have its format silently changed by a
-    // rewrite. The executor refuses it too; saying so here turns a refusal
-    // reported every cycle into an explanation given once.
+    // Bergman reads and writes only Parquet, so a table asking for anything
+    // else would have its format silently changed by a rewrite. The executor
+    // refuses it too — and checks the files themselves, which this cannot see;
+    // saying so here turns a refusal reported every cycle into an explanation
+    // given once.
     if let Some(format) = health.write_format.as_deref()
         && format != "parquet"
     {
@@ -127,7 +128,8 @@ fn plan_compaction(
         return None;
     }
 
-    let threshold = settings.small_file_threshold();
+    let small_threshold = settings.small_file_threshold();
+    let large_threshold = settings.large_file_threshold();
     let target = settings.target_file_size.value;
     let now_ms = now.timestamp_millis();
 
@@ -146,35 +148,64 @@ fn plan_compaction(
             continue;
         }
 
+        let small_files = partition.small_file_count(small_threshold);
+        let small_ratio = partition.small_file_ratio(small_threshold);
+        let delete_ratio = partition.delete_ratio();
+
+        // Three independent reasons to rewrite, and they select different sets
+        // of files. Size triggers read only the files whose size is the
+        // problem; the delete trigger reads the whole partition, because a
+        // partition-scoped delete can apply to a file of any size and the
+        // manifests do not say which.
+        let size_eligible = partition.size_eligible(small_threshold, large_threshold);
+
+        let by_small_files = small_ratio >= settings.small_file_ratio.value
+            && size_eligible.count >= settings.min_input_files.value;
+        // No minimum count: one file that no reader can split is already a
+        // problem, and splitting it is unambiguously worth a commit.
+        let by_oversized = size_eligible.oversized > 0;
+        let by_deletes =
+            delete_ratio >= settings.delete_ratio.value && partition.delete_file_count() > 0;
+
+        if !by_small_files && !by_oversized && !by_deletes {
+            continue;
+        }
+
+        let eligible = if by_deletes {
+            partition.all_eligible()
+        } else {
+            size_eligible
+        };
+
+        // Rewriting N files into N files spends I/O to achieve nothing. Without
+        // this check a table just below the target size would be rewritten
+        // every cycle, forever.
+        //
+        // Not applied to the other two triggers, and for opposite reasons:
+        // splitting an oversized file is *meant* to produce more files than it
+        // consumed, and retiring a delete file is worth a commit however the
+        // file count lands.
+        let output_files = partition.output_file_estimate(eligible, target);
+        if !by_deletes && !by_oversized && output_files >= eligible.count {
+            continue;
+        }
+
         // Output is written under the table's current spec, so a partition
         // whose files were written under an older one cannot be rewritten: the
         // commit would claim to replace files partitioned differently. The
         // executor refuses these too; not planning them keeps the plan honest
         // about what will happen — and counting them keeps it from being
         // silent about a partition that will never be maintained.
+        //
+        // Asked *after* the triggers rather than before, because the note this
+        // produces is only worth an operator's attention when the partition
+        // would otherwise have been rewritten. A spec-evolved table's history
+        // is mostly old partitions that are perfectly healthy, and counting
+        // those would put a paragraph about mis-filed rows on every plan of
+        // every such table, every cycle — which is how a warning that matters
+        // stops being read.
         if partition.key.spec_id != health.current_spec_id {
             superseded += 1;
-            continue;
-        }
-
-        let small_files = partition.small_file_count(threshold);
-        let small_ratio = partition.small_file_ratio(threshold);
-        let delete_ratio = partition.delete_ratio();
-
-        let by_small_files = small_ratio >= settings.small_file_ratio.value
-            && small_files >= settings.min_input_files.value;
-        let by_deletes =
-            delete_ratio >= settings.delete_ratio.value && partition.delete_file_count() > 0;
-
-        if !by_small_files && !by_deletes {
-            continue;
-        }
-
-        // Rewriting N files into N files spends I/O to achieve nothing. Without
-        // this check a table just below the target size would be rewritten
-        // every cycle, forever.
-        let output_files = partition.output_file_estimate(target);
-        if output_files >= partition.data_file_count && !by_deletes {
             continue;
         }
 
@@ -187,25 +218,33 @@ fn plan_compaction(
                 settings.delete_ratio.value * 100.0,
                 partition.delete_file_count(),
             )
-        } else {
+        } else if by_small_files {
             format!(
                 "{small_files} of {} files below {} ({:.0}% ≥ {:.0}%)",
                 partition.data_file_count,
-                human_bytes(threshold),
+                human_bytes(small_threshold),
                 small_ratio * 100.0,
                 settings.small_file_ratio.value * 100.0,
             )
+        } else {
+            format!(
+                "{} of {} files above {}, which no reader can split",
+                size_eligible.oversized,
+                partition.data_file_count,
+                human_bytes(large_threshold),
+            )
         };
 
-        triggered.push((partition, output_files, reason));
+        triggered.push((partition, eligible, output_files, reason));
     }
 
     if superseded > 0 {
         notes.push(format!(
-            "{superseded} partitions are under a superseded partition spec \
-             (current is {}) and are never rewritten: output goes out under the current \
-             spec, and a commit claiming it replaces files partitioned differently would \
-             mis-file every row in it",
+            "{superseded} partitions need compacting but are under a superseded partition \
+             spec (current is {}), so they are never rewritten: output goes out under the \
+             current spec, and a commit claiming it replaces files partitioned differently \
+             would mis-file every row in it. Migrating them to the current spec is a \
+             migration tool's job",
             health.current_spec_id,
         ));
     }
@@ -214,15 +253,18 @@ fn plan_compaction(
         return None;
     }
 
-    let input_files: usize = triggered.iter().map(|(p, _, _)| p.data_file_count).sum();
-    let input_bytes: u64 = triggered.iter().map(|(p, _, _)| p.data_bytes).sum();
-    let output_files: usize = triggered.iter().map(|(_, out, _)| *out).sum();
+    // The *eligible* files, not the partitions' totals. This figure is what the
+    // cycle's byte budget is charged, so charging a partition's untouched
+    // two-thirds against it would defer real work to pay for work nobody does.
+    let input_files: usize = triggered.iter().map(|(_, e, _, _)| e.count).sum();
+    let input_bytes: u64 = triggered.iter().map(|(_, e, _, _)| e.bytes).sum();
+    let output_files: usize = triggered.iter().map(|(_, _, out, _)| *out).sum();
 
     let reason = if triggered.len() == 1 {
-        let (partition, _, why) = &triggered[0];
+        let (partition, _, _, why) = &triggered[0];
         format!("partition {}: {why}", partition.key)
     } else {
-        let (partition, _, why) = &triggered[0];
+        let (partition, _, _, why) = &triggered[0];
         format!(
             "{} partitions; e.g. {}: {why}",
             triggered.len(),
@@ -236,7 +278,7 @@ fn plan_compaction(
         // The exact partitions the triggers fired on. Carried on the operation
         // so `run` rewrites precisely what `plan` displayed, rather than
         // re-deciding against a table that has moved since.
-        targets: triggered.iter().map(|(p, _, _)| p.key.clone()).collect(),
+        targets: triggered.iter().map(|(p, _, _, _)| p.key.clone()).collect(),
         estimate: Estimate {
             input_files,
             input_bytes,
@@ -530,6 +572,90 @@ mod tests {
     }
 
     #[test]
+    fn only_the_eligible_files_are_charged_to_the_plan() {
+        // The estimate is what the cycle's byte budget is charged, so it has to
+        // be what a rewrite reads. This partition is ten at-target files plus
+        // forty tiny ones; charging the whole partition would bill the budget
+        // ten thousand times the rewrite's actual cost and defer real work
+        // elsewhere to pay for work nobody does.
+        let mut sizes = vec![1000u64; 10];
+        sizes.extend(std::iter::repeat_n(10u64, 40));
+
+        let health = health_with(
+            vec![partition("d=1", &sizes, 1000, 0, 0)],
+            snapshots(1, Duration::from_secs(60)),
+        );
+        let plan = plan_table(
+            &health,
+            &effective(COMPACT_ON),
+            PlanContext::default(),
+            Utc::now(),
+        )
+        .unwrap();
+
+        let op = &plan.operations[0];
+        assert_eq!(op.kind, OperationKind::Compact);
+        assert_eq!(
+            op.estimate.input_files, 40,
+            "the at-target files are not read"
+        );
+        assert_eq!(op.estimate.input_bytes, 400);
+    }
+
+    #[test]
+    fn one_oversized_file_triggers_a_rewrite_on_its_own() {
+        // The half a small-file-only compactor forgets. A file no reader can
+        // split is a task that cannot be parallelised, and nothing but a
+        // rewrite ever splits it — so there is no minimum count to reach and
+        // the "N in, N out" guard must not veto producing more files than it
+        // consumed, which is the entire point.
+        let health = health_with(
+            vec![partition("d=1", &[5000, 1000, 1000], 100, 0, 0)],
+            snapshots(1, Duration::from_secs(60)),
+        );
+        let plan = plan_table(
+            &health,
+            &effective(COMPACT_ON),
+            PlanContext::default(),
+            Utc::now(),
+        )
+        .unwrap();
+
+        let op = &plan.operations[0];
+        assert_eq!(op.kind, OperationKind::Compact);
+        assert!(
+            op.reason.contains("no reader can split"),
+            "got: {}",
+            op.reason
+        );
+        assert_eq!(
+            op.estimate.input_files, 1,
+            "only the oversized file is read"
+        );
+        assert_eq!(op.estimate.output_files, 5, "and it is split");
+    }
+
+    #[test]
+    fn a_partition_of_healthy_files_is_left_alone_at_both_ends() {
+        // Between the two thresholds is the band a rewrite cannot improve. A
+        // planner that read this partition would rewrite a healthy table every
+        // cycle forever.
+        let health = health_with(
+            vec![partition("d=1", &[750, 900, 1000, 1500, 1800], 100, 0, 0)],
+            snapshots(1, Duration::from_secs(60)),
+        );
+        assert!(
+            plan_table(
+                &health,
+                &effective(COMPACT_ON),
+                PlanContext::default(),
+                Utc::now()
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn deletes_trigger_compaction_even_when_file_sizes_are_fine() {
         // The case the whole delete-aware design exists for: a streaming target
         // whose files are the right size but whose reads are amplified by
@@ -736,12 +862,38 @@ mod tests {
     }
 
     #[test]
+    fn a_healthy_partition_under_an_old_spec_is_not_worth_a_note() {
+        // The other half of the same rule, and the one that decides whether the
+        // note above is ever read. A table whose spec evolved keeps every old
+        // partition it ever had, and almost all of them are at target size and
+        // want nothing. Counting those would put a paragraph about mis-filed
+        // rows on every plan of every spec-evolved table, every cycle — and a
+        // warning that appears when nothing is wrong is a warning nobody reads
+        // when something is.
+        let mut healthy = partition("d=1", &[1000, 1000, 1000], 100, 0, 0);
+        healthy.key.spec_id = 0;
+
+        let mut health = health_with(vec![healthy], snapshots(1, Duration::from_secs(60)));
+        health.current_spec_id = 1;
+
+        assert!(
+            plan_table(
+                &health,
+                &effective(COMPACT_ON),
+                PlanContext::default(),
+                Utc::now()
+            )
+            .is_none(),
+            "a healthy old partition is silence, not a warning"
+        );
+    }
+
+    #[test]
     fn a_non_parquet_table_says_why_compaction_will_never_run() {
-        // Bergman reads Parquet, Avro and ORC but writes only Parquet, so a
-        // rewrite of an ORC table would silently change its format. The
-        // executor refuses it; planning it anyway would report that refusal
-        // every cycle forever, and planning nothing silently would look exactly
-        // like a healthy table.
+        // Bergman reads and writes only Parquet, so a rewrite of an ORC table
+        // would silently change its format. The executor refuses it; planning
+        // it anyway would report that refusal every cycle forever, and planning
+        // nothing silently would look exactly like a healthy table.
         let mut health = health_with(
             vec![partition("d=1", &[10; 10], 100, 0, 0)],
             snapshots(1, Duration::from_secs(60)),

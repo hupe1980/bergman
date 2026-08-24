@@ -44,9 +44,12 @@ impl std::fmt::Display for Trigger {
 }
 
 /// The schedules a policy declares, compiled once.
+///
+/// The daemon's own interval is not here: it is a deadline the caller carries
+/// across wake-ups, and holding a copy of it would invite recomputing it from
+/// `now`. See [`TriggerSet::next_after`].
 #[derive(Debug)]
 pub struct TriggerSet {
-    interval: Duration,
     schedules: Vec<(String, cron::Schedule)>,
 }
 
@@ -56,7 +59,7 @@ impl TriggerSet {
     /// Compiling here rather than per wakeup means a malformed expression is a
     /// startup failure — though policy validation has already rejected one, so
     /// reaching an error here would mean the two disagree.
-    pub fn from_policy(policy: &Policy, interval: Duration) -> Result<Self> {
+    pub fn from_policy(policy: &Policy) -> Result<Self> {
         let mut schedules = Vec::new();
         for (pattern, expression) in policy.schedules() {
             schedules.push((
@@ -64,15 +67,23 @@ impl TriggerSet {
                 crate::policy::parse_schedule(expression)?,
             ));
         }
-        Ok(Self {
-            interval,
-            schedules,
-        })
+        Ok(Self { schedules })
     }
 
     /// How long until the next trigger fires, and which one.
-    pub fn next_after(&self, now: DateTime<Utc>) -> (Duration, Trigger) {
-        let mut soonest = (self.interval, Trigger::Interval);
+    ///
+    /// `interval_due` is the *absolute* moment the interval next comes round,
+    /// and it is a parameter rather than `now + interval` because the daemon
+    /// also wakes on commit notifications and recomputes this on every wake-up.
+    /// Measured from `now`, a table committed to more often than the interval
+    /// would reset the clock forever and the periodic sweep would never run.
+    pub fn next_after(
+        &self,
+        now: DateTime<Utc>,
+        interval_due: DateTime<Utc>,
+    ) -> (Duration, Trigger) {
+        let until_interval = (interval_due - now).to_std().unwrap_or(Duration::ZERO);
+        let mut soonest = (until_interval, Trigger::Interval);
 
         for (pattern, schedule) in &self.schedules {
             let Some(next) = schedule.after(&now).next() else {
@@ -115,17 +126,48 @@ mod tests {
         Policy::compile(&Config::from_toml(toml).unwrap()).unwrap()
     }
 
+    /// The interval's deadline, `interval` from now — what a daemon that has
+    /// just started, or has just run an interval cycle, holds.
+    fn due_in(interval: Duration) -> (DateTime<Utc>, DateTime<Utc>) {
+        let now = Utc::now();
+        (now, now + chrono::Duration::from_std(interval).unwrap())
+    }
+
     #[test]
     fn with_no_schedules_the_interval_governs() {
-        let triggers = TriggerSet::from_policy(
-            &policy("[[rules]]\nmatch = \"prod.**\"\n"),
-            Duration::from_secs(3600),
-        )
-        .unwrap();
+        let triggers =
+            TriggerSet::from_policy(&policy("[[rules]]\nmatch = \"prod.**\"\n")).unwrap();
 
         assert!(triggers.is_empty());
-        let (delay, trigger) = triggers.next_after(Utc::now());
+        let (now, due) = due_in(Duration::from_secs(3600));
+        let (delay, trigger) = triggers.next_after(now, due);
         assert_eq!(delay, Duration::from_secs(3600));
+        assert_eq!(trigger, Trigger::Interval);
+    }
+
+    #[test]
+    fn the_interval_counts_down_rather_than_restarting() {
+        // The bug this signature exists to prevent. The daemon recomputes its
+        // wake-up on every event, so an interval measured from `now` would
+        // restart on each notification — and a table committed to more often
+        // than the interval would keep the periodic sweep from ever running.
+        // Tables that *stopped* being written would then never have their
+        // snapshots expired, and no orphan scan would ever happen.
+        let triggers =
+            TriggerSet::from_policy(&policy("[[rules]]\nmatch = \"prod.**\"\n")).unwrap();
+
+        let now = Utc::now();
+        let due = now + chrono::Duration::seconds(3600);
+
+        // Half an hour later — after any number of event-driven cycles — the
+        // interval is half an hour away, not another full hour.
+        let (delay, _) = triggers.next_after(now + chrono::Duration::seconds(1800), due);
+        assert_eq!(delay, Duration::from_secs(1800));
+
+        // And once it is overdue it fires immediately rather than going
+        // negative or wrapping.
+        let (delay, trigger) = triggers.next_after(now + chrono::Duration::seconds(7200), due);
+        assert_eq!(delay, Duration::ZERO);
         assert_eq!(trigger, Trigger::Interval);
     }
 
@@ -133,13 +175,13 @@ mod tests {
     fn the_soonest_schedule_wins_over_a_longer_interval() {
         // A rule asking for every two hours must not be stretched to a daily
         // interval, so the daemon wakes for the rule.
-        let triggers = TriggerSet::from_policy(
-            &policy("[[rules]]\nmatch = \"prod.**\"\nschedule = \"0 */2 * * *\"\n"),
-            Duration::from_secs(86400),
-        )
+        let triggers = TriggerSet::from_policy(&policy(
+            "[[rules]]\nmatch = \"prod.**\"\nschedule = \"0 */2 * * *\"\n",
+        ))
         .unwrap();
 
-        let (delay, trigger) = triggers.next_after(Utc::now());
+        let (now, due) = due_in(Duration::from_secs(86400));
+        let (delay, trigger) = triggers.next_after(now, due);
         assert!(delay <= Duration::from_secs(2 * 3600), "{delay:?}");
         assert_eq!(
             trigger,
@@ -152,30 +194,28 @@ mod tests {
     #[test]
     fn a_short_interval_wins_over_a_distant_schedule() {
         // The reverse: a daily rule must not stop a five-minute daemon waking.
-        let triggers = TriggerSet::from_policy(
-            &policy("[[rules]]\nmatch = \"prod.**\"\nschedule = \"0 3 * * *\"\n"),
-            Duration::from_secs(300),
-        )
+        let triggers = TriggerSet::from_policy(&policy(
+            "[[rules]]\nmatch = \"prod.**\"\nschedule = \"0 3 * * *\"\n",
+        ))
         .unwrap();
 
-        let (delay, trigger) = triggers.next_after(Utc::now());
+        let (now, due) = due_in(Duration::from_secs(300));
+        let (delay, trigger) = triggers.next_after(now, due);
         assert_eq!(delay, Duration::from_secs(300));
         assert_eq!(trigger, Trigger::Interval);
     }
 
     #[test]
     fn several_schedules_resolve_to_the_earliest() {
-        let triggers = TriggerSet::from_policy(
-            &policy(
-                "[[rules]]\nmatch = \"prod.slow.**\"\nschedule = \"0 3 * * *\"\n\n\
+        let triggers = TriggerSet::from_policy(&policy(
+            "[[rules]]\nmatch = \"prod.slow.**\"\nschedule = \"0 3 * * *\"\n\n\
                  [[rules]]\nmatch = \"prod.fast.**\"\nschedule = \"*/5 * * * *\"\n",
-            ),
-            Duration::from_secs(86400),
-        )
+        ))
         .unwrap();
 
         assert_eq!(triggers.len(), 2);
-        let (delay, trigger) = triggers.next_after(Utc::now());
+        let (now, due) = due_in(Duration::from_secs(86400));
+        let (delay, trigger) = triggers.next_after(now, due);
         assert!(delay <= Duration::from_secs(300), "{delay:?}");
         assert_eq!(
             trigger,

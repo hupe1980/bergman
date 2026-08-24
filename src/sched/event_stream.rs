@@ -43,10 +43,21 @@ pub struct Events {
 }
 
 /// Receives them.
+///
+/// The debounce window's state lives on the stream rather than inside
+/// [`EventStream::next_batch`], which is what makes that method **cancel-safe**.
+/// The daemon awaits it inside a `select!` against a timer, so the future is
+/// dropped whenever the timer wins — and a window whose collected tables lived
+/// in a local would lose every one of them, silently, exactly when a burst of
+/// commits coincided with a scheduled cycle.
 #[derive(Debug)]
 pub struct EventStream {
     rx: mpsc::Receiver<TableRef>,
     debounce: Duration,
+    /// Tables collected in the window that is currently open.
+    pending: std::collections::HashSet<TableRef>,
+    /// When that window closes. `None` when no window is open.
+    closes_at: Option<tokio::time::Instant>,
 }
 
 /// Create a connected pair.
@@ -57,7 +68,15 @@ pub struct EventStream {
 /// maintenance.
 pub fn channel(debounce: Duration) -> (Events, EventStream) {
     let (tx, rx) = mpsc::channel(CHANNEL_DEPTH);
-    (Events { tx }, EventStream { rx, debounce })
+    (
+        Events { tx },
+        EventStream {
+            rx,
+            debounce,
+            pending: HashSet::new(),
+            closes_at: None,
+        },
+    )
 }
 
 impl Events {
@@ -86,26 +105,35 @@ impl EventStream {
     /// Wait for a change, then collect everything that arrives during the
     /// debounce window.
     ///
-    /// Returns `None` when every sender is gone.
+    /// Returns `None` when every sender is gone and nothing is pending.
+    ///
+    /// **Cancel-safe.** Dropping this future — which the daemon does on every
+    /// `select!` its timer wins — keeps the window open and every table already
+    /// collected in it, so the next call resumes where this one stopped.
+    /// [`mpsc::Receiver::recv`] is itself cancel-safe, so nothing in flight is
+    /// lost either. A version that held the batch in a local would drop a burst
+    /// of notifications precisely when a scheduled cycle happened to fire
+    /// through the middle of it, and nothing would say so.
     pub async fn next_batch(&mut self) -> Option<Vec<TableRef>> {
-        // Block until something happens. Waking on a timer to find an empty
-        // queue is the polling this exists to replace.
-        let first = self.rx.recv().await?;
-
-        let mut batch = HashSet::new();
-        batch.insert(first);
-
-        // Then drain for the debounce window. A writer committing every two
-        // seconds produces one cycle rather than thirty.
-        let deadline = tokio::time::Instant::now() + self.debounce;
         loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let Some(closes_at) = self.closes_at else {
+                // No window open. Block until something happens — waking on a
+                // timer to find an empty queue is the polling this replaces.
+                let first = self.rx.recv().await?;
+                self.pending.insert(first);
+                self.closes_at = Some(tokio::time::Instant::now() + self.debounce);
+                continue;
+            };
+
+            // Then drain for the rest of the window. A writer committing every
+            // two seconds produces one cycle rather than thirty.
+            let remaining = closes_at.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 break;
             }
             match tokio::time::timeout(remaining, self.rx.recv()).await {
                 Ok(Some(table)) => {
-                    batch.insert(table);
+                    self.pending.insert(table);
                 }
                 // Senders gone, or the window closed. Either way this batch is
                 // complete — the tables already collected are still worth a
@@ -114,7 +142,8 @@ impl EventStream {
             }
         }
 
-        let mut batch: Vec<TableRef> = batch.into_iter().collect();
+        self.closes_at = None;
+        let mut batch: Vec<TableRef> = std::mem::take(&mut self.pending).into_iter().collect();
         // Deduplicated by the set, then ordered so a cycle's work is stable.
         batch.sort();
         Some(batch)
@@ -164,6 +193,42 @@ mod tests {
 
         let result = tokio::time::timeout(Duration::from_secs(60), stream.next_batch()).await;
         assert!(result.is_err(), "a batch appeared with no events");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_window_cut_short_by_a_timer_keeps_what_it_collected() {
+        // The daemon awaits `next_batch` inside a `select!` against its timer,
+        // so this future is dropped whenever the timer wins. A batch held in a
+        // local would vanish with it — losing a burst of commits precisely when
+        // a scheduled cycle fired through the middle of one, with nothing to
+        // say so.
+        let (events, mut stream) = channel(Duration::from_secs(30));
+
+        events.notify(table("a"));
+        events.notify(table("b"));
+
+        // The window opens, collects both, and is then abandoned well before it
+        // closes — which is exactly what losing the `select!` looks like.
+        let cancelled = tokio::time::timeout(Duration::from_secs(1), stream.next_batch()).await;
+        assert!(cancelled.is_err(), "the window closed early");
+
+        // The next call resumes the same window rather than starting over.
+        let batch = stream.next_batch().await.unwrap();
+        assert_eq!(batch, vec![table("a"), table("b")]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resumed_window_still_collects_what_arrives_after_it() {
+        let (events, mut stream) = channel(Duration::from_secs(30));
+
+        events.notify(table("a"));
+        let _ = tokio::time::timeout(Duration::from_secs(1), stream.next_batch()).await;
+        events.notify(table("b"));
+
+        assert_eq!(
+            stream.next_batch().await.unwrap(),
+            vec![table("a"), table("b")]
+        );
     }
 
     #[tokio::test]

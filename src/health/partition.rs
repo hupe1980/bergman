@@ -53,6 +53,12 @@ impl PartitionKey {
 /// records, where blank reads as missing data rather than as "no partitioning".
 pub const UNPARTITIONED: &str = "unpartitioned";
 
+/// How a partition value that is genuinely null renders.
+const NULL: &str = "null";
+
+/// How a partition tuple shorter than its spec renders.
+const ABSENT: &str = "absent";
+
 /// Render a partition tuple to a stable, unambiguous string.
 ///
 /// The shape is Hive's and Iceberg's own — `region=eu/day=2026-01-15` — built
@@ -60,12 +66,16 @@ pub const UNPARTITIONED: &str = "unpartitioned";
 /// renders as a date rather than as the integer actually stored. That is what
 /// makes a plan line legible without Bergman modelling the spec's type system.
 ///
-/// Values are percent-encoded for `%` and `/`. Upstream's own
-/// `PartitionSpec::partition_to_path` does not escape, which leaves a string
-/// partition value containing a slash able to render as two fields — and this
-/// string is compared for equality to decide which files are rewritten
-/// together, so an ambiguity here mis-files rows rather than merely printing
-/// oddly.
+/// **Injective**, which is the property the whole type exists for: this string
+/// is compared for equality to decide which files are rewritten together, so
+/// two partitions that rendered alike would have their files merged and written
+/// out under one of the two partition values — filing every row of the other
+/// where it does not belong. Nothing fails; queries just start missing rows.
+///
+/// Upstream's own `PartitionSpec::partition_to_path` is not injective and does
+/// not try to be: it is for building a directory name a human reads. Two
+/// distinct failures have to be closed to get from there to here, and the
+/// escaping below closes both.
 pub fn partition_path(spec: &PartitionSpec, schema: &Schema, data: &Struct) -> String {
     if spec.fields().is_empty() {
         return UNPARTITIONED.to_string();
@@ -86,43 +96,98 @@ pub fn partition_path(spec: &PartitionSpec, schema: &Schema, data: &Struct) -> S
             out.push('/');
         }
         let rendered = match (data.iter().nth(index), field_types.get(index)) {
+            // A null value renders as the reserved token, unescaped. It is the
+            // only thing that ever produces that spelling, because `escape`
+            // encodes a *value* of "null" into something else.
+            (Some(None), _) => NULL.to_string(),
             (Some(value), Some(declared)) => {
-                field.transform.to_human_string(&declared.field_type, value)
+                escape(&field.transform.to_human_string(&declared.field_type, value))
             }
             // A tuple shorter than its spec is malformed metadata. Naming the
             // field as absent keeps the key distinct from one whose value is
             // genuinely null.
-            _ => "absent".to_string(),
+            _ => ABSENT.to_string(),
         };
         out.push_str(&field.name);
         out.push('=');
-        out.push_str(&escape(&rendered));
+        out.push_str(&rendered);
     }
     out
 }
 
-/// Percent-encode the two characters that would otherwise make a rendered
-/// tuple ambiguous.
+/// Make one rendered value unmistakable for anything else.
+///
+/// Two ambiguities, each of which mis-files rows rather than merely printing
+/// oddly:
+///
+/// 1. **The field separator.** A string value containing `/` renders as two
+///    fields, so `region = "eu/day=2026-01-15"` produces exactly the key a
+///    different, real partition produces. `%` is encoded too, and *first*, so an
+///    escape introduced here cannot be mistaken for one already in the value.
+///
+/// 2. **The reserved tokens.** [`Transform::to_human_string`] renders a null
+///    value as `null` — and a string column holding those four characters
+///    renders identically. Same for `absent`. So a value coming out as a
+///    reserved token has its first byte percent-encoded, which no real value can
+///    produce: a genuine `%` has already become `%25`.
+///
+/// The result is injective and stays legible — the escape fires only for those
+/// two strings and for values containing `%` or `/`.
+///
+/// [`Transform::to_human_string`]: iceberg::spec::Transform::to_human_string
 fn escape(value: &str) -> String {
-    if !value.contains(['%', '/']) {
-        return value.to_string();
-    }
-    let mut out = String::with_capacity(value.len() + 4);
-    for ch in value.chars() {
-        match ch {
-            // `%` first, so an escape introduced below cannot be mistaken for
-            // one that was in the value to begin with.
-            '%' => out.push_str("%25"),
-            '/' => out.push_str("%2F"),
-            other => out.push(other),
+    let escaped = if value.contains(['%', '/']) {
+        let mut out = String::with_capacity(value.len() + 4);
+        for ch in value.chars() {
+            match ch {
+                '%' => out.push_str("%25"),
+                '/' => out.push_str("%2F"),
+                other => out.push(other),
+            }
         }
+        out
+    } else {
+        value.to_string()
+    };
+
+    match escaped.as_str() {
+        NULL => "%6Eull".to_string(),
+        ABSENT => "%61bsent".to_string(),
+        _ => escaped,
     }
-    out
 }
 
 impl std::fmt::Display for PartitionKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.value)
+    }
+}
+
+/// The files of one partition that a rewrite would read.
+///
+/// A partition is what *triggers* a rewrite; this is what the rewrite then
+/// costs. The two are not the same set, and conflating them is how a compactor
+/// reads fifty gigabytes to merge forty small files: a partition earns a
+/// rewrite because a third of its files are small, and the other two thirds —
+/// already at target — gain nothing from being read and written back.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Eligible {
+    /// How many files a rewrite would read.
+    pub count: usize,
+    /// Their total size, which is what a byte budget is charged.
+    pub bytes: u64,
+    /// How many of them are above the oversized threshold.
+    ///
+    /// Tracked separately because it inverts one rule: a rewrite that splits an
+    /// oversized file deliberately produces *more* files than it consumed, so
+    /// the "N in, N out — not worth it" guard must not veto it.
+    pub oversized: usize,
+}
+
+impl Eligible {
+    /// Whether a rewrite would read anything.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
     }
 }
 
@@ -201,6 +266,49 @@ impl PartitionHealth {
         self.file_sizes.iter().filter(|&&s| s < threshold).count()
     }
 
+    /// How many of this partition's files are above `threshold`.
+    ///
+    /// The half of file-size health a small-file-only compactor forgets. One
+    /// unsplittable file is a task no reader can parallelise, and nothing but a
+    /// rewrite ever splits it.
+    pub fn large_file_count(&self, threshold: u64) -> usize {
+        self.file_sizes.iter().filter(|&&s| s > threshold).count()
+    }
+
+    /// The files a rewrite would actually read, by size alone.
+    ///
+    /// Size alone, because a manifest does not say which data file a delete
+    /// applies to — deciding that needs the sequence-number rule the scan
+    /// applies, and the scan is data-plane work the planner deliberately does
+    /// not do. When the delete trigger fires the executor treats the whole
+    /// partition as eligible instead, which is the honest reading: a
+    /// partition-scoped delete may apply to any file in it.
+    pub fn size_eligible(&self, small: u64, large: u64) -> Eligible {
+        let mut eligible = Eligible::default();
+        for &size in &self.file_sizes {
+            if size > large {
+                eligible.oversized += 1;
+            } else if size >= small {
+                continue;
+            }
+            eligible.count += 1;
+            eligible.bytes = eligible.bytes.saturating_add(size);
+        }
+        eligible
+    }
+
+    /// Every file in the partition, as an eligible set.
+    ///
+    /// What the delete trigger selects: the deletes are what make the rewrite
+    /// worth doing, and a delete can apply to a file of any size.
+    pub fn all_eligible(&self) -> Eligible {
+        Eligible {
+            count: self.data_file_count,
+            bytes: self.data_bytes,
+            oversized: 0,
+        }
+    }
+
     /// Rows named by delete files, over live rows.
     pub fn delete_ratio(&self) -> f64 {
         if self.record_count == 0 {
@@ -230,20 +338,24 @@ impl PartitionHealth {
         now_ms.saturating_sub(newest) >= min_age_ms
     }
 
-    /// How many files a rewrite of this partition would produce.
+    /// How many files rewriting `eligible` would produce.
     ///
     /// Used to reject rewrites that would not actually help: rewriting five
     /// files into five files spends I/O to achieve nothing, and a planner that
     /// cannot tell will do it every cycle forever.
-    pub fn output_file_estimate(&self, target_file_size: u64) -> usize {
-        if target_file_size == 0 || self.data_bytes == 0 {
+    ///
+    /// Over the *eligible* set rather than the whole partition, because that is
+    /// what a rewrite reads — comparing a whole partition's output estimate
+    /// against a whole partition's file count answers a question nobody asked.
+    pub fn output_file_estimate(&self, eligible: Eligible, target_file_size: u64) -> usize {
+        if target_file_size == 0 || eligible.bytes == 0 {
             return 0;
         }
         // Deletes remove rows, so the output is smaller than the input by
         // roughly the delete ratio. This is an estimate and is documented as
         // one — the exact figure is not knowable without reading the data.
         let live_fraction = (1.0 - self.delete_ratio()).max(0.0);
-        let live_bytes = (self.data_bytes as f64 * live_fraction) as u64;
+        let live_bytes = (eligible.bytes as f64 * live_fraction) as u64;
         live_bytes.div_ceil(target_file_size).max(1) as usize
     }
 }
@@ -356,6 +468,47 @@ mod tests {
     }
 
     #[test]
+    fn a_value_of_null_is_not_the_same_partition_as_a_null_value() {
+        // The second way injectivity breaks, and the one upstream's own
+        // renderer walks straight into: `to_human_string` prints a NULL value
+        // as the word "null", and a *string column holding the four characters
+        // n-u-l-l* prints identically. Those are two different partitions with
+        // two different sets of files, and a key that conflated them would have
+        // both rewritten together and written out under whichever tuple the
+        // group's first file carried — silently filing every row of the other
+        // partition where it does not belong.
+        let (spec, schema) = spec_and_schema();
+
+        let genuinely_null = PartitionKey::new(
+            &spec,
+            &schema,
+            &Struct::from_iter([None, Some(Literal::int(20_000))]),
+        );
+        let the_word_null = PartitionKey::new(
+            &spec,
+            &schema,
+            &Struct::from_iter([Some(Literal::string("null")), Some(Literal::int(20_000))]),
+        );
+
+        assert_ne!(genuinely_null, the_word_null);
+        assert_eq!(genuinely_null.value, "region=null/day=2024-10-04");
+        assert_eq!(the_word_null.value, "region=%6Eull/day=2024-10-04");
+    }
+
+    #[test]
+    fn a_value_cannot_impersonate_a_reserved_token() {
+        // Both tokens, and the escape that keeps them unreachable: a real `%`
+        // has already become `%25`, so nothing but this rule ever produces
+        // `%6E` or `%61`.
+        assert_eq!(escape("null"), "%6Eull");
+        assert_eq!(escape("absent"), "%61bsent");
+        assert_eq!(escape("%6Eull"), "%256Eull", "and it does not round-trip");
+        // Values that merely contain a token are unambiguous already.
+        assert_eq!(escape("nullable"), "nullable");
+        assert_eq!(escape("not null"), "not null");
+    }
+
+    #[test]
     fn an_unpartitioned_spec_renders_as_a_name() {
         let spec = PartitionSpec::unpartition_spec();
         let schema = Schema::builder().with_schema_id(0).build().unwrap();
@@ -404,13 +557,13 @@ mod tests {
         // 1000 bytes with half the rows deleted is ~500 live bytes, one file
         // at a 512-byte target.
         let p = partition(&[500, 500], 100, 50);
-        assert_eq!(p.output_file_estimate(512), 1);
+        assert_eq!(p.output_file_estimate(p.all_eligible(), 512), 1);
     }
 
     #[test]
     fn output_estimate_of_a_large_partition_is_many_files() {
         let p = partition(&[1000; 10], 100, 0);
-        assert_eq!(p.output_file_estimate(1000), 10);
+        assert_eq!(p.output_file_estimate(p.all_eligible(), 1000), 10);
     }
 
     #[test]
@@ -418,13 +571,13 @@ mod tests {
         // A partition holding data always produces at least one file; a zero
         // here would make a planner believe a rewrite deletes the partition.
         let p = partition(&[10], 100, 0);
-        assert_eq!(p.output_file_estimate(1_000_000), 1);
+        assert_eq!(p.output_file_estimate(p.all_eligible(), 1_000_000), 1);
     }
 
     #[test]
     fn empty_partition_produces_no_files() {
         let p = partition(&[], 0, 0);
-        assert_eq!(p.output_file_estimate(1000), 0);
+        assert_eq!(p.output_file_estimate(p.all_eligible(), 1000), 0);
     }
 
     #[test]
@@ -433,6 +586,59 @@ mod tests {
         // keeps the answer honest as "a rewrite still produces a file", since
         // the delete ratio is an upper bound, not a certainty.
         let p = partition(&[1000], 100, 100);
-        assert_eq!(p.output_file_estimate(512), 1);
+        assert_eq!(p.output_file_estimate(p.all_eligible(), 512), 1);
+    }
+
+    #[test]
+    fn the_estimate_is_over_the_files_a_rewrite_reads() {
+        // The whole reason `Eligible` exists. This partition is 10 GB of
+        // at-target files plus 40 tiny ones; a rewrite reads the tiny ones and
+        // nothing else, and an estimate over the partition's totals would
+        // charge the cycle's byte budget ten thousand times what the rewrite
+        // costs.
+        let mut sizes = vec![1000u64; 10];
+        sizes.extend(std::iter::repeat_n(10u64, 40));
+        let p = partition(&sizes, 1000, 0);
+
+        let eligible = p.size_eligible(750, 1800);
+        assert_eq!(eligible.count, 40);
+        assert_eq!(eligible.bytes, 400);
+        assert_eq!(eligible.oversized, 0);
+        assert_eq!(p.output_file_estimate(eligible, 1000), 1);
+    }
+
+    #[test]
+    fn a_file_at_target_is_neither_small_nor_oversized() {
+        // The band between the two thresholds is the healthy one, and a file in
+        // it must never be read: doing so is how a compactor rewrites a table
+        // that was already fine, every cycle, forever.
+        let p = partition(&[750, 1000, 1800], 100, 0);
+        assert_eq!(p.size_eligible(750, 1800), Eligible::default());
+        assert!(p.size_eligible(750, 1800).is_empty());
+    }
+
+    #[test]
+    fn an_oversized_file_is_eligible_on_its_own() {
+        // The half a small-file-only compactor forgets. Nothing else ever
+        // splits it, and one unsplittable file is a task no reader can
+        // parallelise.
+        let p = partition(&[5000, 1000], 100, 0);
+        let eligible = p.size_eligible(750, 1800);
+
+        assert_eq!(eligible.count, 1);
+        assert_eq!(eligible.oversized, 1);
+        assert_eq!(eligible.bytes, 5000);
+        assert_eq!(p.large_file_count(1800), 1);
+    }
+
+    #[test]
+    fn a_file_is_counted_once_however_many_thresholds_it_crosses() {
+        // A degenerate configuration where the bands overlap must not double
+        // count: the byte figure feeds a budget, and a doubled one defers real
+        // work to pay for work nobody does.
+        let p = partition(&[10], 100, 0);
+        let eligible = p.size_eligible(1000, 5);
+        assert_eq!(eligible.count, 1);
+        assert_eq!(eligible.bytes, 10);
     }
 }

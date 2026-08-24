@@ -10,10 +10,11 @@
     <p class="hero__eyebrow">Apache Iceberg maintenance · Rust · Apache-2.0 OR MIT</p>
     <h1 class="hero__title">Iceberg maintenance<br><span class="grad">without the JVM</span></h1>
     <p class="hero__lede">
-      Bergman keeps Iceberg tables healthy — expiring snapshots, reclaiming what
-      that leaves behind, and removing orphans — driven by declarative policies
-      and built on <code>iceberg-rust</code>. No Spark, no Trino, no cluster.
-      One crate, one binary, and a library any Rust service can embed.
+      Bergman keeps Iceberg tables healthy — compacting small files with their
+      delete files applied, re-packing manifests, expiring snapshots and removing
+      orphans — driven by declarative policies and built on
+      <code>iceberg-rust</code>. No Spark, no Trino, no cluster. One crate, one
+      binary, and a library any Rust service can embed.
     </p>
 
     <div class="hero__actions">
@@ -26,10 +27,10 @@
         <div class="terminal__bar" aria-hidden="true"><span></span><span></span><span></span></div>
 <pre class="terminal__body"><code><span class="c">$</span> bergman inspect
 
- TABLE                        FILES   SIZE       AVG FILE   DELETES     SNAPSHOTS
- prod.analytics.events        480     2.14 GiB   4.56 MiB   —           61 / 34d
- prod.streaming.events_raw    92      8.11 GiB   90.2 MiB   1204 (23%)  8 / 2h
- prod.finance.ledger          12      6.02 GiB   513 MiB    —           4 / 6d</code></pre>
+ TABLE                        FILES   SIZE       FILE SIZE p50/p95    DELETES
+ prod.analytics.events        480     2.14 GiB   3.10 MiB / 9.80 MiB  —
+ prod.streaming.events_raw    92      8.11 GiB   88.4 MiB / 96.1 MiB  1204 (23%)
+ prod.finance.ledger          12      6.02 GiB   402 MiB / 2.90 GiB   —</code></pre>
       </div>
       <p class="hero__note">
         Reads only, changes nothing. The first command answers what is wrong
@@ -44,7 +45,7 @@
     <div class="stat"><span class="stat__n">0</span><span class="stat__l">JVMs required</span></div>
     <div class="stat"><span class="stat__n">0</span><span class="stat__l">clusters to run</span></div>
     <div class="stat"><span class="stat__n">1</span><span class="stat__l">static binary</span></div>
-    <div class="stat"><span class="stat__n">5</span><span class="stat__l">checks before a delete</span></div>
+    <div class="stat"><span class="stat__n">7</span><span class="stat__l">checks before a delete</span></div>
   </div>
 </section>
 
@@ -54,7 +55,7 @@
     <p class="section__lede">
       It must never win against a foreground writer, and never corrupt one. Every
       design decision below follows from that — triggers instead of schedules,
-      replan instead of retry, and a deletion path with five independent checks
+      replan instead of retry, and a deletion path with seven independent checks
       standing in front of it.
     </p>
 
@@ -95,9 +96,10 @@
       <article class="pillar">
         <h3>Deletion is the hard part</h3>
         <p>
-          Dry run by default; a grace period with a hard 24-hour floor that cannot be
-          configured away; unknown file age means too young; segment-wise containment;
-          and re-verification against freshly loaded metadata before the first delete.
+          Dry run by default. A grace period with a hard 24-hour floor that cannot be
+          configured away. Unknown file age means too young. Segment-wise containment,
+          and a refusal to scan a location another table lives inside. Re-verification
+          against freshly loaded metadata, and a ceiling on the blast radius.
         </p>
         <a class="pillar__link" href="{{ get_url(path='@/docs/orphans.md') }}">The safety model →</a>
       </article>
@@ -129,34 +131,30 @@
 
 <section class="section section--alt">
   <div class="wrap">
-    <h2 class="section__title">A plan states the need, and what it will actually do</h2>
+    <h2 class="section__title">What <code>plan</code> shows is what <code>run</code> does</h2>
     <p class="section__lede">
-      Compaction and manifest rewriting are <strong>planned but not executed</strong>:
-      committing them means removing data files, and <code>iceberg-rust</code> has no
-      transaction action that does. Bergman reports the need and marks the operation
-      blocked rather than pretending.
+      Both build the same plan through the same code, so a preview cannot disagree
+      with the thing it previews. Every operation carries the measurement that
+      triggered it and the threshold it crossed.
     </p>
 
 <pre class="code-showcase"><code class="language-text">$ bergman plan
 
 prod.analytics.events
   rule: prod.analytics.*
-  !! compact
+  -&gt; compact
      why: partition d=2026-08-20: 412 of 480 files below 384 MiB (86% &ge; 30%)
-     reads 480 files (2.14 GiB), writes ~5 files
-     BLOCKED: compaction needs a commit that removes data files; iceberg-rust
-     0.10 has no such transaction action and its commit API is crate-private
-     (apache/iceberg-rust#2186). Planned and reported only.
+     reads 412 files (1.83 GiB), writes ~5 files
   -&gt; expire-snapshots
      why: oldest snapshot is 34d old (&gt; 7d), 61 snapshots retained (keeping at least 3)
      removes up to 58 snapshots
 
-1 tables, 2 operations (1 will run, 1 blocked), 2.14 GiB to read</code></pre>
+1 tables, 2 operations, 1.83 GiB to read</code></pre>
 
     <p class="section__foot">
-      A tool that silently did nothing about a need it had just reported would be
-      worse than one that never looked.
-      <a href="{{ get_url(path='@/docs/status.md') }}">What works today →</a>
+      It reads 412 files, not 480: a partition triggers a rewrite, but only the files
+      a rewrite would improve are read.
+      <a href="{{ get_url(path='@/docs/compaction.md') }}#eligible">Which files those are →</a>
     </p>
   </div>
 </section>

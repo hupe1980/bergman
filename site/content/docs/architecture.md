@@ -270,14 +270,23 @@ physical cleanup as a higher-level responsibility. Bergman computes the reachabl
 set before and after the commit and deletes the difference.
 
 **Commit delivery**, as above — including the OAuth2 client-credentials
-exchange, with refresh. `iceberg-catalog-rest` carries a `TODO: Support
-automatic token refreshing`, and the commit path reads the same auth properties
-the read path does. Two clients that authenticated differently would let reads
-succeed and every write return 401 — the tool would appear to work and quietly
-change nothing.
+exchange, with refresh. The commit path reads the same auth properties the read
+path does: two clients that authenticated differently would let reads succeed
+and every write return 401, and the tool would appear to work and quietly change
+nothing.
 
-All four are temporary implementations while the gap exists, and the first two
-are the natural things to contribute back.
+**Token renewal for the read path.** `iceberg-catalog-rest` carries a `TODO:
+Support automatic token refreshing`, so it exchanges its credential once and
+never again. Bergman's commit client renews its own; the catalog client — table
+loads, discovery, and snapshot expiration's commit — is renewed from outside by
+`refresh_credentials()`, before each cycle. Renewing rather than reacting to a
+401, because upstream maps one onto `ErrorKind::Unexpected` and telling an
+expired token from a permission error would mean matching on message text.
+
+All five are temporary implementations while the gap exists, and the first two
+are the natural things to contribute back — as is a setter for extra headers on
+`RestCatalogBuilder`, without which upstream's own actions cannot carry
+Bergman's run id (see [Rustberg](@/docs/rustberg.md#joined-audit-trails)).
 
 ## Errors carry a disposition
 

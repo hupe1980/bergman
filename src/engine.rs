@@ -8,7 +8,7 @@ use futures::stream::{self, StreamExt};
 use iceberg::Catalog;
 use uuid::Uuid;
 
-use crate::catalog::CatalogConfig;
+use crate::catalog::{CatalogConfig, CredentialRefresh};
 use crate::commit::TableCommitter;
 use crate::error::{Error, Result};
 use crate::health::TableHealth;
@@ -54,6 +54,11 @@ pub struct Bergman {
 struct ConnectedCatalog {
     config: CatalogConfig,
     client: Arc<dyn Catalog>,
+    /// How to renew `client`'s bearer token, when it has one that expires.
+    ///
+    /// See [`crate::catalog::CredentialRefresh`] for why the read path needs
+    /// this and the commit path does not.
+    refresh: Option<Arc<dyn CredentialRefresh>>,
     /// Bergman's own commit path, for the operations `iceberg::Transaction`
     /// cannot express (see [`crate::commit`]).
     committer: Arc<dyn TableCommitter>,
@@ -141,11 +146,12 @@ impl BergmanBuilder {
 
         let mut catalogs = Vec::with_capacity(self.config.catalogs.len());
         for config in &self.config.catalogs {
-            let client = config.connect().await?;
+            let connection = config.connect().await?;
             let committer = config.committer().await?;
             catalogs.push(ConnectedCatalog {
                 config: config.clone(),
-                client,
+                client: connection.client,
+                refresh: connection.refresh,
                 committer,
             });
         }
@@ -196,6 +202,9 @@ impl Bergman {
     }
 
     async fn inspect_where(&self, selection: &Selection) -> Result<Vec<TableHealth>> {
+        // One reading for the whole sweep, so two tables examined a minute apart
+        // are still reported as of the same moment.
+        let now = Utc::now();
         let mut out = Vec::new();
         let limit = self.policy.limits().max_parallel_tables.max(1);
 
@@ -212,7 +221,7 @@ impl Bergman {
                 })
                 .map(|d| async move {
                     let health = self
-                        .examine(catalog, &d.table)
+                        .examine(catalog, &d.table, now)
                         .await
                         .map(|(health, _)| health);
                     (d.table, health)
@@ -356,6 +365,42 @@ impl Bergman {
         Ok(plan)
     }
 
+    /// Renew every catalog client's bearer token, where it has one that expires.
+    ///
+    /// Reads nothing and writes nothing to any table; the only I/O is one
+    /// `OAuth2` exchange per catalog configured with a `credential`. A catalog
+    /// authenticating with a static `token`, or with nothing at all, is skipped.
+    ///
+    /// **A long-lived process should call this before each cycle**, as
+    /// [`crate::sched::Daemon`] does: the catalog client exchanges its
+    /// credential once at construction and never again, so a daemon holding a
+    /// one-hour token keeps its cadence perfectly and stops reading a single
+    /// table. A one-shot `bergman run` outlives no token.
+    ///
+    /// A catalog whose renewal fails is reported and skipped, not fatal —
+    /// upstream fetches the replacement before discarding the old token, so the
+    /// one in hand still works. Returns how many catalogs were renewed.
+    pub async fn refresh_credentials(&self) -> usize {
+        let mut renewed = 0;
+        for catalog in &self.catalogs {
+            let Some(refresh) = &catalog.refresh else {
+                continue;
+            };
+            match refresh.refresh().await {
+                Ok(()) => {
+                    renewed += 1;
+                    tracing::debug!(catalog = %catalog.config.name, "catalog credential renewed");
+                }
+                Err(e) => tracing::warn!(
+                    catalog = %catalog.config.name,
+                    error = %e,
+                    "catalog credential could not be renewed; continuing with the token in hand"
+                ),
+            }
+        }
+        renewed
+    }
+
     /// Execute a plan.
     ///
     /// The first method that writes anything.
@@ -495,18 +540,34 @@ impl Bergman {
                 continue;
             }
 
-            let result = self
-                .execute(catalog, &table, table_plan, ctx, &operation.targets)
-                .await
-                .unwrap_or_else(|e| match e {
-                    Error::Refused { reason, .. } => OperationResult::Refused { reason },
-                    other if other.is_replan() => OperationResult::Conflicted {
-                        detail: other.to_string(),
-                    },
-                    other => OperationResult::Failed {
-                        error: other.to_string(),
-                    },
-                });
+            // One place, because every operation passes through it and a
+            // deadline enforced on three of four is not a deadline. Cancelling
+            // is safe by construction: maintenance is crash-only, so a rewrite
+            // dropped part-way leaves files nothing references — which is what
+            // the orphan scanner reclaims — and a commit is one atomic request,
+            // so it either happened or did not.
+            let attempt = self.execute(catalog, &table, table_plan, ctx, &operation.targets);
+            let outcome = match self.policy.limits().operation_timeout {
+                Some(limit) => match tokio::time::timeout(limit, attempt).await {
+                    Ok(outcome) => outcome,
+                    Err(_) => Err(Error::Timeout {
+                        table: table_plan.table.to_string(),
+                        operation: operation.kind.as_str(),
+                        after: limit,
+                    }),
+                },
+                None => attempt.await,
+            };
+
+            let result = outcome.unwrap_or_else(|e| match e {
+                Error::Refused { reason, .. } => OperationResult::Refused { reason },
+                other if other.is_replan() => OperationResult::Conflicted {
+                    detail: other.to_string(),
+                },
+                other => OperationResult::Failed {
+                    error: other.to_string(),
+                },
+            });
 
             self.observer
                 .operation_finished(ctx, &result, started.elapsed())
@@ -632,7 +693,7 @@ impl Bergman {
             Decision::Maintain(_) => {}
         }
 
-        let (health, decision) = match self.examine(catalog, table).await {
+        let (health, decision) = match self.examine(catalog, table, now).await {
             Ok(examined) => examined,
             // One unreadable table does not stop the sweep, and the reason
             // reaches the plan rather than only a log line.
@@ -669,10 +730,20 @@ impl Bergman {
         }
     }
 
+    /// Load a table, resolve its policy, and measure it — all against one clock
+    /// reading.
+    ///
+    /// `now` is the caller's, not a fresh `Utc::now()`. Snapshot ages and the
+    /// settle-time check are both derived from it, and the planner then compares
+    /// what it produced against *its* `now`: two readings inside one examination
+    /// can disagree about whether a partition has settled, which is a decision
+    /// that reads differently on every run for no reason anyone can see. The
+    /// same rule operations follow (see [`crate::ops::OpEnv::now`]).
     async fn examine(
         &self,
         catalog: &ConnectedCatalog,
         table_ref: &TableRef,
+        now: DateTime<Utc>,
     ) -> Result<(TableHealth, Decision)> {
         let table = self.load(catalog, table_ref).await?;
         let decision = self
@@ -688,7 +759,7 @@ impl Bergman {
             _ => 8 * 1024 * 1024,
         };
 
-        let health = crate::health::analyze(table_ref, &table, target, Utc::now()).await?;
+        let health = crate::health::analyze(table_ref, &table, target, now).await?;
 
         // Remembered so orphan removal can refuse a table that another table
         // lives inside (see `crate::ops::orphans`, check 5). Recorded here

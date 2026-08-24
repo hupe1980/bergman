@@ -331,7 +331,7 @@ impl TestTable {
             .expect("an append changes something");
 
         self.committer
-            .commit(&self.ident, requirements, updates)
+            .commit(&self.ident, requirements, updates, fixture_ctx())
             .await
     }
 
@@ -464,6 +464,7 @@ impl TestTable {
                         ),
                     },
                 ],
+                fixture_ctx(),
             )
             .await
     }
@@ -505,6 +506,13 @@ pub struct InMemoryCommitter {
     metadata: Mutex<TableMetadata>,
     /// Commits accepted so far, for assertions.
     pub commits: Mutex<usize>,
+    /// Commits *offered*, accepted or not.
+    ///
+    /// The difference between this and `commits` is wasted work: a rewrite whose
+    /// compare-and-swap is rejected has already read and written its whole file
+    /// group by the time it is refused. A test that only counted successes could
+    /// not see a compactor doing everything twice.
+    pub attempts: Mutex<usize>,
     /// When set, the next commit is rejected as a conflict.
     pub fail_next_as_conflict: Mutex<bool>,
     /// When set, every commit is rejected as a conflict.
@@ -519,6 +527,7 @@ impl InMemoryCommitter {
         Self {
             metadata: Mutex::new(metadata),
             commits: Mutex::new(0),
+            attempts: Mutex::new(0),
             fail_next_as_conflict: Mutex::new(false),
             always_conflict: Mutex::new(false),
         }
@@ -531,6 +540,11 @@ impl InMemoryCommitter {
     pub fn commit_count(&self) -> usize {
         *self.commits.lock().unwrap()
     }
+
+    /// How many commits were offered, accepted or not.
+    pub fn attempt_count(&self) -> usize {
+        *self.attempts.lock().unwrap()
+    }
 }
 
 #[async_trait::async_trait]
@@ -540,7 +554,9 @@ impl TableCommitter for InMemoryCommitter {
         ident: &TableIdent,
         requirements: Vec<TableRequirement>,
         updates: Vec<TableUpdate>,
+        _ctx: bergman::obs::OperationContext<'_>,
     ) -> Result<()> {
+        *self.attempts.lock().unwrap() += 1;
         if *self.always_conflict.lock().unwrap()
             || std::mem::replace(&mut *self.fail_next_as_conflict.lock().unwrap(), false)
         {
@@ -614,7 +630,7 @@ impl iceberg::Catalog for FixtureCatalog {
         let updates = commit.take_updates();
 
         self.committer
-            .commit(&ident, requirements, updates)
+            .commit(&ident, requirements, updates, fixture_ctx())
             .await
             .map_err(|e| {
                 // Conflicts keep their identity across the boundary, or the
@@ -792,6 +808,26 @@ pub async fn live_delete_files(table: &Table) -> Result<Vec<String>> {
 /// Operations receive one `OpEnv` rather than eight positional handles, and
 /// tests should build it the same way the engine does — otherwise a change to
 /// what an operation needs shows up as eight edits per test.
+/// The context the *fixture's own* commits carry.
+///
+/// The fixture plays the foreground writer — appends, equality deletes — which
+/// is not maintenance at all, so nothing here needs to be true of a real run.
+/// It exists because [`bergman::commit::TableCommitter`] asks every commit to
+/// say which run produced it, and a writer that could not answer would be a
+/// writer Bergman's own commit path could not be tested against.
+pub fn fixture_ctx() -> bergman::obs::OperationContext<'static> {
+    static TABLE: std::sync::LazyLock<bergman::policy::TableRef> =
+        std::sync::LazyLock::new(|| bergman::policy::TableRef::new("prod", ["db"], "events"));
+
+    bergman::obs::OperationContext {
+        run_id: "fixture",
+        table: &TABLE,
+        kind: bergman::plan::OperationKind::Compact,
+        matched_rule: "fixture",
+        reason: "the test fixture writing as a foreground writer would",
+    }
+}
+
 pub fn op_env<'a>(
     table: &'a Table,
     ident: &'a TableIdent,
@@ -1028,7 +1064,29 @@ impl TestTable {
                         ),
                     },
                 ],
+                fixture_ctx(),
             )
             .await
     }
+}
+
+/// Every live data file with its size, for tests about which files a rewrite
+/// reads.
+///
+/// A rewrite is eligibility-filtered by size, so a test about that rule has to
+/// see sizes rather than paths — and reading them from the scan is what the
+/// executor itself does.
+pub async fn live_data_files_with_sizes(table: &Table) -> Result<Vec<(String, u64)>> {
+    use futures::StreamExt;
+
+    let scan = table.scan().build()?;
+    let mut stream = scan.plan_files().await?;
+
+    let mut files = Vec::new();
+    while let Some(task) = stream.next().await {
+        let task = task?;
+        files.push((task.data_file_path, task.file_size_in_bytes));
+    }
+    files.sort();
+    Ok(files)
 }

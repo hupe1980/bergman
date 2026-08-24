@@ -82,3 +82,35 @@ fn the_readme_quick_start_config_parses() {
 
     Policy::compile(&config).expect("the README quick-start config must compile");
 }
+
+#[test]
+fn an_operation_timeout_of_zero_is_refused() {
+    // Zero would cancel every operation before it began, which is a config that
+    // silently maintains nothing — the shape of failure the whole `limits`
+    // section exists to make loud.
+    let err = bergman::policy::Config::from_toml(
+        "[limits]\noperation_timeout = \"0s\"\n\n[[rules]]\nmatch = \"prod.**\"\n",
+    )
+    .and_then(|config| bergman::policy::Policy::compile(&config).map(|_| ()))
+    .unwrap_err();
+    assert!(err.to_string().contains("operation_timeout"), "got: {err}");
+}
+
+#[test]
+fn an_operation_timeout_is_read_in_the_units_operators_write() {
+    // The same `humantime` vocabulary every other duration in the file uses.
+    let config =
+        bergman::policy::Config::from_toml("[limits]\noperation_timeout = \"45m\"\n").unwrap();
+    assert_eq!(
+        config.limits.operation_timeout,
+        Some(std::time::Duration::from_secs(45 * 60))
+    );
+}
+
+#[test]
+fn no_operation_timeout_is_the_default() {
+    // The right value depends on the largest group a deployment rewrites, and a
+    // wrong one cancels honest work — so it is asked for rather than assumed.
+    let config = bergman::policy::Config::default();
+    assert_eq!(config.limits.operation_timeout, None);
+}

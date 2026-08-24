@@ -30,8 +30,6 @@
 //!    says so — the same ceiling, through the same deleter, that expiration's
 //!    cleanup uses (see [`crate::ops::delete`]).
 
-use std::collections::BTreeSet;
-
 use futures::StreamExt;
 
 use crate::error::{Error, Result};
@@ -133,7 +131,7 @@ pub async fn run(
     let mut scanned = 0usize;
     let mut candidates: Vec<String> = Vec::new();
     let mut orphan_bytes = 0u64;
-    let mut foreign_roots: BTreeSet<String> = BTreeSet::new();
+    let mut foreign_root: Option<String> = None;
 
     while let Some(object) = listing.next().await {
         let object = object?;
@@ -142,9 +140,15 @@ pub async fn run(
         // Check 5, second half, and the one that does not depend on Bergman
         // having examined anything: another table's own metadata document,
         // found under this location.
+        //
+        // The scan stops here rather than finishing the listing and refusing
+        // afterwards. The answer cannot change — one nested table is enough to
+        // refuse — and continuing would pay for a full recursive listing of a
+        // location nothing will be deleted from, which on a large table is real
+        // money for a decision already made.
         if let Some(root) = nested_table_root(&location, &object.path) {
-            foreign_roots.insert(root);
-            continue;
+            foreign_root = Some(root);
+            break;
         }
 
         if reachable.contains(&object.path) {
@@ -179,7 +183,7 @@ pub async fn run(
         candidates.push(object.path);
     }
 
-    if let Some(nested) = foreign_roots.iter().next() {
+    if let Some(nested) = &foreign_root {
         return Err(nested_refusal(table_ref, &location, nested));
     }
 

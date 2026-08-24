@@ -8,7 +8,7 @@
 mod discovery;
 mod storage;
 
-pub use discovery::{DiscoveredTable, discover};
+pub use discovery::{DiscoveredTable, NamespaceSource, discover};
 pub use storage::{StorageScheme, resolving_factory};
 
 use std::collections::HashMap;
@@ -137,20 +137,86 @@ impl std::fmt::Debug for CatalogConfig {
     }
 }
 
+/// Renews a catalog client's own bearer token.
+///
+/// `iceberg-catalog-rest` exchanges an `OAuth2` credential once, at
+/// construction, and never again — its source carries a `TODO: Support
+/// automatic token refreshing`. Bergman's commit client renews its own (see
+/// [`crate::commit::TokenSource`]); the *read* path is this one, and reads are
+/// everything else: table loads, discovery, and snapshot expiration's commit. A
+/// daemon holding a one-hour token keeps its cadence perfectly and stops
+/// reading a single table.
+///
+/// Renewed before each cycle rather than in response to a 401, because
+/// recognising one is not available: upstream maps it onto
+/// `ErrorKind::Unexpected` with the status buried in an error context, and
+/// classifying by message text is what [`crate::ops::expire`] refuses to do.
+#[async_trait::async_trait]
+pub trait CredentialRefresh: Send + Sync + std::fmt::Debug {
+    /// Exchange the configured credential for a fresh token.
+    async fn refresh(&self) -> Result<()>;
+}
+
+#[cfg(feature = "catalog-rest")]
+#[async_trait::async_trait]
+impl CredentialRefresh for iceberg_catalog_rest::RestCatalog {
+    async fn refresh(&self) -> Result<()> {
+        // `regenerate_token` fetches the new token *before* invalidating the
+        // old one, so a failed exchange leaves the working token in place
+        // rather than a client that can no longer authenticate at all.
+        self.regenerate_token()
+            .await
+            .map_err(|e| Error::Catalog(Box::new(e)))
+    }
+}
+
+/// A connected catalog client, and the handle that renews its credential.
+///
+/// One type rather than two calls, because the refresher has to be the *same*
+/// client: a second one built from the same configuration would have its own
+/// token cache, and renewing that would leave the client actually in use
+/// holding the token that expired.
+#[derive(Debug, Clone)]
+pub struct CatalogConnection {
+    /// The client every read goes through.
+    pub client: Arc<dyn iceberg::Catalog>,
+    /// How to renew its token, when it has one that expires.
+    ///
+    /// `None` for a static `token`, which has no exchange to repeat, and for a
+    /// catalog with no credential at all.
+    pub refresh: Option<Arc<dyn CredentialRefresh>>,
+}
+
 impl CatalogConfig {
     /// Build the catalog client.
     ///
     /// Credentials are read from the environment here rather than at parse
     /// time, so a configuration can be linted (`bergman policy lint`) on a
     /// machine that holds no credentials at all.
-    pub async fn connect(&self) -> Result<Arc<dyn iceberg::Catalog>> {
+    pub async fn connect(&self) -> Result<CatalogConnection> {
         match self.kind {
             CatalogKind::Rest => self.connect_rest().await,
         }
     }
 
+    /// Whether this catalog's credential is one that expires and can be renewed.
+    ///
+    /// Only the `OAuth2` client-credentials exchange is: a `token` — however it
+    /// was supplied — is a value whose lifetime belongs to whatever produced
+    /// it, and there is no exchange to repeat. An explicit `token_env` wins
+    /// over `credential` in the client, so it counts here too.
+    ///
+    /// Gated with the only protocol that has an exchange to repeat, so that a
+    /// build without it carries no dead code.
     #[cfg(feature = "catalog-rest")]
-    async fn connect_rest(&self) -> Result<Arc<dyn iceberg::Catalog>> {
+    fn has_renewable_credential(&self) -> bool {
+        self.token_env.is_none()
+            && !self.properties.contains_key("token")
+            && self.properties.contains_key("credential")
+    }
+
+    #[cfg(feature = "catalog-rest")]
+    async fn connect_rest(&self) -> Result<CatalogConnection> {
         use iceberg::CatalogBuilder;
         use iceberg_catalog_rest::{
             REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalogBuilder,
@@ -175,16 +241,23 @@ impl CatalogConfig {
         let builder =
             RestCatalogBuilder::default().with_storage_factory(storage::resolving_factory());
 
-        let catalog = builder
-            .load(self.name.clone(), props)
-            .await
-            .map_err(|e| Error::Catalog(Box::new(e)))?;
+        let catalog = Arc::new(
+            builder
+                .load(self.name.clone(), props)
+                .await
+                .map_err(|e| Error::Catalog(Box::new(e)))?,
+        );
 
-        Ok(Arc::new(catalog))
+        Ok(CatalogConnection {
+            client: catalog.clone(),
+            refresh: self
+                .has_renewable_credential()
+                .then_some(catalog as Arc<dyn CredentialRefresh>),
+        })
     }
 
     #[cfg(not(feature = "catalog-rest"))]
-    async fn connect_rest(&self) -> Result<Arc<dyn iceberg::Catalog>> {
+    async fn connect_rest(&self) -> Result<CatalogConnection> {
         Err(Error::Unsupported(format!(
             "catalog \"{}\" is a REST catalog, but this build has no `catalog-rest` feature",
             self.name
@@ -360,6 +433,35 @@ mod tests {
         for key in ["s3.endpoint", "s3.region", "gcs.project-id"] {
             assert!(!is_secret_property(key), "{key} is not a secret");
         }
+    }
+
+    #[test]
+    #[cfg(feature = "catalog-rest")]
+    fn only_an_exchangeable_credential_is_renewable() {
+        // A token is a value whose lifetime belongs to whatever produced it —
+        // there is no exchange to repeat, and asking upstream to regenerate one
+        // errors rather than helping. Only the OAuth2 client-credentials flow
+        // has something to renew.
+        let mut plain = config("prod", Some("s3://b/wh"));
+        assert!(!plain.has_renewable_credential(), "no credential at all");
+
+        plain
+            .properties
+            .insert("credential".to_string(), "svc-bergman:hunter2".to_string());
+        assert!(plain.has_renewable_credential());
+
+        // A `token` wins over a `credential` in the client, so it wins here
+        // too: renewing a credential whose token the client never uses would
+        // be an exchange per cycle that changes nothing.
+        let mut with_token = plain.clone();
+        with_token
+            .properties
+            .insert("token".to_string(), "static".to_string());
+        assert!(!with_token.has_renewable_credential());
+
+        let mut with_token_env = plain.clone();
+        with_token_env.token_env = Some("BERGMAN_CATALOG_TOKEN".to_string());
+        assert!(!with_token_env.has_renewable_credential());
     }
 
     #[test]

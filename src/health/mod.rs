@@ -14,8 +14,8 @@
 mod analyze;
 mod partition;
 
-pub use analyze::{analyze, partition_index};
-pub use partition::{PartitionHealth, PartitionKey, UNPARTITIONED, partition_path};
+pub use analyze::{FileIndex, analyze, file_index};
+pub use partition::{Eligible, PartitionHealth, PartitionKey, UNPARTITIONED, partition_path};
 
 use std::time::Duration;
 
@@ -40,10 +40,12 @@ pub struct TableHealth {
     /// The table's `write.format.default`, lower-cased, when it sets one.
     ///
     /// Carried on the health report so the planner can say *before* a cycle that
-    /// compaction will never run against this table. Bergman reads Parquet, Avro
-    /// and ORC but writes only Parquet, and a rewrite must not silently change a
-    /// table's format — so a table asking for anything else is refused, and a
-    /// refusal reported every cycle is noise where an explanation is wanted.
+    /// compaction will never run against this table. Bergman handles Parquet and
+    /// only Parquet, in both directions — upstream's `ArrowReader` opens a
+    /// Parquet stream whatever a scan task's format field says — and a rewrite
+    /// must not silently change a table's format, so a table asking for anything
+    /// else is refused. A refusal reported every cycle is noise where an
+    /// explanation is wanted, which is why this reaches the plan as a note.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_format: Option<String>,
     /// The partition spec new files are written under.

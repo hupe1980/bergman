@@ -72,12 +72,17 @@ fmt:
 # compiles under `--all-features` can be broken *alone*, because some other
 # crate's feature was switching on the thing it needed. That failure only
 # appears in exactly this build.
+#
+# Warnings are errors here, not only under `--all-features`: `just lint` runs
+# clippy against the full build, so a warning that exists only in a narrower one
+# — code left dead when a feature is off, most often — is invisible everywhere
+# else.
 check-all:
-    cargo check --no-default-features
-    cargo check --all-features
+    RUSTFLAGS="-D warnings" cargo check --no-default-features
+    RUSTFLAGS="-D warnings" cargo check --all-features
     @for feature in cli catalog-rest compaction storage-s3 storage-gcs storage-azure metrics; do \
         echo "--- checking feature: $feature (alone) ---"; \
-        cargo check --no-default-features --features "$feature" || exit 1; \
+        RUSTFLAGS="-D warnings" cargo check --no-default-features --features "$feature" || exit 1; \
     done
 
 # Documentation must build without warnings: a broken intra-doc link is a

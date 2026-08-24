@@ -44,7 +44,14 @@ mod bergman_defaults {
     pub const MIN_INPUT_FILES: usize = 5;
     pub const DELETE_RATIO: f64 = 0.1;
     /// A file smaller than this fraction of the target counts as small.
+    ///
+    /// Spark's `min-file-size-bytes` default, so a table maintained by both
+    /// tools is judged by one rule.
     pub const MIN_FILE_SIZE_RATIO: f64 = 0.75;
+    /// A file larger than this multiple of the target counts as oversized.
+    ///
+    /// Spark's `max-file-size-bytes` default, for the same reason.
+    pub const MAX_FILE_SIZE_RATIO: f64 = 1.8;
     /// An hour of quiet before a partition is considered settled.
     ///
     /// Long enough that a streaming writer committing every few seconds is
@@ -322,14 +329,36 @@ type PropertyParser<'a, T> = &'a dyn Fn(&str) -> Option<T>;
 /// A table property Bergman consults: its name, and how to parse it.
 type PropertySource<'a, T> = (&'a str, PropertyParser<'a, T>);
 
-fn parse_u64(s: &str) -> Option<u64> {
-    s.trim().parse().ok()
+/// A size or a count from a table property, which must be positive.
+///
+/// Every property read through this is a divisor or a threshold, and a zero
+/// turns each one into its own opposite:
+///
+/// - `write.target-file-size-bytes = 0` makes the oversized threshold zero, so
+///   **every file in the table is oversized**. The partition triggers on that
+///   alone, the "N in, N out" guard is deliberately disabled for oversized
+///   files, and the rolling writer is then handed a target of zero. The table
+///   rewrites itself, entirely, every cycle, forever.
+/// - `commit.manifest.target-size-bytes = 0` makes no manifest undersized, so
+///   manifest rewriting silently never runs.
+/// - `history.expire.min-snapshots-to-keep = 0` removes the retention floor
+///   that `[defaults]` is validated against — the config layer refuses a zero
+///   and the property layer would have waved it through.
+///
+/// Rejecting means falling through to the documented default, and the value is
+/// reported as a warning (see [`unparseable_properties`]) rather than failing
+/// the table: it is one table owner's mistake, and refusing to maintain a table
+/// over a property is the worse outcome.
+fn parse_positive_u64(s: &str) -> Option<u64> {
+    s.trim().parse().ok().filter(|v| *v > 0)
 }
 
-fn parse_usize(s: &str) -> Option<usize> {
-    s.trim().parse().ok()
+fn parse_positive_usize(s: &str) -> Option<usize> {
+    s.trim().parse().ok().filter(|v| *v > 0)
 }
 
+/// A duration in milliseconds. Zero is meaningful here — "no snapshot is too
+/// young to expire" — and the retention floor still bounds what goes.
 fn parse_millis(s: &str) -> Option<Duration> {
     s.trim().parse::<u64>().ok().map(Duration::from_millis)
 }
@@ -371,6 +400,8 @@ pub struct EffectiveCompaction {
     pub delete_ratio: Resolved<f64>,
     /// What counts as small, as a fraction of the target.
     pub min_file_size_ratio: Resolved<f64>,
+    /// What counts as oversized, as a multiple of the target.
+    pub max_file_size_ratio: Resolved<f64>,
     /// How long a partition must be quiet before it is rewritten.
     pub min_file_age: Resolved<Duration>,
     /// Sort columns, if the rule, the defaults, or the table itself asks for
@@ -389,6 +420,40 @@ impl EffectiveCompaction {
     /// The size below which a file counts as small.
     pub fn small_file_threshold(&self) -> u64 {
         (self.target_file_size.value as f64 * self.min_file_size_ratio.value) as u64
+    }
+
+    /// The size above which a file counts as oversized.
+    ///
+    /// Saturating rather than wrapping: a target near `u64::MAX` multiplied by
+    /// 1.8 does not fit, and a wrapped ceiling would make every file oversized.
+    pub fn large_file_threshold(&self) -> u64 {
+        let raw = self.target_file_size.value as f64 * self.max_file_size_ratio.value;
+        if raw >= u64::MAX as f64 {
+            u64::MAX
+        } else {
+            raw as u64
+        }
+    }
+
+    /// Which of a partition's files a rewrite would actually read.
+    ///
+    /// This is the rule that decides what compaction *costs*, and getting it
+    /// wrong is expensive rather than incorrect: a partition that triggers
+    /// because a third of its files are small does not need its other two
+    /// thirds — already at target — read and written back to achieve it. Spark
+    /// draws the same line in `SizeBasedFileRewriter.filterFiles`, and drawing
+    /// it anywhere else would make a table maintained by both tools cost
+    /// different amounts depending on which one ran.
+    ///
+    /// Three ways a file earns a rewrite, and they are genuinely different:
+    ///
+    /// - **too small** — merging it is the whole point;
+    /// - **oversized** — nothing else ever splits it, and one unsplittable file
+    ///   is a task no reader can parallelise;
+    /// - **carrying deletes** — its size is irrelevant, because the rewrite is
+    ///   what applies the deletes and retires the delete files.
+    pub fn is_eligible(&self, size: u64, has_deletes: bool) -> bool {
+        has_deletes || size < self.small_file_threshold() || size > self.large_file_threshold()
     }
 }
 
@@ -456,7 +521,7 @@ impl EffectivePolicy {
             ),
             target_file_size: l.resolve(
                 |s| s.compaction.as_ref().and_then(|c| c.target_file_size),
-                Some(("write.target-file-size-bytes", &parse_u64)),
+                Some(("write.target-file-size-bytes", &parse_positive_u64)),
                 spec_defaults::TARGET_FILE_SIZE,
                 Provenance::IcebergDefault,
             ),
@@ -482,6 +547,12 @@ impl EffectivePolicy {
                 |s| trigger(s).and_then(|t| t.min_file_size_ratio),
                 None,
                 bergman_defaults::MIN_FILE_SIZE_RATIO,
+                Provenance::BergmanDefault,
+            ),
+            max_file_size_ratio: l.resolve(
+                |s| trigger(s).and_then(|t| t.max_file_size_ratio),
+                None,
+                bergman_defaults::MAX_FILE_SIZE_RATIO,
                 Provenance::BergmanDefault,
             ),
             min_file_age: l.resolve(
@@ -546,7 +617,10 @@ impl EffectivePolicy {
             ),
             min_to_keep: l.resolve(
                 |s| s.snapshots.as_ref().and_then(|c| c.min_to_keep),
-                Some(("history.expire.min-snapshots-to-keep", &parse_usize)),
+                Some((
+                    "history.expire.min-snapshots-to-keep",
+                    &parse_positive_usize,
+                )),
                 spec_defaults::MIN_SNAPSHOTS_TO_KEEP,
                 Provenance::IcebergDefault,
             ),
@@ -567,13 +641,13 @@ impl EffectivePolicy {
             ),
             target_size: l.resolve(
                 |s| s.manifests.as_ref().and_then(|c| c.target_size),
-                Some(("commit.manifest.target-size-bytes", &parse_u64)),
+                Some(("commit.manifest.target-size-bytes", &parse_positive_u64)),
                 spec_defaults::MANIFEST_TARGET_SIZE,
                 Provenance::IcebergDefault,
             ),
             min_count_to_merge: l.resolve(
                 |s| s.manifests.as_ref().and_then(|c| c.min_count_to_merge),
-                Some(("commit.manifest.min-count-to-merge", &parse_usize)),
+                Some(("commit.manifest.min-count-to-merge", &parse_positive_usize)),
                 spec_defaults::MANIFEST_MIN_COUNT_TO_MERGE,
                 Provenance::IcebergDefault,
             ),
@@ -657,18 +731,20 @@ fn unparseable_properties(properties: &HashMap<String, String>) -> Vec<String> {
     type Check = (&'static str, fn(&str) -> bool);
 
     const CHECKED: &[Check] = &[
-        ("write.target-file-size-bytes", |s| parse_u64(s).is_some()),
+        ("write.target-file-size-bytes", |s| {
+            parse_positive_u64(s).is_some()
+        }),
         ("history.expire.max-snapshot-age-ms", |s| {
             parse_millis(s).is_some()
         }),
         ("history.expire.min-snapshots-to-keep", |s| {
-            parse_usize(s).is_some()
+            parse_positive_usize(s).is_some()
         }),
         ("commit.manifest.target-size-bytes", |s| {
-            parse_u64(s).is_some()
+            parse_positive_u64(s).is_some()
         }),
         ("commit.manifest.min-count-to-merge", |s| {
-            parse_usize(s).is_some()
+            parse_positive_usize(s).is_some()
         }),
     ];
 
@@ -708,6 +784,101 @@ mod tests {
     }
 
     const MATCH_ALL: &str = "[[rules]]\nmatch = \"prod.db.t\"\n";
+
+    #[test]
+    fn a_zero_target_file_size_property_does_not_make_every_file_oversized() {
+        // A zero target makes the oversized threshold zero, so every file in
+        // the table is above it — a trigger with no minimum file count and no
+        // "N in, N out" guard, and a rolling writer handed a target of zero.
+        // The config layer already refuses a zero; the property layer must too,
+        // or the rule has a hole in the half nobody reviews.
+        let zeroed = decide(MATCH_ALL, &[("write.target-file-size-bytes", "0")]);
+
+        assert_eq!(
+            zeroed.compaction.target_file_size.value,
+            spec_defaults::TARGET_FILE_SIZE,
+            "a zero target must fall through to the documented default"
+        );
+        assert_eq!(
+            zeroed.compaction.target_file_size.from,
+            Provenance::IcebergDefault
+        );
+        assert!(zeroed.compaction.large_file_threshold() > 0);
+        assert!(
+            !zeroed
+                .compaction
+                .is_eligible(spec_defaults::TARGET_FILE_SIZE, false),
+            "a file at the target size must be neither small nor oversized"
+        );
+
+        // And it is reported rather than silently corrected: a property that
+        // does nothing looks exactly like one that works.
+        assert!(
+            zeroed
+                .warnings
+                .iter()
+                .any(|w| w.contains("write.target-file-size-bytes")),
+            "got: {:?}",
+            zeroed.warnings
+        );
+    }
+
+    #[test]
+    fn zero_is_refused_for_every_size_and_count_property() {
+        // Each of these is a divisor or a threshold, and each turns into its
+        // own opposite at zero: no manifest is undersized so rewriting never
+        // runs, and the retention floor that `[defaults]` is validated against
+        // disappears.
+        for (key, value) in [
+            ("commit.manifest.target-size-bytes", "0"),
+            ("commit.manifest.min-count-to-merge", "0"),
+            ("history.expire.min-snapshots-to-keep", "0"),
+        ] {
+            let resolved = decide(MATCH_ALL, &[(key, value)]);
+            assert!(
+                resolved.warnings.iter().any(|w| w.contains(key)),
+                "{key} = {value} was accepted: {:?}",
+                resolved.warnings
+            );
+        }
+
+        let resolved = decide(
+            MATCH_ALL,
+            &[
+                ("commit.manifest.target-size-bytes", "0"),
+                ("commit.manifest.min-count-to-merge", "0"),
+                ("history.expire.min-snapshots-to-keep", "0"),
+            ],
+        );
+        assert_eq!(
+            resolved.manifests.target_size.value,
+            spec_defaults::MANIFEST_TARGET_SIZE
+        );
+        assert_eq!(
+            resolved.manifests.min_count_to_merge.value,
+            spec_defaults::MANIFEST_MIN_COUNT_TO_MERGE
+        );
+        assert!(
+            resolved.snapshots.min_to_keep.value >= 1,
+            "expiring every snapshot would leave the table unreadable"
+        );
+    }
+
+    #[test]
+    fn a_zero_snapshot_age_property_is_still_honoured() {
+        // Unlike the sizes and counts, zero is meaningful for an age: "no
+        // snapshot is too young to expire". The retention floor still bounds
+        // what actually goes, so this is a configuration rather than a hazard.
+        let resolved = decide(MATCH_ALL, &[("history.expire.max-snapshot-age-ms", "0")]);
+        assert_eq!(resolved.snapshots.max_age.value, Duration::ZERO);
+        assert_eq!(
+            resolved.snapshots.max_age.from,
+            Provenance::TableProperty {
+                key: "history.expire.max-snapshot-age-ms".into()
+            }
+        );
+        assert!(resolved.warnings.is_empty(), "{:?}", resolved.warnings);
+    }
 
     #[test]
     fn rule_beats_defaults_beats_property_beats_spec_default() {

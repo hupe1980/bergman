@@ -241,8 +241,25 @@ impl<'a> SnapshotProducer<'a> {
     /// A delete file becomes dangling when every data file it applied to has
     /// been rewritten away — which is exactly what happens to a delete file a
     /// rewrite could not retire because it was shared, once the other files it
-    /// covered are rewritten too. Nothing else ever removes them, and every
-    /// scan still opens each one.
+    /// covered are rewritten too. Nothing else ever removes them, and every scan
+    /// still opens each one.
+    ///
+    /// Removing one that is *not* dangling resurrects every row it was hiding,
+    /// so the question is answered **two independent ways and both must agree**:
+    ///
+    /// 1. `still_applied` — the delete files upstream's scan associated with a
+    ///    live data file. Exactly the relation a reader will use, but it is one
+    ///    library's index, and deleting on the strength of it alone is one bug
+    ///    away from data loss.
+    /// 2. The sequence-number argument, computed here from the manifests. A
+    ///    delete file applies only when the numbers stand in the right order —
+    ///    strictly greater for an equality delete, greater-or-equal for a
+    ///    positional one — so one below every live data file's number *in its
+    ///    partition* can apply to nothing. This is Java's
+    ///    `RemoveDanglingDeletes` rule, reached from the other side.
+    ///
+    /// It costs one pass over entries already in memory, and buys that the
+    /// dangerous half of this operation needs two derivations wrong at once.
     pub async fn dangling_delete_files(
         &self,
         still_applied: &HashSet<String>,
@@ -251,19 +268,76 @@ impl<'a> SnapshotProducer<'a> {
             return Ok(Vec::new());
         };
 
-        let mut dangling: Vec<String> = self
-            .load_manifests(parent)
-            .await?
-            .iter()
-            .flat_map(|m| m.entries.iter())
-            .filter(|entry| entry.content_type() != DataContentType::Data)
-            .map(|entry| entry.file_path().to_string())
-            .filter(|path| !still_applied.contains(&normalize(path)))
+        let manifests = self.load_manifests(parent).await?;
+        // The spec id comes from the manifest, not the entry: `DataFile` keeps
+        // its own copy crate-private, and a manifest carries exactly one spec
+        // for every entry in it, which is the authoritative answer anyway.
+        let entries = || {
+            manifests
+                .iter()
+                .flat_map(|m| m.entries.iter().map(|e| (m.file.partition_spec_id, e)))
+        };
+
+        // The lowest sequence number a live data file carries, per partition —
+        // and across the whole table, for the global case below.
+        let mut lowest: HashMap<(i32, iceberg::spec::Struct), i64> = HashMap::new();
+        let mut lowest_anywhere: Option<i64> = None;
+        for (spec_id, entry) in entries().filter(|(_, e)| e.content_type() == DataContentType::Data)
+        {
+            let Some(sequence) = entry.sequence_number() else {
+                continue;
+            };
+            let key = (spec_id, entry.data_file().partition().clone());
+            lowest
+                .entry(key)
+                .and_modify(|current| *current = (*current).min(sequence))
+                .or_insert(sequence);
+            lowest_anywhere = Some(lowest_anywhere.unwrap_or(sequence).min(sequence));
+        }
+
+        let mut dangling: Vec<String> = entries()
+            .filter(|(_, entry)| entry.content_type() != DataContentType::Data)
+            .filter(|(_, entry)| !still_applied.contains(&normalize(entry.file_path())))
+            .filter(|(spec_id, entry)| {
+                is_dead_by_sequence(*spec_id, entry, &lowest, lowest_anywhere)
+            })
+            .map(|(_, entry)| entry.file_path().to_string())
             .collect();
 
         dangling.sort();
         dangling.dedup();
         Ok(dangling)
+    }
+
+    /// Whether the table holds any delete manifest at all.
+    ///
+    /// One manifest-*list* read, and no manifest. A table with no delete
+    /// manifest can have no dangling delete file, and the alternative way to
+    /// learn that — planning the whole table's scan and finding no delete file
+    /// associated with anything — costs a full manifest walk to reach the same
+    /// answer. On the ordinary table, which has no delete files whatsoever,
+    /// that walk would happen every cycle forever.
+    pub async fn has_delete_manifests(&self, parent: &iceberg::spec::SnapshotRef) -> Result<bool> {
+        let metadata = self.table.metadata();
+        let bytes = self
+            .table
+            .file_io()
+            .new_input(parent.manifest_list())
+            .map_err(|e| Error::Storage(Box::new(e)))?
+            .read()
+            .await
+            .map_err(|e| Error::Storage(Box::new(e)))?;
+
+        let manifest_list =
+            iceberg::spec::ManifestList::parse_with_version(&bytes, metadata.format_version())
+                .map_err(|e| {
+                    Error::metadata(self.table.identifier().to_string(), format!("{e}"))
+                })?;
+
+        Ok(manifest_list
+            .entries()
+            .iter()
+            .any(|entry| entry.content == ManifestContentType::Deletes))
     }
 
     /// The id this producer will stamp on the snapshot it builds.
@@ -721,6 +795,55 @@ impl<'a> SnapshotProducer<'a> {
     }
 }
 
+/// Whether a delete file's own sequence number proves it applies to nothing.
+///
+/// The second of the two derivations [`SnapshotProducer::dangling_delete_files`]
+/// requires. `lowest` is the least sequence number a live data file carries in
+/// each `(spec, partition)`, and `lowest_anywhere` the least across the table.
+///
+/// Conservative wherever the metadata is not conclusive: a delete file with no
+/// sequence number of its own is kept, because an unknown number cannot be used
+/// to argue that it is low enough to be dead — the same shape as orphan
+/// removal's "unknown age means young".
+fn is_dead_by_sequence(
+    spec_id: i32,
+    entry: &ManifestEntry,
+    lowest: &HashMap<(i32, iceberg::spec::Struct), i64>,
+    lowest_anywhere: Option<i64>,
+) -> bool {
+    let Some(sequence) = entry.sequence_number() else {
+        return false;
+    };
+    let file = entry.data_file();
+
+    // "Equality delete files stored with an unpartitioned spec are applied as
+    // global deletes" — so an empty partition tuple means the file reaches
+    // every data file in the table, and the comparison has to be against the
+    // whole table's lowest rather than one partition's. Comparing it against
+    // one partition's would call it dead while it was still hiding rows in
+    // another.
+    let floor = if file.content_type() == DataContentType::EqualityDeletes
+        && file.partition().fields().is_empty()
+    {
+        lowest_anywhere
+    } else {
+        lowest.get(&(spec_id, file.partition().clone())).copied()
+    };
+
+    match floor {
+        // No live data file it could ever apply to.
+        None => true,
+        // An equality delete applies to a data file when its number is strictly
+        // greater; a positional one when it is greater or equal. Dead is the
+        // negation of that, asked of the lowest number any live data file
+        // carries — if it cannot reach the lowest, it reaches none of them.
+        Some(floor) => match file.content_type() {
+            DataContentType::EqualityDeletes => sequence <= floor,
+            _ => sequence < floor,
+        },
+    }
+}
+
 /// What a rewrite removes and what survives it, counted once.
 #[derive(Debug, Default)]
 struct Counts {
@@ -820,6 +943,144 @@ mod tests {
             }
             .is_empty()
         );
+    }
+
+    /// A delete-file manifest entry in `partition`, at `sequence`.
+    fn delete_entry(
+        content: DataContentType,
+        sequence: i64,
+        partition: iceberg::spec::Struct,
+    ) -> ManifestEntry {
+        use iceberg::spec::{DataFileBuilder, DataFileFormat};
+
+        let data_file = DataFileBuilder::default()
+            .content(content)
+            .file_path(format!("s3://b/t/deletes/{sequence}.parquet"))
+            .file_format(DataFileFormat::Parquet)
+            .partition(partition)
+            .record_count(1)
+            .file_size_in_bytes(1)
+            .equality_ids(Some(vec![1]))
+            .build()
+            .expect("delete file");
+
+        ManifestEntry::builder()
+            .status(ManifestStatus::Existing)
+            .snapshot_id(1)
+            .sequence_number(sequence)
+            .file_sequence_number(sequence)
+            .data_file(data_file)
+            .build()
+    }
+
+    fn partitioned(value: i32) -> iceberg::spec::Struct {
+        iceberg::spec::Struct::from_iter([Some(iceberg::spec::Literal::int(value))])
+    }
+
+    #[test]
+    fn a_delete_below_every_live_data_file_is_dead() {
+        // The second derivation, and Java's. Every live data file in this
+        // partition was written at sequence 10 or later, so a delete file at 4
+        // cannot apply to any of them however an index reports it.
+        let lowest = HashMap::from([((0, partitioned(1)), 10i64)]);
+
+        for content in [
+            DataContentType::EqualityDeletes,
+            DataContentType::PositionDeletes,
+        ] {
+            assert!(
+                is_dead_by_sequence(
+                    0,
+                    &delete_entry(content, 4, partitioned(1)),
+                    &lowest,
+                    Some(10)
+                ),
+                "{content:?} at 4 cannot reach a data file at 10"
+            );
+            assert!(
+                !is_dead_by_sequence(
+                    0,
+                    &delete_entry(content, 12, partitioned(1)),
+                    &lowest,
+                    Some(10)
+                ),
+                "{content:?} at 12 still applies"
+            );
+        }
+    }
+
+    #[test]
+    fn the_boundary_differs_by_delete_kind() {
+        // An equality delete applies when its number is *strictly* greater; a
+        // positional one when it is greater or equal. At exactly the lowest
+        // number the two answers differ, and getting it backwards either leaks
+        // a dead file forever or resurrects rows.
+        let lowest = HashMap::from([((0, partitioned(1)), 10i64)]);
+
+        assert!(
+            is_dead_by_sequence(
+                0,
+                &delete_entry(DataContentType::EqualityDeletes, 10, partitioned(1)),
+                &lowest,
+                Some(10)
+            ),
+            "an equality delete at the lowest number applies to nothing"
+        );
+        assert!(
+            !is_dead_by_sequence(
+                0,
+                &delete_entry(DataContentType::PositionDeletes, 10, partitioned(1)),
+                &lowest,
+                Some(10)
+            ),
+            "a positional delete at the lowest number still applies"
+        );
+    }
+
+    #[test]
+    fn a_partition_with_no_live_data_file_leaves_its_deletes_dead() {
+        // Everything the delete file covered has been rewritten away. This is
+        // the case the whole operation exists for.
+        assert!(is_dead_by_sequence(
+            0,
+            &delete_entry(DataContentType::EqualityDeletes, 7, partitioned(1)),
+            &HashMap::new(),
+            None,
+        ));
+    }
+
+    #[test]
+    fn a_global_equality_delete_is_measured_against_the_whole_table() {
+        // "Equality delete files stored with an unpartitioned spec are applied
+        // as global deletes." Measuring one against a single partition's lowest
+        // sequence number would call it dead while it was still hiding rows in
+        // every other partition.
+        let global = delete_entry(
+            DataContentType::EqualityDeletes,
+            7,
+            iceberg::spec::Struct::empty(),
+        );
+        // This partition's files are all newer than the delete...
+        let lowest = HashMap::from([((0, iceberg::spec::Struct::empty()), 20i64)]);
+
+        assert!(
+            !is_dead_by_sequence(0, &global, &lowest, Some(3)),
+            "...but somewhere in the table a data file at 3 is still covered"
+        );
+        assert!(
+            is_dead_by_sequence(0, &global, &lowest, Some(9)),
+            "with the whole table newer than the delete, it reaches nothing"
+        );
+    }
+
+    #[test]
+    fn a_delete_with_no_sequence_number_is_kept() {
+        // An unknown number cannot be used to argue that a file is old enough
+        // to remove — the same rule orphan removal applies to an unknown
+        // modification time, for the same reason.
+        let mut entry = delete_entry(DataContentType::EqualityDeletes, 1, partitioned(1));
+        entry.sequence_number = None;
+        assert!(!is_dead_by_sequence(0, &entry, &HashMap::new(), None));
     }
 
     #[test]

@@ -7,13 +7,12 @@ Bergman is a library first. The `bergman` binary is a thin consumer of the same
 public API you get, which is how that API stays sufficient — anything the CLI can
 do, an embedder can do.
 
-```toml
-[dependencies]
-bergman = { version = "0.1", default-features = false, features = ["catalog-rest", "storage-s3"] }
+```bash
+cargo add bergman --no-default-features --features catalog-rest,storage-s3
 ```
 
-`default-features = false` drops the CLI, the terminal renderer, the logging
-setup, the cloud backends you are not using — and the query engine.
+`--no-default-features` drops the CLI, the terminal renderer, the logging setup,
+the cloud backends you are not using — and the query engine.
 
 ## What each feature costs you
 
@@ -34,8 +33,8 @@ If you are embedding Bergman for **metadata maintenance** — the Lakekeeper
 shape: expire snapshots, re-pack manifests, remove orphans — leave it off and
 carry no query engine at all:
 
-```toml
-bergman = { version = "0.1", default-features = false, features = ["catalog-rest", "storage-s3"] }
+```bash
+cargo add bergman --no-default-features --features catalog-rest,storage-s3
 # -> expire, manifests, orphans. No DataFusion.
 ```
 
@@ -67,6 +66,19 @@ Every one of these has a scoped sibling — `inspect_matching(pattern)`,
 *examination*, not the output. A table the pattern excludes is never read, which
 is what makes "what is wrong with this one namespace" cost a namespace's
 metadata rather than the warehouse's.
+
+A plan is a plain value, so scoping *which operations* run is a filter on it
+rather than another entry point — `MaintenancePlan::retain_operations`, which is
+what `bergman run --only` calls:
+
+```rust
+let mut plan = bergman.plan().await?;
+plan.retain_operations(&[OperationKind::RemoveOrphans]);
+let report = bergman.run(&plan).await?;
+```
+
+Any subset is safe: filtering preserves the per-table order, and dropping an
+operation only ever makes the others do less.
 
 A plan may carry **notes**: work the policy asked for that a table cannot
 receive, with the reason — a [format v3 table](@/docs/compaction.md#format-v3),
@@ -113,6 +125,11 @@ signal handler, and reads no configuration file on its own initiative. It emits
 **Bring your own runtime.** Every entry point is a plain `async fn` on the
 caller's runtime. Concurrency limits are parameters (`limits.max_parallel_tables`),
 never process-wide statics.
+
+**No background threads, including for credentials.** Nothing is renewed on a
+timer Bergman owns. `refresh_credentials()` is a method you call — see
+[Long-lived processes](#long-lived) — which is what lets a library that installs
+no signal handler still keep a long-running host authenticated.
 
 **Planning is pure.** `plan()` performs no writes and no deletions, so dry-run is
 not a mode to remember — it is what happens when you stop before `run()`. The
@@ -196,21 +213,18 @@ depend on the order it was registered in.
 
 ## Who this is for
 
-Three shapes, each with a precedent:
-
 **Rust catalogs.** [Lakekeeper](https://docs.lakekeeper.io/docs/latest/table-maintenance/)
 ships expire-snapshots and orphan removal but deliberately does not compact,
 emitting CloudEvents so an external engine can. [Rustberg](@/docs/rustberg.md)
-draws the same boundary. Bergman is designed to be the engine both leave room
-for.
+draws the same boundary. Bergman is the engine both leave room for.
 
 **Streaming writers and CDC sinks.** RisingWave proved the embedded-compactor
 pattern by building one into their engine. Anyone writing Iceberg from Rust
 should not have to.
 
-**Lakehouse platforms and control planes.** nimtable embeds
-`iceberg-compaction` the same way; Bergman offers the full operation set —
-expiration, cleanup, orphans — rather than compaction alone.
+**Lakehouse platforms and control planes.** A service that already knows which
+tables exist and when they changed can drive maintenance directly, with an
+observer for its own metrics and approval gates.
 
 ## Running on a schedule
 
@@ -265,6 +279,33 @@ did not.
 
 `Bergman::plan_tables` is the same thing without a daemon — plan a named subset
 and run it.
+
+### Long-lived processes {#long-lived}
+
+If your process outlives its catalog token, call `refresh_credentials()` before
+each cycle. `Daemon` already does; a hand-rolled loop has to.
+
+```rust
+loop {
+    // One OAuth2 exchange per catalog configured with a `credential`.
+    // Catalogs using a static token, or none, are skipped.
+    bergman.refresh_credentials().await;
+
+    let plan = bergman.plan().await?;
+    let report = bergman.run(&plan).await?;
+    // ...
+}
+```
+
+`iceberg-catalog-rest` exchanges its credential once, at construction, and never
+again, and the read path is everything but the commits Bergman authors itself:
+table loads, discovery, and snapshot expiration's commit. Without this, a
+process holding a one-hour token keeps its cadence perfectly and stops reading a
+single table.
+
+A renewal that fails is logged and skipped rather than fatal — upstream fetches
+the replacement before discarding the old token, so the one in hand still works.
+The return value is how many catalogs were renewed.
 
 ## Errors
 

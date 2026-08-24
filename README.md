@@ -53,9 +53,8 @@ reclaimed. The refusal appears in `bergman plan`, not only in a log line.
 `iceberg::Transaction` has no action that removes a data file, and both
 `TransactionAction` and `TableCommit`'s builder are `pub(crate)` — so
 compaction and manifest rewriting cannot be expressed through it at all. The
-common answer is to fork; [`nimtable/iceberg-compaction`](https://github.com/nimtable/iceberg-compaction)
-pins `risingwavelabs/iceberg-rust` at a git revision, which costs a rebase
-forever and a crate that cannot be published.
+common answer is to fork upstream, which costs a rebase forever and a crate that
+cannot be published — Cargo rejects git dependencies on crates.io.
 
 Bergman owns just that layer instead. Every piece of a commit is already public,
 so it builds one with upstream's own writers and `POST`s it to the table
@@ -135,7 +134,9 @@ Every setting resolves through four layers, most specific first:
 
 Layer 3 is what makes Bergman a participant rather than a competing source of
 truth: a table already carries its owner's intent, and every other Iceberg tool
-reads it.
+reads it. A property that is present but unusable — unparseable, or a zero where
+a size or a count is needed — falls through to the default and is reported as a
+warning rather than failing the table.
 
 `bergman policy explain` shows every resolved setting *and the layer that
 answered*, because the question is never "what is the target file size" — it is
@@ -169,9 +170,16 @@ filesystem glob:
 | `prod.analytics.**` | ✅ | ✅ |
 | `prod.**` | ✅ | ✅ |
 
+A dot that belongs to a *name* rather than being a separator is written `\.`, so
+`prod.analytics.a\.b` addresses the table literally called `a.b`. The rendering
+used for matching is injective — `/` and `%` are percent-encoded per segment —
+so no pattern can reach two different tables by accident.
+
 Rules are evaluated in order; the first match wins. A table no rule matches is
 reported as `unmatched` — distinct from one a rule deliberately `skip`s, so you
-can tell "my pattern is wrong" from "I excluded this".
+can tell "my pattern is wrong" from "I excluded this". A rule that an earlier one
+already covers is refused at startup rather than left as a line that does
+nothing.
 
 ---
 
@@ -182,9 +190,10 @@ costs one metadata read per cycle and no data I/O.
 
 | Trigger | Default | What it catches |
 |---|---|---|
-| `small_file_ratio` | 30% of files below 75% of target, and ≥ 5 of them | The classic small-file problem |
+| `small_file_ratio` | 30% of files below 75% of target, and ≥ 5 eligible | The classic small-file problem |
+| `max_file_size_ratio` | any file above 1.8× target | Its opposite: one file no reader can split, which nothing but a rewrite divides |
 | `delete_ratio` | 10% of rows named by delete files | Streaming and CDC targets, where read amplification comes from deletes rather than file sizes |
-| `min_file_age` | partition quiet for 1h | Its *inverse* — a partition still being written is left alone, rather than losing a commit race to the next micro-batch |
+| `min_file_age` | partition quiet for 1h | The *inverse* of all three: a partition still being written is left alone rather than losing a commit race to the next micro-batch |
 
 ```toml
 [[rules]]
@@ -207,10 +216,22 @@ would start reading every file. Direction and null placement are reproduced
 exactly. A rule's `sort` overrides it; where neither says anything, output is
 unsorted.
 
-**A partition is not a unit of work.** Its eligible files are bin-packed into
-groups bounded by `max_group_bytes` (8 GiB) and `max_input_files` (10 000), and
-each group commits on its own — so one lost commit costs one group, and a
+**A partition triggers a rewrite; it is not what the rewrite reads.** Only the
+files a rewrite would improve are read — the too-small, the too-large-to-split,
+and any file a delete applies to — so a partition of a hundred at-target files
+plus forty tiny ones reads forty, not a hundred and forty. That is Spark's
+`SizeBasedFileRewriter.filterFiles` rule, and the plan's byte estimate counts
+those files and no others.
+
+**A partition is not a unit of work either.** Its eligible files are bin-packed
+into groups bounded by `max_group_bytes` (8 GiB) and `max_input_files` (10 000),
+and each group commits on its own — so one lost commit costs one group, and a
 partition larger than memory is still compactable.
+
+Groups run **most-consolidation-first**, so a cycle that ends early has done its
+most valuable work. Each group commits against the snapshot the previous one
+produced. After three groups fail in a row the table is left for the next cycle,
+since a failing group has already paid for a full rewrite before it fails.
 
 Each group is read with its delete files applied, optionally sorted, and written
 back at the target size honouring the table's own `write.parquet.*` settings. A
@@ -220,9 +241,10 @@ ever cleans them up.
 
 Equality deletes go through a DataFusion hash anti-join, which is why the
 default build carries a query engine — upstream applies them as a nested-loop
-join over `data rows × delete rows`. It sits behind the default-on `compaction`
-feature, so an embedder wanting only metadata maintenance takes
-`default-features = false` and carries none of it.
+join over `data rows × delete rows`. The test suite asserts the *physical plan*
+is a hash join, since the rewrite that makes it one is a conservative optimizer
+rule. It sits behind the default-on `compaction` feature, so an embedder wanting
+only metadata maintenance builds `--no-default-features` and carries none.
 [Detail →](https://hupe1980.github.io/bergman/docs/compaction/)
 
 ---
@@ -338,9 +360,8 @@ println!("{} operations", plan.operation_count());
 let report = bergman.run(&plan).await?;
 ```
 
-```toml
-[dependencies]
-bergman = { version = "0.1", default-features = false, features = ["catalog-rest", "storage-s3"] }
+```bash
+cargo add bergman --no-default-features --features catalog-rest,storage-s3
 ```
 
 The contract:
@@ -350,6 +371,12 @@ The contract:
   what listens is yours.
 - **Bring your own runtime.** Plain `async fn` on the caller's runtime.
   Concurrency limits are parameters, never process-wide statics.
+- **No background threads, including for credentials.** Nothing is renewed on a
+  timer Bergman owns: a long-lived host calls `refresh_credentials()` before
+  each cycle, which is what `bergman daemon` does. Upstream's catalog client
+  exchanges its OAuth2 credential once and never again, and a process holding a
+  one-hour token does not crash after an hour — it keeps its cadence perfectly
+  and stops reading a single table.
 - **Planning is pure.** `plan()` writes nothing and deletes nothing, so dry-run
   is not a mode to remember — it is what happens when you stop before `run()`.
 - **Observation is a hook.** Implement `MaintenanceObserver` for metrics, an
@@ -376,6 +403,7 @@ impl MaintenanceObserver for RequireSignoff {
 | `bergman run` | **yes** | Executes the plan |
 | `bergman run --dry-run` | no | Identical to `plan` |
 | `… --table <glob>` | — | Scopes `inspect`, `plan` and `run` — the *examination*, not just the output: an excluded table is never read |
+| `… --only <op>[,<op>]` | — | Scopes `plan` and `run` to named operations: `compact`, `rewrite-manifests`, `expire-snapshots`, `remove-orphans` |
 | `bergman daemon` | **yes** | Runs cycles on schedules, or when told a table changed |
 | `bergman daemon --events --events-token-env VAR` | **yes** | …and requires a bearer token on `POST /events` |
 | `bergman policy lint` | no | Validates config offline — for CI |
@@ -386,6 +414,14 @@ Global flags: `--config`, `--format text|json`, `--audit-log <path>`, `--log <le
 
 `bergman run` exits `2` when any operation failed or was refused, so a broken
 cron job does not look healthy.
+
+```bash
+# Reclaim storage tonight; rewrite nothing.
+bergman run --only remove-orphans,expire-snapshots
+```
+
+Any subset is safe: the per-table order is preserved, and dropping an operation
+only ever makes the others do less.
 
 ---
 
@@ -406,7 +442,7 @@ Prometheus server down. Per-table facts live in the audit trail, which has no
 cardinality budget.
 
 Local filesystem and in-memory storage are always available, which is what keeps
-the test suite free of containers. Embedders take `default-features = false`.
+the test suite free of containers. Embedders build `--no-default-features`.
 
 ---
 

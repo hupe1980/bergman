@@ -7,8 +7,8 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use iceberg::spec::{
-    DataContentType, ManifestContentType, ManifestEntry, ManifestList, ManifestStatus,
-    PartitionSpec, Schema, TableMetadata,
+    DataContentType, DataFileFormat, ManifestContentType, ManifestEntry, ManifestList,
+    ManifestStatus, PartitionSpec, Schema, TableMetadata,
 };
 use iceberg::table::Table;
 
@@ -178,29 +178,53 @@ pub async fn analyze(
     })
 }
 
-/// Map every live data file to the partition it belongs to.
+/// What the manifests say about each live file, which the scan does not.
 ///
-/// Compaction needs this and cannot get it from the scan: `FileScanTask` has a
-/// `partition_spec` field, but upstream's scan leaves it `None` — the value is
-/// only ever set in upstream's own tests, and `scan/context.rs` carries a `TODO`
-/// about passing the real spec through. Without a spec, a file's partition tuple
-/// cannot be rendered, and a rewrite that grouped scanned files by "no spec"
-/// would find no partition matching the plan and quietly compact nothing.
+/// Two facts, one walk, because compaction needs both:
 ///
-/// Reading it from the manifests instead is exact rather than a workaround: a
-/// manifest carries exactly one `partition_spec_id`, so each entry is rendered
-/// under the spec that actually produced its tuple — which is what makes a table
-/// whose spec has evolved come out right rather than merely non-empty.
+/// - **Which partition a data file is in.** Upstream's scan leaves
+///   `FileScanTask::partition_spec` `None`, and without a spec a partition tuple
+///   cannot be rendered — so a rewrite grouping scanned files by "no spec" would
+///   match none of the partitions the plan named and quietly compact nothing.
+///   The manifests are exact rather than a workaround: each carries one
+///   `partition_spec_id`, so every entry is rendered under the spec that
+///   produced its tuple, which is what makes a spec-evolved table come out
+///   right.
+///
+/// - **What format a delete file is written in.** `FileScanTaskDeleteFile`
+///   carries no format, and upstream's reader is Parquet-only — so an Avro or
+///   ORC delete file has to be refused, which means knowing about it.
 ///
 /// Keyed by [`crate::ops::reachability::normalize`]d path, because the scan and
 /// the manifests need not spell a location the same way.
-pub async fn partition_index(
-    table_ref: &TableRef,
-    table: &Table,
-) -> Result<HashMap<String, PartitionKey>> {
+#[derive(Debug, Default, Clone)]
+pub struct FileIndex {
+    partitions: HashMap<String, PartitionKey>,
+    delete_formats: HashMap<String, DataFileFormat>,
+}
+
+impl FileIndex {
+    /// The partition a live data file belongs to.
+    pub fn partition_of(&self, normalized_path: &str) -> Option<&PartitionKey> {
+        self.partitions.get(normalized_path)
+    }
+
+    /// The on-disk format of a live delete file.
+    pub fn delete_format_of(&self, normalized_path: &str) -> Option<DataFileFormat> {
+        self.delete_formats.get(normalized_path).copied()
+    }
+
+    /// How many live data files it covers.
+    pub fn data_file_count(&self) -> usize {
+        self.partitions.len()
+    }
+}
+
+/// Walk the current snapshot's manifests and index what the scan omits.
+pub async fn file_index(table_ref: &TableRef, table: &Table) -> Result<FileIndex> {
     let metadata = table.metadata();
     let Some(snapshot) = metadata.current_snapshot() else {
-        return Ok(HashMap::new());
+        return Ok(FileIndex::default());
     };
 
     let file_io = table.file_io();
@@ -215,7 +239,9 @@ pub async fn partition_index(
         .map_err(|e| Error::metadata(table_ref, format!("unreadable manifest list: {e}")))?;
 
     let schema = metadata.current_schema().clone();
-    let per_manifest: Vec<Vec<(String, PartitionKey)>> = stream::iter(manifest_list.entries())
+    type Indexed = (Vec<(String, PartitionKey)>, Vec<(String, DataFileFormat)>);
+
+    let per_manifest: Vec<Indexed> = stream::iter(manifest_list.entries())
         .map(|manifest_file| {
             let file_io = file_io.clone();
             let schema = schema.clone();
@@ -229,30 +255,41 @@ pub async fn partition_index(
                     .await
                     .map_err(|e| Error::Storage(Box::new(e)))?;
 
-                Ok::<_, Error>(
-                    manifest
-                        .entries()
-                        .iter()
-                        .filter(|entry| entry.status() != ManifestStatus::Deleted)
-                        .filter(|entry| entry.data_file().content_type() == DataContentType::Data)
-                        .map(|entry| {
+                let mut partitions = Vec::new();
+                let mut formats = Vec::new();
+
+                for entry in manifest.entries() {
+                    if entry.status() == ManifestStatus::Deleted {
+                        continue;
+                    }
+                    let path = crate::ops::reachability::normalize(entry.file_path());
+                    match entry.data_file().content_type() {
+                        DataContentType::Data => {
                             let key = match &spec {
                                 Some(spec) => {
                                     PartitionKey::new(spec, &schema, entry.data_file().partition())
                                 }
                                 None => PartitionKey::unpartitioned(spec_id),
                             };
-                            (crate::ops::reachability::normalize(entry.file_path()), key)
-                        })
-                        .collect::<Vec<_>>(),
-                )
+                            partitions.push((path, key));
+                        }
+                        _ => formats.push((path, entry.data_file().file_format())),
+                    }
+                }
+
+                Ok::<_, Error>((partitions, formats))
             }
         })
         .buffer_unordered(MANIFEST_CONCURRENCY)
         .try_collect()
         .await?;
 
-    Ok(per_manifest.into_iter().flatten().collect())
+    let mut index = FileIndex::default();
+    for (partitions, formats) in per_manifest {
+        index.partitions.extend(partitions);
+        index.delete_formats.extend(formats);
+    }
+    Ok(index)
 }
 
 /// Per-manifest counts, merged after the concurrent read.

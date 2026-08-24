@@ -24,14 +24,15 @@ read as a healthy one:
 | | |
 |---|---|
 | **Rewriting a format v3 table** | Preserving row lineage needs `_row_id` projected out of the scan and written back, which upstream does not offer; and the snapshot would lack `first-row-id`, which the spec requires in v3. Expiration and orphan removal still run on it — see [Compaction](@/docs/compaction.md#format-v3) |
-| **Non-Parquet writes** | It reads Parquet, Avro and ORC but writes only Parquet, and refuses a table whose `write.format.default` is something else |
+| **Anything but Parquet** | Upstream's reader opens a Parquet stream whatever a scan task's format says, and the writer is `ParquetWriterBuilder` — so it is a refusal in both directions, per table *and* per file |
 | **Rewriting across a partition-spec change** | Output goes out under the current spec; a commit claiming it replaces files partitioned differently would mis-file every row |
 | **Catalogs other than REST** | Each additional protocol is a second commit path to keep correct |
 | **Z-order clustering** | Global sort within a file group works; space-filling curves are an optimization rather than table health |
 | **`OpenTelemetry` export** | The library emits `tracing`; a subscriber in your process exports it today |
 | **A NATS or Kafka client** | Notifications arrive over HTTP and the bridge is yours — see [Operating](@/docs/operating.md#reacting-to-commits) |
 | **Rewriting position delete files** | Java has an action of its own for coalescing small live position deletes. Bergman retires them the expensive way, as a side effect of compaction, and removes the ones that apply to nothing. The middle case needs a reader and writer for a file type Bergman otherwise never writes |
-| **Stamping `sort_order_id` on rewritten files** | Output is clustered and its bounds are tight, but the file does not advertise *which* order it satisfies. Upstream keeps the field crate-private with no setter |
+| **Stamping `sort_order_id` on rewritten files** | Output is clustered and its bounds are tight, but the file does not advertise *which* order it satisfies. No upstream writer path sets it, and rebuilding the `DataFile` by hand to add it would silently drop whatever upstream adds next |
+| **Rewriting into a different partition spec** | Java exposes it as `outputSpecId`. It is how a table is *migrated* to a new spec — which changes what the table is, not how it is laid out, so a maintenance run must never do it by accident |
 
 Scale out by running replicas with disjoint `[[rules]]` or disjoint catalog
 `namespaces`; optimistic commits already make overlap safe.
@@ -43,11 +44,8 @@ An Iceberg commit is `(requirements, updates)` applied atomically, and the
 a data file, and both `TransactionAction` and `TableCommit`'s builder are
 `pub(crate)`. Compaction and manifest rewriting are unreachable through it.
 
-The common answer is to fork —
-[`nimtable/iceberg-compaction`](https://github.com/nimtable/iceberg-compaction)
-pins `risingwavelabs/iceberg-rust` at a git revision — which costs a rebase
-forever and a crate that cannot be published, since Cargo rejects git
-dependencies on crates.io.
+The common answer is to fork upstream, which costs a rebase forever and a crate
+that cannot be published, since Cargo rejects git dependencies on crates.io.
 
 Bergman owns the one blocked layer instead, because the blockage is narrow:
 every piece of a commit is public and only the delivery is not.
@@ -74,3 +72,19 @@ documents it as a higher layer's job), object listing (`Storage` has no `list`,
 without which orphan removal cannot exist), and reading a branch's retention
 (`TableMetadata::refs` is `pub(crate)`, so a commit that moves `main` would
 silently erase it — Bergman reads the field from the metadata JSON).
+
+### Where the seam falls
+
+"Bergman's commit layer" means the commits Bergman *authors*: compaction,
+dangling-delete removal, manifest rewriting. **Snapshot expiration is upstream's
+own action**, and upstream's actions commit through `iceberg::Catalog` —
+`TransactionAction::commit` is `pub(crate)`, so its `(requirements, updates)`
+cannot be intercepted and re-delivered. Two consequences:
+
+- Expiration's commits carry no `X-Request-Id`, so they sit outside the audit
+  join described in [Rustberg](@/docs/rustberg.md#joined-audit-trails).
+  Reimplementing Java's `RemoveSnapshots` selection rules to gain a header would
+  be the worse trade; extra headers on `RestCatalogBuilder` are the natural
+  contribution.
+- The catalog client's token is renewed from outside, because it renews none of
+  its own. See [Credentials](@/docs/operating.md#credentials).

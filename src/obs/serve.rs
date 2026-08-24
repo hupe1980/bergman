@@ -126,10 +126,19 @@ struct TableChanged {
     table: String,
 }
 
+/// Handle a notification, **authenticating before the body is looked at**.
+///
+/// The body arrives as [`axum::body::Bytes`] and is deserialized by hand, which
+/// is the whole point of the signature: axum runs every extractor before the
+/// handler's first line, so a `Json<TableChanged>` argument would reject an
+/// unauthenticated request before the token was checked — answering 422 for a
+/// malformed body and 401 for a good one, which tells an unauthenticated caller
+/// when they have found the right shape. `Bytes` has no failure mode of its
+/// own.
 async fn receive_event(
     State(state): State<EventState>,
     headers: axum::http::HeaderMap,
-    body: axum::extract::Json<TableChanged>,
+    body: axum::body::Bytes,
 ) -> impl IntoResponse {
     if let Some(token) = &state.token {
         let presented = headers
@@ -141,6 +150,14 @@ async fn receive_event(
             return (StatusCode::UNAUTHORIZED, "unauthorized");
         }
     }
+
+    let Ok(body) = serde_json::from_slice::<TableChanged>(&body) else {
+        // Safe to be specific now that the caller is authenticated.
+        return (
+            StatusCode::BAD_REQUEST,
+            "expected {\"catalog\":…,\"namespace\":[…],\"table\":…}",
+        );
+    };
 
     let table = crate::policy::TableRef::new(&body.catalog, body.namespace.clone(), &body.table);
 
@@ -325,8 +342,19 @@ mod tests {
         assert_eq!(batch, vec![TableRef::new("prod", ["analytics"], "events")]);
     }
 
+    const GOOD_EVENT: &str = r#"{"catalog":"prod","namespace":["analytics"],"table":"events"}"#;
+
     /// Post a notification, optionally presenting a bearer token.
     async fn post_event(token: Option<EventToken>, present: Option<&str>) -> StatusCode {
+        post_body(token, present, GOOD_EVENT).await
+    }
+
+    /// The same, with control over the body.
+    async fn post_body(
+        token: Option<EventToken>,
+        present: Option<&str>,
+        body: &'static str,
+    ) -> StatusCode {
         use axum::body::Body;
         use axum::http::Request;
         use tower::ServiceExt;
@@ -343,16 +371,33 @@ mod tests {
         }
 
         router
-            .oneshot(
-                request
-                    .body(Body::from(
-                        r#"{"catalog":"prod","namespace":["analytics"],"table":"events"}"#,
-                    ))
-                    .expect("request"),
-            )
+            .oneshot(request.body(Body::from(body)).expect("request"))
             .await
             .expect("response")
             .status()
+    }
+
+    #[tokio::test]
+    async fn the_token_is_checked_before_the_body_is_looked_at() {
+        // The reason `receive_event` takes `Bytes` rather than `Json`: an
+        // extractor runs before the handler, so a malformed body would answer
+        // 422 and a well-formed one 401, telling an unauthenticated caller when
+        // they had found the right shape.
+        let token = || Some(EventToken::new("s3cret"));
+
+        for body in [GOOD_EVENT, "not json at all", "{}", ""] {
+            assert_eq!(
+                post_body(token(), None, body).await,
+                StatusCode::UNAUTHORIZED,
+                "an unauthenticated caller learned something from body {body:?}"
+            );
+        }
+
+        // With a token, the body's shape is worth reporting.
+        assert_eq!(
+            post_body(token(), Some("Bearer s3cret"), "not json at all").await,
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[tokio::test]

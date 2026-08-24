@@ -87,8 +87,21 @@ convention; the credential simply does not exist.
 
 Bergman writes its own JSONL trail recording *why* — the policy rule, the
 trigger, the measurement. Rustberg records *who was allowed to* — the principal,
-the decision, the matched Cedar policies. One `X-Request-Id` joins them, so a
-single grep answers a question neither log answers alone.
+the decision, the matched Cedar policies. Bergman sends its **run id** as
+`X-Request-Id` on every commit it authors itself, and that is the same id every
+one of its own audit records already carries, so a single grep answers a
+question neither log answers alone.
+
+The header is run-grained rather than request-unique on purpose. An id invented
+per request would identify the request and nothing else — and would appear in
+exactly one of the two logs, which joins nothing. `X-Bergman-Operation` rides
+along, so a catalog-side line also says *which* maintenance operation asked.
+
+**Snapshot expiration sits outside the join**, because it commits through
+upstream's action rather than through Bergman's client and so carries no header
+([Status](@/docs/status.md#where-the-seam-falls)). Those commits are still
+authorized and still land in Rustberg's trail under the same principal; they
+just cannot be correlated back to a Bergman run by id.
 
 ## For development
 

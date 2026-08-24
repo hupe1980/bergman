@@ -128,6 +128,10 @@ Timers still fire. Events are an addition to the cadence, not a replacement: a
 notification can always be lost, and a table that *stops* being written still
 needs its snapshots expired.
 
+That holds however busy the event stream gets: `--interval` is an absolute
+deadline that only an interval cycle advances, so a constant stream of
+notifications cannot push the periodic sweep out of the way.
+
 > [!NOTE]
 > Bergman carries no NATS or Kafka client on purpose. Lakekeeper emits
 > `CloudEvents` to a broker, and dragging one into a maintenance engine would
@@ -164,6 +168,11 @@ The token is a variable *name*, never a value, and it is compared in constant
 time — a naive `==` leaks a secret's length and, byte by byte, its contents to
 anyone who can measure response latency, and an endpoint on the network is
 exactly where that is measurable.
+
+An unauthorized request gets a bare `401`, and nothing about it is examined
+first — not even whether the body parses. Answering `400` for a malformed body
+and `401` for a good one would tell an unauthenticated caller when they had
+found the right shape. Once authenticated, a bad body *is* reported.
 
 Leaving it open is right on a loopback bind, or behind a service mesh that
 authenticates for you. It is the wrong answer everywhere else, so the daemon
@@ -239,8 +248,15 @@ config file, nothing in the environment.
 **OAuth2 client credentials.** Set `credential = "client-id:secret"` in
 `[catalogs.properties]`, optionally with `oauth2-server-uri` and `scope` — the
 same properties every Iceberg client reads, so one configuration authenticates
-both Bergman's read path and its commit path. Bergman renews the token before
-it expires, which matters for a daemon holding a one-hour token.
+both Bergman's read path and its commit path.
+
+Tokens are renewed on both paths, differently, because they are different
+clients. Bergman's commit client refreshes on a margin before expiry; the
+catalog client is upstream's and refreshes nothing, so `bergman daemon` renews it
+before each cycle. Without that, a daemon holding a one-hour token keeps its
+cadence perfectly and stops reading a single table. Embedders driving their own
+loop call `refresh_credentials()` — see
+[Long-lived processes](@/docs/library.md#long-lived).
 
 **Environment.** `token_env` names the variable holding a static bearer token;
 the value never appears in `bergman.toml`. Whatever produced that token owns its
@@ -400,11 +416,13 @@ and `refused` need anyone's attention.
 
 ```promql
 # Something needs looking at.
-sum by (table) (rate(bergman_operations{outcome=~"failed|refused"}[1h])) > 0
+sum by (namespace, operation) (rate(bergman_operations{outcome=~"failed|refused"}[1h])) > 0
 
 # Losing to writers repeatedly — the window is probably wrong.
-sum by (table) (rate(bergman_operations{outcome="conflicted"}[6h])) > 0.5
+sum by (namespace) (rate(bergman_operations{outcome="conflicted"}[6h])) > 0.5
 ```
+
+Group by `namespace`: there is no `table` label.
 
 > [!IMPORTANT]
 > **The table name is deliberately not a label**, and neither is the policy
@@ -415,8 +433,13 @@ sum by (table) (rate(bergman_operations{outcome="conflicted"}[6h])) > 0.5
 > that was supposed to be watching it.
 >
 > The namespace is the finest grain that stays bounded, and it is enough to tell
-> you where to look. The per-table facts are in the audit trail, which is
-> append-only and has no cardinality budget:
+> you where to look. It is kept bounded by a cap rather than by assuming a
+> warehouse has few namespaces — one per tenant or per day is common. The first
+> 128 a process sees keep their own series and the rest share
+> `namespace="<over-cardinality-cap>"`, reported once in the log.
+>
+> The per-table facts are in the audit trail, which is append-only and has no
+> cardinality budget:
 >
 > ```bash
 > jq -r 'select(.result.result == "failed") | "\(.table)\t\(.result.error)"' \

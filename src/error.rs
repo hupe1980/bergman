@@ -109,6 +109,22 @@ pub enum Error {
     #[error("unsupported: {0}")]
     Unsupported(String),
 
+    /// An operation ran past `limits.operation_timeout` and was cancelled.
+    ///
+    /// Distinct from a failure, and reported as one anyway: nothing was
+    /// corrupted — maintenance is crash-only, so what a cancelled rewrite
+    /// leaves is files nothing references — but a table that keeps timing out
+    /// is a table nothing is maintaining, and that has to be visible.
+    #[error("{operation} on {table} was cancelled after {after:?}")]
+    Timeout {
+        /// The table whose operation was cancelled.
+        table: String,
+        /// The operation that ran out of time.
+        operation: &'static str,
+        /// The deadline it exceeded.
+        after: std::time::Duration,
+    },
+
     /// An I/O failure outside object storage: reading a config file, writing an
     /// audit log.
     #[error("io error: {0}")]
@@ -130,7 +146,12 @@ impl Error {
             // retry budget is small and bounded, so guessing wrong costs one
             // extra request, while guessing the *other* way costs a whole
             // maintenance cycle.
-            Error::Catalog(_) | Error::Storage(_) | Error::Io(_) => Disposition::Retry,
+            // A deadline says the world was too slow, not that the request was
+            // wrong. Coming back is the right response — next cycle, since the
+            // budget for this one is spent.
+            Error::Catalog(_) | Error::Storage(_) | Error::Io(_) | Error::Timeout { .. } => {
+                Disposition::Retry
+            }
 
             // These describe the request, not the world. They will fail the
             // same way forever.

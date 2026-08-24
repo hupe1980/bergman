@@ -23,9 +23,12 @@ pub struct AuditRecord {
     pub at: DateTime<Utc>,
     /// The run this belongs to.
     ///
-    /// Also sent as `X-Request-Id` on the catalog calls the operation makes, so
-    /// one identifier joins Bergman's record of *why* to the catalog's record
-    /// of *who was allowed to*.
+    /// Sent verbatim as `X-Request-Id` on every commit the run makes (see
+    /// [`crate::commit::TableCommitter`]), so one identifier joins Bergman's
+    /// record of *why* to a governing catalog's record of *who was allowed to*.
+    /// That join is the whole reason the header exists, and it only works
+    /// because the value is this one rather than something invented per
+    /// request — which would appear in exactly one of the two logs.
     pub run_id: String,
     /// The table.
     pub table: String,
@@ -112,6 +115,12 @@ impl AuditSink for JsonlSink {
         // Flushed per record rather than per batch. An audit trail buffered in
         // a process that then dies describes a world that never existed.
         writer.flush()?;
+        // ...and *synced*, which is the guarantee actually being claimed:
+        // `flush` reaches the kernel's buffer, which survives a `kill -9` but
+        // not a node failure, and the deletion this record describes begins the
+        // moment it returns. Records are per operation and per deletion *batch*
+        // — not per file — so a cycle costs a handful of syncs.
+        writer.get_ref().sync_data()?;
         Ok(())
     }
 }

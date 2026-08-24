@@ -152,6 +152,24 @@ pub struct Limits {
     /// move. Parsed at startup, so a malformed one is a startup failure.
     #[serde(default)]
     pub maintenance_window: Option<String>,
+
+    /// Give up on one operation after this long.
+    ///
+    /// Bounds unbounded *waiting*, not slow work. A commit has its own request
+    /// timeout; a data read does not, so an object store that accepts a
+    /// connection and never answers leaves a rewrite waiting forever — and with
+    /// table concurrency bounded, a few of those stop the daemon maintaining
+    /// anything.
+    ///
+    /// Cancelling is safe: maintenance is crash-only, so a rewrite killed
+    /// part-way leaves files nothing references, and a commit is one atomic
+    /// request.
+    ///
+    /// **Absent by default** — the right value depends on the largest group a
+    /// deployment rewrites, and a one-shot `bergman run` already has a deadline
+    /// from cron or its orchestrator. This is for the daemon, which has none.
+    #[serde(default, with = "humantime_serde::option")]
+    pub operation_timeout: Option<Duration>,
 }
 
 impl Limits {
@@ -177,6 +195,12 @@ impl Limits {
                  snapshots.delete_files = false to report without deleting",
             ));
         }
+        if self.operation_timeout == Some(Duration::ZERO) {
+            return Err(Error::policy(
+                "limits.operation_timeout is 0, which would cancel every operation before \
+                 it began; omit it to let operations run as long as they need",
+            ));
+        }
         Ok(())
     }
 }
@@ -188,6 +212,7 @@ impl Default for Limits {
             max_rewrite_bytes_per_run: None,
             max_deletes_per_run: Self::default_max_deletes_per_run(),
             maintenance_window: None,
+            operation_timeout: None,
         }
     }
 }
@@ -255,6 +280,55 @@ struct CompiledRule {
     settings: TableSettings,
 }
 
+/// The characters that make a pattern segment a glob rather than a name.
+const GLOB_CHARS: [char; 7] = ['*', '?', '[', ']', '{', '}', '\\'];
+
+/// Which earlier rule, if any, already matches everything `pattern` would.
+///
+/// Deliberately **sound rather than complete**: it reports only the two cases
+/// that can be decided by inspection, and stays quiet everywhere else. Deciding
+/// glob subsumption in general needs a real algorithm, and the half-measures are
+/// worse than nothing — `prod.a.*c*` "matching" the pattern text `prod.a.[abc]`
+/// proves nothing about the tables the two select, and an error that is
+/// sometimes wrong is an error operators learn to route around.
+///
+/// The two decidable cases cover the mistake people actually make: a catch-all
+/// written first, and the same pattern written twice.
+///
+/// 1. **The same pattern twice.** The second can never be reached.
+/// 2. **A literal prefix followed by `**`.** `prod.**` matches every table whose
+///    rendered path starts with `prod/`, so any later pattern beginning
+///    `prod.` selects a subset of it. The prefix must contain no glob character,
+///    or it says nothing about which paths it covers.
+fn shadowed_by<'a>(earlier: &'a [CompiledRule], pattern: &str) -> Option<&'a str> {
+    earlier
+        .iter()
+        .map(|rule| rule.pattern.as_str())
+        .find(|&candidate| candidate == pattern || covers(candidate, pattern))
+}
+
+/// Whether `broad` provably matches every table `narrow` does.
+fn covers(broad: &str, narrow: &str) -> bool {
+    // `**` alone reaches every table there is.
+    let prefix = match broad {
+        "**" => "",
+        _ => match broad.strip_suffix(".**") {
+            Some(prefix) => prefix,
+            None => return false,
+        },
+    };
+
+    if prefix.contains(GLOB_CHARS) {
+        return false;
+    }
+    if prefix.is_empty() {
+        return true;
+    }
+    narrow
+        .strip_prefix(prefix)
+        .is_some_and(|rest| rest.starts_with('.'))
+}
+
 /// What policy says about one table.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "decision", rename_all = "kebab-case")]
@@ -291,6 +365,20 @@ impl Policy {
                 return Err(Error::policy(format!(
                     "{where_}: `skip` is set alongside settings, which cannot both apply; \
                      remove one"
+                )));
+            }
+
+            // A rule no table can ever reach is a line in a config file that
+            // does nothing — the same fault `skip` alongside settings is
+            // rejected for, and a worse one, because the rule most likely to be
+            // written last is the specific exclusion somebody added after the
+            // catch-all.
+            if let Some(shadow) = shadowed_by(&rules, &rule.pattern) {
+                return Err(Error::policy(format!(
+                    "{where_}: this rule can never match, because rule \"{shadow}\" is \
+                     listed before it and already matches everything it does. Rules are \
+                     evaluated in order and the first match wins, so put the specific \
+                     rule first"
                 )));
             }
 
@@ -481,6 +569,77 @@ mod tests {
         .unwrap();
         let err = Policy::compile(&config).unwrap_err();
         assert!(err.to_string().contains("`skip` is set alongside settings"));
+    }
+
+    #[test]
+    fn a_rule_no_table_can_reach_is_rejected() {
+        // First match wins, so a catch-all written first makes every later rule
+        // dead — and the rule people add last is usually the specific exclusion
+        // they added *because* the catch-all was doing the wrong thing. Silence
+        // here means the exclusion never applies and nothing says so.
+        let config = Config::from_toml(
+            r#"
+            [[rules]]
+            match = "prod.**"
+
+            [[rules]]
+            match = "prod.tmp.*"
+            skip = true
+            "#,
+        )
+        .unwrap();
+
+        let err = Policy::compile(&config).unwrap_err().to_string();
+        assert!(err.contains("can never match"), "got: {err}");
+        assert!(
+            err.contains("prod.**"),
+            "the shadowing rule is named: {err}"
+        );
+        assert!(err.contains("specific rule first"), "got: {err}");
+    }
+
+    #[test]
+    fn the_same_pattern_twice_is_rejected() {
+        let config = Config::from_toml(
+            "[[rules]]\nmatch = \"prod.a.*\"\n\n[[rules]]\nmatch = \"prod.a.*\"\n",
+        )
+        .unwrap();
+        assert!(
+            Policy::compile(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("can never match")
+        );
+    }
+
+    #[test]
+    fn specific_before_general_is_the_supported_order() {
+        // The whole point of first-match-wins, and it must stay legal.
+        let config = Config::from_toml(
+            "[[rules]]\nmatch = \"prod.tmp.*\"\nskip = true\n\n[[rules]]\nmatch = \"prod.**\"\n",
+        )
+        .unwrap();
+        assert!(Policy::compile(&config).is_ok());
+    }
+
+    #[test]
+    fn shadow_detection_reports_only_what_it_can_decide() {
+        // Sound rather than complete, on purpose: an error that is sometimes
+        // wrong is an error operators learn to route around.
+        assert!(covers("prod.**", "prod.a.*"));
+        assert!(covers("**", "anything.at.all"));
+        assert!(covers("prod.a.**", "prod.a.b.c"));
+
+        // A sibling is not covered — the prefix must end on a separator, or
+        // `prod.events.**` would swallow `prod.events_archive.*`.
+        assert!(!covers("prod.events.**", "prod.events_archive.*"));
+        // A `*` reaches one segment, so it says nothing about deeper patterns.
+        assert!(!covers("prod.*", "prod.a.b"));
+        // A prefix containing a glob says nothing about which paths it covers.
+        assert!(!covers("prod.*.**", "prod.a.b"));
+        // And a pattern that is not `**`-terminated is never decided here, even
+        // when it happens to be broader.
+        assert!(!covers("prod.a.*", "prod.a.b"));
     }
 
     #[test]

@@ -867,3 +867,388 @@ async fn an_unsorted_table_is_not_given_a_sort_nobody_asked_for() {
 
     assert!(effective.compaction.sort.is_none());
 }
+
+// ---------------------------------------------------------------------------
+// Which files a rewrite reads
+// ---------------------------------------------------------------------------
+
+/// A compaction policy with an explicit target, so the size bands are known.
+fn sized_policy(target: u64) -> bergman::policy::EffectiveCompaction {
+    compaction_policy(&format!(
+        r#"
+        [[rules]]
+        match = "prod.db.events"
+        [rules.compaction]
+        enabled = true
+        target_file_size = {target}
+        "#
+    ))
+}
+
+#[tokio::test]
+async fn a_file_already_at_target_is_not_read_and_written_back() {
+    // The rule that decides what compaction costs. A partition earns a rewrite
+    // as a whole, but a file already the right size gains nothing from being
+    // read and written back — and on a real table that distinction is the
+    // difference between rewriting gigabytes and rewriting terabytes.
+    let fixture = TestTable::new().unwrap();
+
+    // One substantial file, then three tiny ones.
+    let many: Vec<(i32, &str)> = (0..400).map(|i| (i, "padding-padding-padding")).collect();
+    let mut files = vec![fixture.write_data_file(&many).await.unwrap()];
+    for chunk in [&[(1000, "a")][..], &[(1001, "b")][..], &[(1002, "c")][..]] {
+        files.push(fixture.write_data_file(chunk).await.unwrap());
+    }
+    fixture.append(files).await.unwrap();
+
+    let before = common::live_data_files_with_sizes(&fixture.table())
+        .await
+        .unwrap();
+    assert_eq!(before.len(), 4);
+
+    // Target = the big file's own size, so it sits inside the healthy band
+    // [0.75x, 1.8x] while the three small ones fall below it.
+    let target = before.iter().map(|(_, size)| *size).max().unwrap();
+    let (big, big_size) = before
+        .iter()
+        .find(|(_, size)| *size == target)
+        .cloned()
+        .unwrap();
+    let small: Vec<&(String, u64)> = before.iter().filter(|(p, _)| *p != big).collect();
+    assert!(
+        small.iter().all(|(_, size)| *size < (big_size * 3) / 4),
+        "the fixture must produce genuinely small files: {before:?}"
+    );
+
+    let result = compact_all(&fixture, &sized_policy(target)).await;
+    assert!(
+        matches!(result, OperationResult::Succeeded { .. }),
+        "got {result:?}"
+    );
+
+    let after = common::live_data_files_with_sizes(&fixture.table())
+        .await
+        .unwrap();
+
+    // The big file was never touched: same path, same bytes.
+    assert!(
+        after
+            .iter()
+            .any(|(path, size)| *path == big && *size == big_size),
+        "the at-target file must survive untouched\nbefore: {before:?}\nafter:  {after:?}"
+    );
+    // The three small ones were merged into one.
+    for (path, _) in &small {
+        assert!(
+            !after.iter().any(|(live, _)| live == path),
+            "{path} should have been rewritten"
+        );
+    }
+    assert_eq!(
+        after.len(),
+        2,
+        "one untouched file plus one merged: {after:?}"
+    );
+
+    // And no row moved.
+    let rows = read_all(&fixture.table()).await.unwrap();
+    assert_eq!(rows.len(), 403);
+}
+
+#[tokio::test]
+async fn an_oversized_file_is_split_even_when_it_is_the_only_one() {
+    // The half a small-file-only compactor forgets. Nothing else ever splits a
+    // file too large for a reader to divide, and splitting it deliberately
+    // produces more files than it consumed — so the "N in, N out is not worth
+    // it" guard must not veto it, and no minimum file count applies.
+    let fixture = TestTable::new().unwrap();
+
+    // Enough rows to read back as several record batches. The rolling writer
+    // closes a file *between* batches, so a single-batch input cannot be split
+    // however small the target — which is a real property of the write path and
+    // not something to paper over in a fixture.
+    let many: Vec<(i32, &str)> = (0..40_000)
+        .map(|i| (i, "padding-padding-padding"))
+        .collect();
+    let file = fixture.write_data_file(&many).await.unwrap();
+    fixture.append(vec![file]).await.unwrap();
+
+    let before = common::live_data_files_with_sizes(&fixture.table())
+        .await
+        .unwrap();
+    assert_eq!(before.len(), 1);
+    let size = before[0].1;
+
+    // A target a fifth of the file's size puts it far above 1.8x.
+    let result = compact_all(&fixture, &sized_policy(size / 5)).await;
+    assert!(
+        matches!(result, OperationResult::Succeeded { .. }),
+        "a lone oversized file must still be rewritten, got {result:?}"
+    );
+
+    let after = common::live_data_files_with_sizes(&fixture.table())
+        .await
+        .unwrap();
+    assert!(
+        after.len() > 1,
+        "the file must actually be split, got {after:?}"
+    );
+    assert_ne!(after[0].0, before[0].0, "the original must be gone");
+
+    // Splitting is a layout change and nothing else.
+    let rows = read_all(&fixture.table()).await.unwrap();
+    assert_eq!(rows.len(), 40_000);
+}
+
+#[tokio::test]
+async fn a_healthy_table_is_left_completely_alone() {
+    // Both ends of the band at once: files between the two thresholds are what
+    // a compacted table looks like, and reading them would rewrite a healthy
+    // table every cycle forever.
+    let fixture = TestTable::new().unwrap();
+
+    let mut files = Vec::new();
+    for start in [0i32, 400, 800] {
+        let rows: Vec<(i32, &str)> = (start..start + 400)
+            .map(|i| (i, "padding-padding-padding"))
+            .collect();
+        files.push(fixture.write_data_file(&rows).await.unwrap());
+    }
+    fixture.append(files).await.unwrap();
+
+    let before = common::live_data_files_with_sizes(&fixture.table())
+        .await
+        .unwrap();
+    // Every file is within a few percent of the others, so one of them serves
+    // as the target for all three.
+    let target = before[0].1;
+
+    let result = compact_all(&fixture, &sized_policy(target)).await;
+    assert!(
+        matches!(result, OperationResult::NoOp { .. }),
+        "nothing here is worth rewriting, got {result:?}"
+    );
+
+    let after = common::live_data_files_with_sizes(&fixture.table())
+        .await
+        .unwrap();
+    assert_eq!(before, after, "not one byte should have moved");
+}
+
+#[tokio::test]
+async fn each_group_after_the_first_does_not_rewrite_itself_twice() {
+    // Every file group commits on its own, and each commit moves `main`. If the
+    // executor keeps offering the *plan-time* parent, every group after the
+    // first loses its compare-and-swap to the group before it — and by then it
+    // has already read and written its whole group. The retry then reloads and
+    // does the identical work a second time.
+    //
+    // Nothing fails: the table ends up correct and the run reports success. It
+    // just costs twice the I/O on every table big enough to need more than one
+    // group, which is every table compaction is for.
+    let fixture = TestTable::new().unwrap();
+
+    let mut files = Vec::new();
+    for i in 0..6 {
+        files.push(fixture.write_data_file(&[(i, "a")]).await.unwrap());
+    }
+    fixture.append(files).await.unwrap();
+
+    // Two files per group, so six files become three groups and three commits.
+    let settings = compaction_policy(
+        r#"
+        [[rules]]
+        match = "prod.db.events"
+        [rules.compaction]
+        enabled = true
+        target_file_size = 1073741824
+        max_input_files = 2
+        "#,
+    );
+
+    let attempts_before = fixture.committer.attempt_count();
+    let commits_before = fixture.committer.commit_count();
+
+    let result = compact_all(&fixture, &settings).await;
+    assert!(
+        matches!(result, OperationResult::Succeeded { .. }),
+        "got {result:?}"
+    );
+
+    let commits = fixture.committer.commit_count() - commits_before;
+    let attempts = fixture.committer.attempt_count() - attempts_before;
+
+    assert!(commits >= 2, "the fixture must produce several groups");
+    assert_eq!(
+        attempts, commits,
+        "every group rewrote itself {attempts} times for {commits} commits — \
+         each group after the first is committing against a parent the group \
+         before it already moved"
+    );
+
+    assert_eq!(read_all(&fixture.table()).await.unwrap().len(), 6);
+}
+
+#[tokio::test]
+async fn a_table_that_keeps_failing_stops_rewriting_itself() {
+    // A group that fails has already read and written its whole file group by
+    // the time it finds out. When the reason is the table rather than the group
+    // — a busy writer, a credential that stopped working, a catalog refusing
+    // commits — every remaining group pays a full rewrite to be told the same
+    // thing. On a table with a hundred groups that is the entire cycle's I/O
+    // spent on work that lands nowhere.
+    let fixture = TestTable::new().unwrap();
+
+    let mut files = Vec::new();
+    for i in 0..12 {
+        files.push(fixture.write_data_file(&[(i, "a")]).await.unwrap());
+    }
+    fixture.append(files).await.unwrap();
+
+    let settings = compaction_policy(
+        r#"
+        [[rules]]
+        match = "prod.db.events"
+        [rules.compaction]
+        enabled = true
+        target_file_size = 1073741824
+        max_input_files = 2
+        "#,
+    );
+
+    // Six groups, and the catalog refuses every commit.
+    *fixture.committer.always_conflict.lock().unwrap() = true;
+
+    let attempts_before = fixture.committer.attempt_count();
+    let result = compact_all(&fixture, &settings).await;
+    let attempts = fixture.committer.attempt_count() - attempts_before;
+
+    match &result {
+        OperationResult::NoOp { detail } => assert!(
+            detail.contains("failed in a row"),
+            "the operator has to learn why the rest were left: {detail}"
+        ),
+        other => panic!("expected a no-op with a reason, got {other:?}"),
+    }
+
+    // Three groups, each retrying up to the commit budget — and then it stops,
+    // rather than doing the same for the other three.
+    assert!(
+        attempts <= 3 * 3,
+        "gave up after {attempts} commit attempts; the ceiling should have stopped it sooner"
+    );
+
+    // And nothing was changed, so the next cycle replans from where the table is.
+    assert_eq!(read_all(&fixture.table()).await.unwrap().len(), 12);
+}
+
+#[tokio::test]
+async fn the_group_that_merges_the_most_files_goes_first() {
+    // Every group commits on its own, so a cycle can end early for reasons that
+    // have nothing to do with the groups left over: a window closing, a
+    // `kill -9`, a table that starts conflicting. What has been committed by
+    // then is what the cycle achieved — so the order the groups run in decides
+    // how much good a truncated run did.
+    //
+    // Ranked by how many files each group removes, because that is what
+    // compaction is *for*. Here one partition holds six files and the other
+    // two; the six-file one must be rewritten first.
+    let fixture = TestTable::partitioned().unwrap();
+
+    for _ in 0..2 {
+        let file = fixture
+            .write_partitioned_data_file(&[(1, "a")], 1)
+            .await
+            .unwrap();
+        fixture.append(vec![file]).await.unwrap();
+    }
+    for _ in 0..6 {
+        let file = fixture
+            .write_partitioned_data_file(&[(2, "b")], 2)
+            .await
+            .unwrap();
+        fixture.append(vec![file]).await.unwrap();
+    }
+
+    let settings = compaction_policy(
+        r#"
+        [[rules]]
+        match = "prod.db.events"
+        [rules.compaction]
+        enabled = true
+        target_file_size = 1073741824
+        "#,
+    );
+
+    let table = fixture.table();
+    let table_ref = TableRef::new("prod", ["db"], "events");
+    let loader = fixture.loader();
+    let env = common::op_env(
+        &table,
+        &fixture.ident,
+        &loader,
+        fixture.committer.as_ref(),
+        OperationContext {
+            run_id: "test",
+            table: &table_ref,
+            kind: OperationKind::Compact,
+            matched_rule: "prod.db.events",
+            reason: "test",
+        },
+    );
+
+    // Deliberately naming the two-file partition first, so passing can only
+    // come from the ordering rule rather than from the order of this list.
+    let targets = vec![
+        PartitionKey {
+            spec_id: 0,
+            value: "id=1".into(),
+        },
+        PartitionKey {
+            spec_id: 0,
+            value: "id=2".into(),
+        },
+    ];
+    compact::run(&env, &settings, &targets)
+        .await
+        .expect("compaction runs");
+
+    // Each rewrite records how many data files it replaced. In commit order,
+    // the six-file group must come before the two-file one.
+    let replaced = ordered_replaced_counts(&fixture.committer.metadata());
+
+    assert_eq!(
+        replaced,
+        vec![6, 2],
+        "the group merging six files must be rewritten before the one merging two"
+    );
+
+    let rows = read_all(&fixture.table()).await.unwrap();
+    assert_eq!(rows.len(), 8);
+    assert_eq!(
+        live_data_files(&fixture.table()).await.unwrap().len(),
+        2,
+        "one file per partition"
+    );
+}
+
+/// How many data files each snapshot that removed any removed, in commit order.
+///
+/// Snapshots come back unordered, and the question here is what happened
+/// *first* — so they are ordered by the sequence number the catalog assigned,
+/// which is commit order by definition. Snapshots that removed nothing are the
+/// fixture's own appends, and say nothing about the order groups ran in.
+fn ordered_replaced_counts(metadata: &iceberg::spec::TableMetadata) -> Vec<u64> {
+    let mut snapshots: Vec<_> = metadata.snapshots().collect();
+    snapshots.sort_by_key(|s| s.sequence_number());
+    snapshots
+        .iter()
+        .filter_map(|s| {
+            s.summary()
+                .additional_properties
+                .get("deleted-data-files")
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|&count| count > 0)
+        })
+        .collect()
+}

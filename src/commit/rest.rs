@@ -237,6 +237,7 @@ impl super::TableCommitter for RestCommitter {
         ident: &TableIdent,
         requirements: Vec<TableRequirement>,
         updates: Vec<TableUpdate>,
+        ctx: crate::obs::OperationContext<'_>,
     ) -> Result<()> {
         let body = CommitTableRequest {
             identifier: RestTableIdent {
@@ -248,17 +249,25 @@ impl super::TableCommitter for RestCommitter {
         };
         let endpoint = self.table_endpoint(ident);
 
-        // One id for every attempt of this commit, sent as `X-Request-Id` and
-        // recorded in Bergman's own audit trail. A governing catalog logs its
-        // authorization decision against the same id, so one grep joins
-        // Bergman's "why" to the catalog's "who was allowed to".
-        let request_id = uuid::Uuid::new_v4().simple().to_string();
+        // The run id, not a fresh UUID. This header is only worth sending if
+        // something on Bergman's side wrote the same value down: a governing
+        // catalog records an authorization decision per commit, and joining that
+        // decision to Bergman's reason for the commit is the whole point. Every
+        // audit record of this run carries `run_id`, so one grep spans both
+        // logs. A value invented here would appear in exactly one of them.
+        //
+        // Run-grained rather than commit-grained on purpose. A commit-unique id
+        // would identify the request and nothing else; the run identifies the
+        // policy evaluation that produced it, which is the question an operator
+        // reading a catalog's audit trail actually has.
+        let request_id = ctx.run_id;
 
         for attempt in 0..=MAX_THROTTLE_RETRIES {
             let mut request = self
                 .client
                 .post(&endpoint)
-                .header("X-Request-Id", &request_id)
+                .header("X-Request-Id", request_id)
+                .header("X-Bergman-Operation", ctx.kind.as_str())
                 .json(&body);
             if let Some(token) = self.tokens.token().await? {
                 request = request.bearer_auth(token);

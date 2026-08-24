@@ -148,6 +148,16 @@ pub enum OperationKind {
 }
 
 impl OperationKind {
+    /// Whether this operation reads and writes **data** files.
+    ///
+    /// What `limits.max_rewrite_bytes_per_run` bounds, and only compaction
+    /// does: manifest rewriting re-packs the same entries into fewer Avro
+    /// files, expiration edits metadata, orphan removal commits nothing.
+    /// See [`MaintenancePlan::apply_budget`] for why that distinction matters.
+    pub fn reads_data_files(&self) -> bool {
+        matches!(self, Self::Compact)
+    }
+
     /// The operation's name, as it appears in output and audit records.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -188,11 +198,18 @@ impl MaintenancePlan {
         self.tables.iter().map(|t| t.operations.len()).sum()
     }
 
-    /// Bytes every planned rewrite would read.
+    /// Bytes of **data** every planned rewrite would read.
+    ///
+    /// The figure `limits.max_rewrite_bytes_per_run` bounds, so it counts the
+    /// same operations that budget charges — see
+    /// [`OperationKind::reads_data_files`]. A manifest rewrite's Avro bytes are
+    /// on its own estimate, where they belong, and not in this total, where
+    /// they would make a metadata-only cycle look like a data rewrite.
     pub fn total_input_bytes(&self) -> u64 {
         self.tables
             .iter()
             .flat_map(|t| &t.operations)
+            .filter(|op| op.kind.reads_data_files())
             .map(|op| op.estimate.input_bytes)
             .sum()
     }
@@ -217,6 +234,28 @@ impl MaintenancePlan {
             .flat_map(|t| t.notes.iter().map(move |note| (&t.table, note.as_str())))
     }
 
+    /// Keep only the operations of these kinds, dropping the rest.
+    ///
+    /// For the operator who needs one thing done now — "reclaim storage
+    /// tonight, rewrite nothing" — without editing a policy file and putting it
+    /// back afterwards. `bergman run --only remove-orphans` is this method.
+    ///
+    /// **Any subset is safe**, which is why this can be a filter rather than a
+    /// separate planning mode: per-table ordering is a correctness property and
+    /// filtering preserves relative order, while dropping compaction only means
+    /// expiration reclaims less and dropping expiration only means the orphan
+    /// scan sees a *larger* reachable set.
+    ///
+    /// Tables left with no operations keep their notes and stay in the plan, as
+    /// in [`Self::apply_budget`].
+    pub fn retain_operations(&mut self, kinds: &[OperationKind]) {
+        for table in &mut self.tables {
+            table.operations.retain(|op| kinds.contains(&op.kind));
+        }
+        self.tables
+            .retain(|table| !table.operations.is_empty() || !table.notes.is_empty());
+    }
+
     /// Apply a global byte budget, deferring the rewrites that do not fit.
     ///
     /// Tables are ordered most-fragmented-first, so a budget too small for
@@ -224,11 +263,12 @@ impl MaintenancePlan {
     /// returned rather than dropped: a plan that silently truncated would read
     /// as "this is all there was to do".
     ///
-    /// **Charged per operation, not per table.** Metadata-only work reads no
-    /// data files and costs the budget nothing. Deferring a whole table because
-    /// its compaction did not fit would stop that table's snapshots expiring —
-    /// it would grow history without bound *because* it was too fragmented to
-    /// compact, which is the opposite of what a cost control is for.
+    /// **Charged per operation, not per table, and only to the operations that
+    /// read data files.** Deferring a whole table because its compaction did
+    /// not fit would stop that table's manifests coalescing and its snapshots
+    /// expiring — it would grow its planning cost and its history without bound
+    /// *because* it was too fragmented to compact, which is the opposite of
+    /// what a cost control is for. See [`OperationKind::reads_data_files`].
     pub fn apply_budget(&mut self, max_bytes: u64) -> Vec<TableRef> {
         // Most-fragmented first. Small files are the metric because they are
         // what a rewrite actually fixes; a large table already at target size
@@ -246,6 +286,9 @@ impl MaintenancePlan {
         for mut table in std::mem::take(&mut self.tables) {
             let before = table.operations.len();
             table.operations.retain(|op| {
+                if !op.kind.reads_data_files() {
+                    return true;
+                }
                 let cost = op.estimate.input_bytes;
                 if cost == 0 {
                     return true;
@@ -373,6 +416,108 @@ mod tests {
             kept.notes[0].contains("deferred"),
             "the partial deferral must not be silent: {:?}",
             kept.notes
+        );
+    }
+
+    #[test]
+    fn naming_operations_keeps_those_and_their_order() {
+        // `bergman run --only remove-orphans`. Per-table ordering is a
+        // correctness property, so a filter must preserve relative order rather
+        // than reorder what survives.
+        let mut plan = MaintenancePlan {
+            generated_at: Utc::now(),
+            tables: vec![plan_with(
+                "t",
+                vec![
+                    (OperationKind::Compact, 1_000),
+                    (OperationKind::ExpireSnapshots, 0),
+                    (OperationKind::RemoveOrphans, 0),
+                ],
+            )],
+            uneventful: Vec::new(),
+            deferred: Vec::new(),
+        };
+
+        plan.retain_operations(&[OperationKind::RemoveOrphans, OperationKind::Compact]);
+
+        assert_eq!(
+            plan.tables[0]
+                .operations
+                .iter()
+                .map(|op| op.kind)
+                .collect::<Vec<_>>(),
+            vec![OperationKind::Compact, OperationKind::RemoveOrphans],
+        );
+    }
+
+    #[test]
+    fn a_table_filtered_down_to_nothing_leaves_the_plan_unless_it_explains_something() {
+        // Same rule the byte budget follows: an entry carrying only a note is
+        // an explanation, and explanations are worth keeping.
+        let mut bare = MaintenancePlan {
+            generated_at: Utc::now(),
+            tables: vec![plan_with("t", vec![(OperationKind::Compact, 1_000)])],
+            uneventful: Vec::new(),
+            deferred: Vec::new(),
+        };
+        bare.retain_operations(&[OperationKind::ExpireSnapshots]);
+        assert!(bare.tables.is_empty());
+        assert!(bare.is_empty());
+
+        let mut annotated = MaintenancePlan {
+            generated_at: Utc::now(),
+            tables: vec![plan_with("t", vec![(OperationKind::Compact, 1_000)])],
+            uneventful: Vec::new(),
+            deferred: Vec::new(),
+        };
+        annotated.tables[0]
+            .notes
+            .push("compaction cannot run: format v3".into());
+        annotated.retain_operations(&[OperationKind::ExpireSnapshots]);
+
+        assert_eq!(annotated.tables.len(), 1);
+        assert!(!annotated.tables[0].has_work());
+        assert_eq!(annotated.notes().count(), 1);
+    }
+
+    #[test]
+    fn a_manifest_rewrite_is_not_charged_to_a_data_rewrite_budget() {
+        // Re-packing manifest entries reads and writes only Avro metadata, and
+        // it is the cheapest real win Iceberg maintenance has. Charging its
+        // bytes against `max_rewrite_bytes_per_run` would let one fragmented
+        // table's compaction stop every other table's manifests coalescing —
+        // so a table too fragmented to compact would also start planning
+        // slowly, *because* it needed compacting.
+        let mut plan = MaintenancePlan {
+            generated_at: Utc::now(),
+            tables: vec![plan_with(
+                "t",
+                vec![
+                    (OperationKind::Compact, 1_000),
+                    (OperationKind::RewriteManifests, 8_000_000),
+                ],
+            )],
+            uneventful: Vec::new(),
+            deferred: Vec::new(),
+        };
+
+        // A budget large enough for the rewrite and far too small for the
+        // manifests' byte figure.
+        let deferred = plan.apply_budget(2_000);
+
+        assert!(deferred.is_empty(), "nothing should have been deferred");
+        assert_eq!(
+            plan.tables[0]
+                .operations
+                .iter()
+                .map(|op| op.kind)
+                .collect::<Vec<_>>(),
+            vec![OperationKind::Compact, OperationKind::RewriteManifests],
+        );
+        assert_eq!(
+            plan.total_input_bytes(),
+            1_000,
+            "only data-plane bytes count toward the rewrite total"
         );
     }
 

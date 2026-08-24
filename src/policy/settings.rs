@@ -53,6 +53,9 @@ impl TableSettings {
         if let Some(snapshots) = &self.snapshots {
             snapshots.validate(where_)?;
         }
+        if let Some(manifests) = &self.manifests {
+            manifests.validate(where_)?;
+        }
         if let Some(schedule) = &self.schedule {
             crate::policy::parse_schedule(schedule)
                 .map_err(|e| Error::policy(format!("{where_}: {e}")))?;
@@ -184,8 +187,28 @@ pub struct CompactionTrigger {
     pub delete_ratio: Option<f64>,
 
     /// What counts as "small", as a fraction of the target file size.
+    ///
+    /// Also decides which files a triggered rewrite actually reads: a file at
+    /// or above this size is already close enough to target that reading and
+    /// writing it back would spend I/O to move it a few percent. Mirrors
+    /// Spark's `min-file-size-bytes`, whose default is the same fraction.
     #[serde(default)]
     pub min_file_size_ratio: Option<f64>,
+
+    /// What counts as "oversized", as a multiple of the target file size.
+    ///
+    /// The other half of the same rule, and the one a small-file-only compactor
+    /// forgets. A single 5 GiB file in a table targeting 512 MiB is as
+    /// unhealthy as a thousand tiny ones and for the opposite reason: no reader
+    /// can split it, so one task does all the work. A rewrite splits it, because
+    /// the rolling writer rolls at the target size regardless of how large the
+    /// input was.
+    ///
+    /// Mirrors Spark's `max-file-size-bytes`, whose default is the same
+    /// multiple. Greater than 1 by definition — at 1 every file that is not
+    /// exactly at target would be rewritten every cycle, forever.
+    #[serde(default)]
+    pub max_file_size_ratio: Option<f64>,
 
     /// Leave a partition alone until its newest file is at least this old.
     ///
@@ -217,6 +240,27 @@ impl CompactionTrigger {
                 )));
             }
         }
+
+        // Not in `0..=1` like the others: it is a *multiple* of the target, not
+        // a fraction of it. At 1 or below, every file that is not exactly at
+        // target counts as oversized and the table rewrites itself every cycle
+        // forever — which is the failure the whole eligibility rule exists to
+        // prevent, arrived at from the other side.
+        // `!is_finite()` rather than a bare `<= 1.0`, which NaN passes: every
+        // comparison against NaN is false, so a `ratio = nan` would sail
+        // through and then make `large_file_threshold` zero — at which point
+        // every file in the table is oversized and the table rewrites itself
+        // forever.
+        if let Some(v) = self.max_file_size_ratio
+            && (!v.is_finite() || v <= 1.0)
+        {
+            return Err(Error::policy(format!(
+                "{where_}: compaction.trigger.max_file_size_ratio must be a finite number \
+                 greater than 1 (it is a multiple of the target file size, not a fraction \
+                 of it), got {v}"
+            )));
+        }
+
         Ok(())
     }
 }
@@ -283,6 +327,31 @@ pub struct ManifestSettings {
     /// Only rewrite when at least this many manifests are below target.
     #[serde(default)]
     pub min_count_to_merge: Option<usize>,
+}
+
+impl ManifestSettings {
+    fn validate(&self, where_: &str) -> Result<()> {
+        // A zero target makes no manifest undersized, so the operation this
+        // section exists to configure would silently never run — the worst
+        // shape a misconfiguration can take, because it looks exactly like a
+        // table whose manifests are fine.
+        if let Some(0) = self.target_size {
+            return Err(Error::policy(format!(
+                "{where_}: manifests.target_size must be greater than zero; \
+                 at zero no manifest counts as undersized and rewriting never runs"
+            )));
+        }
+        // At zero the threshold is met by every table, including one with no
+        // undersized manifest at all — so every cycle would walk every table's
+        // manifest set to conclude that re-packing them changes nothing.
+        if let Some(0) = self.min_count_to_merge {
+            return Err(Error::policy(format!(
+                "{where_}: manifests.min_count_to_merge must be at least 1; \
+                 at zero every table is re-examined every cycle to reach the same answer"
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// What orphan-file removal is allowed to do.
@@ -413,6 +482,25 @@ mod tests {
         .unwrap();
         let err = crate::policy::Policy::compile(&config).unwrap_err();
         assert!(err.to_string().contains("between 0 and 1"), "got: {err}");
+    }
+
+    #[test]
+    fn manifest_settings_are_validated_like_every_other_section() {
+        // The section that had no validation while its three siblings did. A
+        // zero target is the dangerous one: no manifest counts as undersized,
+        // so the operation configured here silently never runs and the table
+        // looks like one whose manifests are already fine.
+        for (key, value) in [("target_size", "0"), ("min_count_to_merge", "0")] {
+            let config = Config::from_toml(&format!(
+                "[[rules]]\nmatch = \"prod.*\"\n[rules.manifests]\n{key} = {value}\n"
+            ))
+            .unwrap();
+            let err = crate::policy::Policy::compile(&config).unwrap_err();
+            assert!(
+                err.to_string().contains(key),
+                "{key} = {value} was accepted: {err}"
+            );
+        }
     }
 
     #[test]

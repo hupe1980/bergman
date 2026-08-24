@@ -41,6 +41,14 @@ jobs:
   features:
     name: Feature matrix
     runs-on: ubuntu-latest
+
+    # Warnings are errors here, not only under `--all-features`. The lint job
+    # runs clippy against the full build, so a warning that exists *only* in a
+    # narrower one — code left dead when a feature is off, most often — is
+    # invisible to every other job in this file.
+    env:
+      RUSTFLAGS: -D warnings
+
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable

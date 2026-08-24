@@ -142,8 +142,8 @@ min_interval = "24h"
 # threshold (`min_file_size_ratio` of the target size).
 small_file_ratio = 0.3
 
-# Never rewrite fewer than this many files. Matches Spark's
-# `rewrite_data_files` default, so behaviour is unsurprising.
+# Never rewrite a partition with fewer than this many eligible files. Matches
+# Spark's `rewrite_data_files` default, so behaviour is unsurprising.
 min_input_files = 5
 
 # Rewrite when delete records exceed this fraction of a partition's rows, even
@@ -153,7 +153,21 @@ min_input_files = 5
 delete_ratio = 0.1
 
 # What counts as "small", as a fraction of the target file size.
+#
+# These two also decide which files a triggered rewrite actually *reads*. A
+# partition triggers as a whole; only the files whose size — or delete load — is
+# the problem are read, because rewriting a file already at target spends I/O to
+# move it a few percent. Both defaults are Spark's, so a table maintained by both
+# tools is judged the same way.
 min_file_size_ratio = 0.75
+
+# What counts as "oversized", as a multiple of the target file size.
+#
+# The other half of the same rule. A 5 GiB file in a table targeting 512 MiB is
+# as unhealthy as a thousand tiny ones and for the opposite reason: no reader can
+# split it, so one task does all its work. A rewrite splits it, and one such file
+# triggers a rewrite on its own.
+max_file_size_ratio = 1.8
 
 # Leave a partition alone until its newest file is this old.
 #
@@ -236,9 +250,11 @@ max_parallel_tables = 4
 # everything, tables are ordered most-fragmented-first and the remainder is
 # reported as deferred — never silently dropped.
 #
-# Charged per *operation*, not per table: metadata-only work reads no data files
-# and costs the budget nothing, so a rewrite ceiling cannot block snapshot
-# expiration — not even on the table whose compaction exhausted it.
+# Charged per *operation*, not per table, and only to the operations that read
+# data files — which is compaction and nothing else. Manifest rewriting,
+# expiration and orphan removal touch no data file and cost the budget nothing,
+# so a rewrite ceiling cannot stop a table coalescing its manifests or expiring
+# its snapshots — not even the table whose compaction exhausted it.
 # max_rewrite_bytes_per_run = 536870912000   # 500 GiB
 
 # Never delete more than this many files in one operation. A ceiling on the
@@ -257,3 +273,18 @@ max_deletes_per_run = 100000
 # The timezone is mandatory: a window in local time moves when a replica is
 # scheduled in another region, and "not during business hours" must not move.
 # maintenance_window = "22:00-06:00 Europe/Berlin"
+
+# Give up on one operation after this long.
+#
+# This bounds unbounded *waiting*, not slow work. A commit has its own request
+# timeout; a data read does not, so an object store that accepts a connection and
+# never answers leaves a rewrite waiting forever — and with table concurrency
+# bounded, a few of those stop the daemon maintaining anything.
+#
+# Cancelling is safe: maintenance is crash-only, so a rewrite killed part-way
+# leaves files nothing references, and a commit is one atomic request.
+#
+# Absent by default — the right value depends on the largest file group you
+# rewrite, and a one-shot `bergman run` already has a deadline from cron or its
+# orchestrator. This is for the daemon, which has none.
+# operation_timeout = "1h"

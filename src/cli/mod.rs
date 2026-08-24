@@ -56,6 +56,35 @@ pub enum Format {
     Json,
 }
 
+/// An operation named on the command line.
+///
+/// A separate type from [`crate::plan::OperationKind`] only so that clap owns
+/// the spellings it accepts; the values are the same names the plan, the run
+/// report and the audit trail already use, so what an operator reads is what
+/// they can type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OperationArg {
+    /// Rewrite small files and apply delete files.
+    Compact,
+    /// Coalesce fragmented manifests.
+    RewriteManifests,
+    /// Remove snapshots beyond their retention.
+    ExpireSnapshots,
+    /// Delete files no retained snapshot references.
+    RemoveOrphans,
+}
+
+impl From<OperationArg> for crate::plan::OperationKind {
+    fn from(arg: OperationArg) -> Self {
+        match arg {
+            OperationArg::Compact => Self::Compact,
+            OperationArg::RewriteManifests => Self::RewriteManifests,
+            OperationArg::ExpireSnapshots => Self::ExpireSnapshots,
+            OperationArg::RemoveOrphans => Self::RemoveOrphans,
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Report table health. Reads only, changes nothing.
@@ -80,6 +109,10 @@ enum Command {
         /// catalog of thousands when you care about one namespace.
         #[arg(long)]
         table: Option<String>,
+
+        /// Only these operations. Repeat or comma-separate for several.
+        #[arg(long, value_enum, value_delimiter = ',')]
+        only: Vec<OperationArg>,
     },
 
     /// Execute maintenance.
@@ -94,6 +127,15 @@ enum Command {
         /// Only maintain tables matching this glob.
         #[arg(long)]
         table: Option<String>,
+
+        /// Only these operations. Repeat or comma-separate for several.
+        ///
+        /// For the night you need one thing done — "reclaim storage now,
+        /// rewrite nothing" — without editing the policy file and remembering
+        /// to put it back. Any subset is safe: per-table ordering is preserved,
+        /// and dropping an operation only ever makes the others do less.
+        #[arg(long, value_enum, value_delimiter = ',')]
+        only: Vec<OperationArg>,
     },
 
     /// Run maintenance repeatedly until stopped.
@@ -209,13 +251,17 @@ pub async fn main() -> Result<()> {
             render::inspect(&health, cli.format)
         }
 
-        Command::Plan { table } => {
-            let plan = plan_for(&bergman, table.as_deref()).await?;
+        Command::Plan { table, only } => {
+            let plan = plan_for(&bergman, table.as_deref(), &only).await?;
             render::plan(&plan, cli.format)
         }
 
-        Command::Run { dry_run, table } => {
-            let plan = plan_for(&bergman, table.as_deref()).await?;
+        Command::Run {
+            dry_run,
+            table,
+            only,
+        } => {
+            let plan = plan_for(&bergman, table.as_deref(), &only).await?;
             if dry_run {
                 return render::plan(&plan, cli.format);
             }
@@ -356,12 +402,27 @@ pub async fn main() -> Result<()> {
     }
 }
 
-/// Plan every table, or only those a pattern matches.
-async fn plan_for(bergman: &Bergman, pattern: Option<&str>) -> Result<MaintenancePlan> {
-    match pattern {
-        Some(pattern) => bergman.plan_matching(pattern).await,
-        None => bergman.plan().await,
+/// Plan every table, or only those a pattern matches, keeping only the
+/// operations asked for.
+///
+/// The pattern scopes the *evaluation* — an excluded table is never read — while
+/// `only` filters a plan that has already been built, because which operations a
+/// table needs is not known until it has been examined.
+async fn plan_for(
+    bergman: &Bergman,
+    pattern: Option<&str>,
+    only: &[OperationArg],
+) -> Result<MaintenancePlan> {
+    let mut plan = match pattern {
+        Some(pattern) => bergman.plan_matching(pattern).await?,
+        None => bergman.plan().await?,
+    };
+
+    if !only.is_empty() {
+        let kinds: Vec<crate::plan::OperationKind> = only.iter().copied().map(Into::into).collect();
+        plan.retain_operations(&kinds);
     }
+    Ok(plan)
 }
 
 fn lint(config: &Config, format: Format) -> Result<()> {
@@ -493,6 +554,60 @@ mod tests {
         assert!(Cli::try_parse_from(["bergman", "daemon"]).is_ok());
         assert!(Cli::try_parse_from(["bergman", "daemon", "--interval", "15m"]).is_ok());
         assert!(Cli::try_parse_from(["bergman", "policy", "explain", "prod.db.t"]).is_ok());
+    }
+
+    #[test]
+    fn operations_can_be_named_on_the_command_line() {
+        // For the night one thing needs doing — "reclaim storage now, rewrite
+        // nothing" — without editing the policy file and remembering to put it
+        // back.
+        assert!(Cli::try_parse_from(["bergman", "run", "--only", "remove-orphans"]).is_ok());
+        assert!(Cli::try_parse_from(["bergman", "plan", "--only", "compact"]).is_ok());
+
+        // Several, both spellings.
+        assert!(
+            Cli::try_parse_from(["bergman", "run", "--only", "compact,expire-snapshots"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "bergman",
+                "run",
+                "--only",
+                "compact",
+                "--only",
+                "expire-snapshots",
+            ])
+            .is_ok()
+        );
+
+        // The spellings are the ones the plan and the audit trail print, so
+        // what an operator reads is what they can type.
+        assert!(Cli::try_parse_from(["bergman", "run", "--only", "compaction"]).is_err());
+    }
+
+    #[test]
+    fn the_command_line_names_match_the_plans_names() {
+        // Two enums for one concept only stays honest if they render alike.
+        use crate::plan::OperationKind;
+        for (arg, kind) in [
+            (OperationArg::Compact, OperationKind::Compact),
+            (
+                OperationArg::RewriteManifests,
+                OperationKind::RewriteManifests,
+            ),
+            (
+                OperationArg::ExpireSnapshots,
+                OperationKind::ExpireSnapshots,
+            ),
+            (OperationArg::RemoveOrphans, OperationKind::RemoveOrphans),
+        ] {
+            assert_eq!(OperationKind::from(arg), kind);
+            assert_eq!(
+                arg.to_possible_value().unwrap().get_name(),
+                kind.as_str(),
+                "the flag and the report must spell {kind} the same way"
+            );
+        }
     }
 
     #[test]

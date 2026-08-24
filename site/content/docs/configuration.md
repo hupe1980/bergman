@@ -107,7 +107,8 @@ max_input_files  = 10000        # files per file group
 small_file_ratio    = 0.3     # fraction of small files that triggers a rewrite
 min_input_files     = 5       # matches Spark's rewrite_data_files
 delete_ratio        = 0.1     # delete records as a fraction of rows
-min_file_size_ratio = 0.75    # what counts as "small"
+min_file_size_ratio = 0.75    # what counts as "small", and worth reading
+max_file_size_ratio = 1.8     # what counts as "oversized", and worth splitting
 min_file_age        = "1h"    # leave a partition alone until it settles
 ```
 
@@ -174,6 +175,7 @@ max_parallel_tables       = 4
 max_rewrite_bytes_per_run = 536870912000   # 500 GiB
 max_deletes_per_run       = 100000         # blast-radius ceiling, every deleter
 maintenance_window        = "22:00-06:00 Europe/Berlin"
+operation_timeout         = "1h"           # optional; bounds unbounded waiting
 ```
 
 `max_deletes_per_run` caps how many files any single operation may delete —
@@ -188,12 +190,15 @@ most-fragmented-first and the remainder is reported as **deferred**, never
 silently dropped — the run report names them, and the table's plan carries a
 note saying why.
 
-The ceiling is charged **per operation, not per table**. Metadata-only work
-reads no data files and costs the budget nothing, so a rewrite ceiling cannot
-block snapshot expiration — not even on the table whose compaction exhausted it.
-Deferring the whole table instead would mean a table too fragmented to fit the
-budget also stopped expiring snapshots, growing its history without bound
-*because* it needed compaction.
+The ceiling is charged **per operation, not per table, and only to the
+operations that read data files** — which is [compaction](@/docs/compaction.md),
+and nothing else. Manifest rewriting, expiration and orphan removal touch no
+data file and cost the budget nothing.
+
+Both halves of that rule prevent the same failure: a table too fragmented to fit
+the budget must not also stop expiring snapshots and coalescing its manifests,
+growing its history and its planning cost without bound *because* it needed
+compaction.
 
 `maintenance_window` governs when work *begins*. A cycle already under way runs
 to completion: stopping mid-rewrite at the window's edge would leave files
@@ -211,6 +216,17 @@ policy error: maintenance_window "22:00-06:00" has no timezone; write it as
 "22:00-06:00 Europe/Berlin". A window without one moves when a replica is
 scheduled in another region.
 ```
+
+`operation_timeout` bounds unbounded *waiting*, not slow work. A commit has its
+own request timeout; a data read does not, so an object store that accepts a
+connection and never answers leaves a rewrite waiting forever — and with table
+concurrency bounded, a few of those stop the daemon maintaining anything.
+Cancelling is safe: maintenance is crash-only, so a rewrite killed part-way
+leaves files nothing references, and a commit is one atomic request.
+
+It is **absent by default** — the right value depends on the largest file group
+you rewrite, and a one-shot `bergman run` already has a deadline from cron or
+its orchestrator. This is for the daemon, which has none.
 
 ## Global flags
 

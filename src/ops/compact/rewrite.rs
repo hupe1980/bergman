@@ -233,10 +233,25 @@ async fn bucket_frame(
 
     let mut df = ctx.table(&data_table).await.map_err(datafusion_error)?;
 
-    if !deletes.is_empty() {
-        let delete_table = format!("{DELETE_TABLE}_{index}");
-        let join_columns = equality_columns(table, deletes)?;
-        let delete_tasks = delete_scan_tasks(table, deletes, &join_columns)?;
+    // One anti-join per distinct set of equality columns.
+    //
+    // The spec allows a table's delete files to match on different columns —
+    // an upstream schema change moves a Flink sink's primary key, and both
+    // generations of delete file stay live until compaction retires them — and
+    // a group can therefore carry more than one set. Anti-joins compose
+    // exactly: a row survives when it matches *none* of them, which is what
+    // chaining `LeftAnti` computes. So this is a loop rather than the refusal
+    // it used to be, and no legal table is turned away for a shape the
+    // arithmetic handles.
+    //
+    // `LeftAnti` keeps only the left side's columns and their qualifier, so
+    // each join after the first still addresses `data_table` by name.
+    for (set, (join_columns, deletes)) in equality_delete_sets(table, deletes)?
+        .into_iter()
+        .enumerate()
+    {
+        let delete_table = format!("{DELETE_TABLE}_{index}_{set}");
+        let delete_tasks = delete_scan_tasks(table, &deletes, &join_columns)?;
         let delete_rows = read_tasks(table, delete_tasks)?;
 
         ctx.register_table(&delete_table, streaming_table(delete_rows)?)
@@ -250,6 +265,11 @@ async fn bucket_frame(
         // Null semantics: Iceberg's equality deletes match nulls, and SQL
         // equality does not, so the join uses `IS NOT DISTINCT FROM`. Plain
         // `=` would silently keep every row whose delete key contains a null.
+        //
+        // That operator is also what makes this a *hash* join rather than a
+        // nested loop, which is the entire reason the `DataFusion` dependency
+        // exists — see `the_equality_delete_join_is_a_hash_join` below, which
+        // asserts the resulting physical plan rather than trusting it.
         let on: Vec<Expr> = join_columns
             .iter()
             .map(|name| {
@@ -402,15 +422,30 @@ impl PartitionStream for OneShotStream {
     }
 }
 
-/// The column names an equality delete matches on.
+/// Group equality delete files by the columns they match on.
 ///
-/// Every delete file in a bucket must agree on them: a bucket whose files match
-/// on different columns cannot be one join. That is legal in the spec and rare
-/// in practice, and it is refused rather than guessed at.
-fn equality_columns(table: &Table, deletes: &[EqualityDelete]) -> Result<Vec<String>> {
+/// A delete file names the *field ids* it matches on, and different files may
+/// name different ones — legally, and for an ordinary reason: an upstream
+/// schema change moves a sink's primary key, and both generations of delete
+/// file stay live until a compaction retires them. Files matching on one set
+/// can share a join; files matching on another need their own.
+///
+/// Returned in a deterministic order (by column names), so a rewrite of an
+/// unchanged group builds the same plan twice.
+///
+/// A delete file whose field ids the *current* schema does not carry is a hard
+/// error rather than a skip. It is unusual — a dropped column with delete files
+/// still live — and the two ways of guessing are both wrong: applying it needs
+/// a column that is gone, and ignoring it silently un-deletes every row it
+/// hides.
+#[allow(clippy::type_complexity)]
+fn equality_delete_sets(
+    table: &Table,
+    deletes: &[EqualityDelete],
+) -> Result<Vec<(Vec<String>, Vec<EqualityDelete>)>> {
     let schema = table.metadata().current_schema();
+    let mut sets: HashMap<Vec<String>, Vec<EqualityDelete>> = HashMap::new();
 
-    let mut resolved: Option<Vec<String>> = None;
     for delete in deletes {
         if delete.equality_ids.is_empty() {
             return Err(Error::metadata(
@@ -442,23 +477,22 @@ fn equality_columns(table: &Table, deletes: &[EqualityDelete]) -> Result<Vec<Str
             })
             .collect::<Result<_>>()?;
 
-        match &resolved {
-            None => resolved = Some(names),
-            Some(existing) if *existing == names => {}
-            Some(existing) => {
-                return Err(Error::Unsupported(format!(
-                    "a file group carries equality deletes matching on different columns \
-                     ({existing:?} and {names:?}); rewriting it would need one join per \
-                     column set"
-                )));
-            }
-        }
+        sets.entry(names).or_default().push(delete.clone());
     }
 
-    resolved.ok_or_else(|| Error::config("no equality deletes to resolve columns from"))
+    let mut out: Vec<(Vec<String>, Vec<EqualityDelete>)> = sets.into_iter().collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
 }
 
 /// Turn equality delete files into scan tasks that read only their key columns.
+///
+/// The tasks say `Parquet`, and that is a fact rather than an assumption:
+/// `FileScanTaskDeleteFile` carries no format, so the caller checks each delete
+/// file's real format against the manifest index and refuses the group when it
+/// is anything else (see `crate::ops::compact::rewrite_once`). Upstream's reader
+/// opens a Parquet stream regardless of what the field says, so a wrong value
+/// here would not change what is read — it would only make the task lie.
 fn delete_scan_tasks(
     table: &Table,
     deletes: &[EqualityDelete],
@@ -714,6 +748,115 @@ mod tests {
             .collect()
     }
 
+    /// Build the physical plan for an anti-join on `columns`, and describe it.
+    ///
+    /// The shape of this plan is the reason `DataFusion` is a dependency at all,
+    /// so it is asserted rather than assumed — see the test below.
+    async fn anti_join_plan(columns: &[&str]) -> String {
+        use datafusion::arrow::array::Int32Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::datasource::MemTable;
+        use datafusion::physical_plan::displayable;
+
+        let schema = Arc::new(Schema::new(
+            columns
+                .iter()
+                .map(|name| Field::new(*name, DataType::Int32, true))
+                .collect::<Vec<_>>(),
+        ));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            columns
+                .iter()
+                .map(|_| Arc::new(Int32Array::from(vec![1, 2])) as _)
+                .collect(),
+        )
+        .unwrap();
+        let table =
+            || Arc::new(MemTable::try_new(schema.clone(), vec![vec![batch.clone()]]).unwrap());
+
+        let ctx = SessionContext::new();
+        ctx.register_table("data_0", table()).unwrap();
+        ctx.register_table("eq_deletes_0", table()).unwrap();
+
+        let on: Vec<Expr> = columns
+            .iter()
+            .map(|name| {
+                binary_expr(
+                    column(Some("data_0"), name),
+                    Operator::IsNotDistinctFrom,
+                    column(Some("eq_deletes_0"), name),
+                )
+            })
+            .collect();
+
+        let plan = ctx
+            .table("data_0")
+            .await
+            .unwrap()
+            .join_on(
+                ctx.table("eq_deletes_0").await.unwrap(),
+                JoinType::LeftAnti,
+                on,
+            )
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+
+        displayable(plan.as_ref()).indent(false).to_string()
+    }
+
+    #[tokio::test]
+    async fn the_equality_delete_join_is_a_hash_join() {
+        // The load-bearing assumption of the whole dependency. Bergman carries
+        // `DataFusion` for exactly one reason: upstream applies equality deletes
+        // by ANDing one predicate term per delete row and evaluating the tree
+        // against every batch, which is work proportional to `data rows ×
+        // delete rows`. A hash anti-join is proportional to their sum.
+        //
+        // But `join_on` does not build an equijoin. It puts every expression in
+        // the join *filter* with no join keys, and it is an optimizer rule
+        // (`ExtractEquijoinPredicate`) that turns `IS NOT DISTINCT FROM` back
+        // into keys plus `NullEquality::NullEqualsNull`. That rule converts only
+        // "when there are NO equijoin predicates, to be conservative" — so a
+        // plan that ever grew an ordinary `=` alongside, or a DataFusion release
+        // that tightened the guard, would silently fall back to
+        // `NestedLoopJoinExec` and restore the quadratic behaviour the
+        // dependency exists to escape. Nothing would fail; delete-heavy
+        // partitions would just stop finishing.
+        //
+        // So the physical plan is asserted, on one column and on several.
+        for columns in [&["id"][..], &["id", "region"][..]] {
+            let plan = anti_join_plan(columns).await;
+            assert!(
+                plan.contains("HashJoinExec"),
+                "the anti-join must be a hash join, got:\n{plan}"
+            );
+            assert!(
+                !plan.contains("NestedLoopJoinExec"),
+                "a nested-loop join is quadratic in the delete count:\n{plan}"
+            );
+            // And it must still be null-safe. Nulls-equal is what makes an
+            // Iceberg equality delete naming NULL remove rows whose value is
+            // null; a hash join that lost it would be fast and wrong, and the
+            // rows it failed to delete would stay visible forever.
+            assert!(
+                plan.contains("NullsEqual: true"),
+                "the join must keep Iceberg's null-matching semantics:\n{plan}"
+            );
+            // Every column must become a join key. One left behind in the
+            // filter is one the hash table does not probe on, which is a
+            // slower plan reached silently.
+            for name in columns {
+                assert!(
+                    plan.contains(&format!("{name}@")),
+                    "{name} is not a join key:\n{plan}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn the_anti_join_removes_exactly_the_deleted_keys() {
         let surviving = anti_join(
@@ -739,6 +882,87 @@ mod tests {
         // make nulls match *everything*.
         let surviving = anti_join(vec![Some(1), None, Some(3)], vec![Some(1)]).await;
         assert_eq!(surviving, vec![None, Some(3)]);
+    }
+
+    #[tokio::test]
+    async fn chained_anti_joins_remove_the_union_of_what_each_names() {
+        // Why more than one equality-column set is a loop rather than a
+        // refusal. An upstream schema change moves a sink's primary key, and
+        // both generations of delete file stay live until compaction retires
+        // them — so one group legitimately carries deletes matching on
+        // different columns. Anti-joins compose: a row survives when it matches
+        // *none* of them, which is exactly what chaining computes.
+        use datafusion::arrow::array::Int32Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::datasource::MemTable;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("region", DataType::Int32, true),
+        ]));
+        let rows = |ids: Vec<i32>, regions: Vec<i32>| {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(ids)),
+                    Arc::new(Int32Array::from(regions)),
+                ],
+            )
+            .unwrap();
+            Arc::new(MemTable::try_new(schema.clone(), vec![vec![batch]]).unwrap())
+        };
+
+        let ctx = SessionContext::new();
+        // Four rows; one delete set names id=2, the other names region=30.
+        ctx.register_table("data_0", rows(vec![1, 2, 3, 4], vec![10, 20, 30, 40]))
+            .unwrap();
+        ctx.register_table("eq_deletes_0_0", rows(vec![2], vec![0]))
+            .unwrap();
+        ctx.register_table("eq_deletes_0_1", rows(vec![0], vec![30]))
+            .unwrap();
+
+        let anti = |df: datafusion::prelude::DataFrame, right: &str, on_column: &str| {
+            let ctx = &ctx;
+            let right = right.to_string();
+            let on_column = on_column.to_string();
+            async move {
+                let other = ctx.table(&right).await.unwrap();
+                df.join_on(
+                    other,
+                    JoinType::LeftAnti,
+                    vec![binary_expr(
+                        column(Some("data_0"), &on_column),
+                        Operator::IsNotDistinctFrom,
+                        column(Some(right.as_str()), &on_column),
+                    )],
+                )
+                .unwrap()
+            }
+        };
+
+        let df = ctx.table("data_0").await.unwrap();
+        let df = anti(df, "eq_deletes_0_0", "id").await;
+        let df = anti(df, "eq_deletes_0_1", "region").await;
+
+        let surviving: Vec<i32> = df
+            .sort(vec![column(None, "id").sort(true, true)])
+            .unwrap()
+            .collect()
+            .await
+            .unwrap()
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert_eq!(surviving, vec![1, 4], "both delete sets must apply");
     }
 
     #[tokio::test]

@@ -27,6 +27,30 @@ max_age = "30d"
 specificity scoring, because a scoring function is a thing you have to simulate
 in your head to predict.
 
+Because the first match wins, a catch-all written **before** a specific rule
+makes that rule dead. Bergman refuses to start rather than let it be silent:
+
+```toml
+[[rules]]
+match = "prod.**"
+
+[[rules]]
+match = "prod.tmp.**"     # unreachable — `prod.**` already matched
+skip  = true
+```
+
+```text
+policy error: rules[1] (match = "prod.tmp.**"): this rule can never match,
+because rule "prod.**" is listed before it and already matches everything it
+does. Rules are evaluated in order and the first match wins, so put the
+specific rule first
+```
+
+The check is **sound rather than complete**: it reports a repeated pattern and a
+literal prefix followed by `**`, and stays quiet about anything it cannot decide
+by inspection. `bergman policy match` is still the way to see what a rule set
+actually selects.
+
 ### Patterns
 
 Globs over `catalog.namespace….table`, with `.` as the separator. `*` stops at a
@@ -47,7 +71,21 @@ filesystem glob:
 
 A table name may itself contain a dot. Bergman treats it as one segment, so
 `prod.analytics.*` matches the table named `a.b`, while `prod.analytics.a.b`
-matches the table `b` in namespace `a` — and not the other way round.
+matches the table `b` in namespace `a` — and not the other way round. Write
+`\.` to mean a dot that is part of a name rather than a separator:
+
+| Pattern | Matches |
+|---|---|
+| `prod.analytics.a.b` | table `b` in namespace `analytics.a` |
+| `prod.analytics.a\.b` | table `a.b` in namespace `analytics` |
+
+Without the escape such a table could only be reached by a wildcard, so it could
+not be `skip`ped.
+
+A name may also contain `/`. It and `%` are percent-encoded per segment before
+matching, so the rendering is **injective**: the table `b/c` in namespace `a`
+and the table `c` in namespace `a.b` are different tables and no pattern reaches
+both. Write the name as it is — `prod.a.b/c`.
 
 ### Skipping
 
@@ -101,11 +139,20 @@ reading every file. Preserving it is not an optimization; it is not breaking
 something the table configured. See
 [Compaction](@/docs/compaction.md#the-tables-own-sort-order).
 
-A property that is present but unparseable falls through to the default rather
-than failing the run — it is one table's typo, and refusing to maintain a table
-over it would be a worse outcome. It is reported as a warning rather than
-ignored, because a property that silently does nothing looks exactly like one
-that works.
+A property that is present but unusable falls through to the default rather than
+failing the run — it is one table's typo, and refusing to maintain a table over
+it would be a worse outcome. It is reported as a warning rather than ignored,
+because a property that silently does nothing looks exactly like one that works.
+
+**Unusable includes zero**, for every size and count, because each is a divisor
+or a threshold that becomes its own opposite there.
+`write.target-file-size-bytes = 0` puts the oversized threshold at zero, making
+every file in the table oversized and rewriting the whole thing every cycle;
+`commit.manifest.target-size-bytes = 0` makes no manifest undersized, so
+manifest rewriting silently never runs.
+
+An *age* keeps its zero: `history.expire.max-snapshot-age-ms = 0` means "no
+snapshot is too young to expire", and `min_to_keep` still bounds what goes.
 
 ## Provenance
 
@@ -125,6 +172,7 @@ prod.analytics.events
  compaction.sort                         event_date, region desc  the table's sort order
  compaction.trigger.small_file_ratio     0.30                     Bergman default
  compaction.trigger.min_file_size_ratio  0.75                     Bergman default
+ compaction.trigger.max_file_size_ratio  1.80                     Bergman default
  compaction.trigger.min_input_files      5                        Bergman default
  compaction.trigger.delete_ratio         0.10                     Bergman default
  compaction.trigger.min_file_age         1h                       Bergman default
@@ -174,7 +222,8 @@ Bergman's own defaults, for knobs Iceberg does not define:
 | `compaction.trigger.small_file_ratio` | 0.3 | |
 | `compaction.trigger.min_input_files` | 5 | Matches Spark's `rewrite_data_files` |
 | `compaction.trigger.delete_ratio` | 0.1 | |
-| `compaction.trigger.min_file_size_ratio` | 0.75 | What counts as "small" |
+| `compaction.trigger.min_file_size_ratio` | 0.75 | What counts as "small", and therefore worth reading |
+| `compaction.trigger.max_file_size_ratio` | 1.8 | What counts as "oversized" — a multiple of the target, not a fraction |
 | `compaction.trigger.min_file_age` | 1 hour | How long a partition must be quiet before it is rewritten |
 | `compaction.max_group_bytes` | 8 GiB | Bytes per [file group](@/docs/compaction.md#file-groups) |
 | `compaction.max_input_files` | 10 000 | Files per file group |

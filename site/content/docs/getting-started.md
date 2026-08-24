@@ -62,20 +62,24 @@ bergman inspect
 ```
 
 ```
- TABLE                        FILES   SIZE       AVG FILE   DELETES     SNAPSHOTS   MANIFESTS
- prod.analytics.events        480     2.14 GiB   4.56 MiB   —           61 / 34d    48 (41 small)
- prod.streaming.events_raw    92      8.11 GiB   90.2 MiB   1204 (23%)  8 / 2h      6
- prod.finance.ledger          12      6.02 GiB   513 MiB    —           4 / 6d      2
+ TABLE                        FILES   SIZE       FILE SIZE p50/p95    DELETES     SNAPSHOTS   MANIFESTS
+ prod.analytics.events        480     2.14 GiB   3.10 MiB / 9.80 MiB  —           61 / 34d    48 (41 small)
+ prod.streaming.events_raw    92      8.11 GiB   88.4 MiB / 96.1 MiB  1204 (23%)  8 / 2h      6
+ prod.finance.ledger          12      6.02 GiB   402 MiB / 2.90 GiB   —           4 / 6d      2
 ```
 
 Every number here comes from manifest metadata Iceberg already maintains — no
 data file is opened. That is what makes this cheap enough to run against
 thousands of tables.
 
-Three things to read in that output:
+Four things to read in that output:
 
-- **`AVG FILE` far below your target** is the small-file problem. `events` is
-  averaging 4.56 MiB against a 512 MiB default target.
+- **`p50` far below your target** is the small-file problem. Half of `events`'
+  files are under 3.10 MiB against a 512 MiB default target.
+- **`p95` far *above* your target** is the opposite problem, and the one a mean
+  would hide. `ledger` looks calm at 12 files, but its largest are 2.90 GiB —
+  unsplittable by any reader, so one query task does all their work. A median
+  beside a 95th percentile shows both shapes; an average shows neither.
 - **`DELETES` with a percentage** is read amplification. 23% of `events_raw`'s
   rows are named by delete files, and every query pays to apply them — even
   though its file sizes are fine.
@@ -93,17 +97,20 @@ prod.analytics.events
   rule: prod.**
   -> compact
      why: partition d=2026-08-20: 412 of 480 files below 384 MiB (86% ≥ 30%)
-     reads 480 files (2.14 GiB), writes ~5 files
+     reads 412 files (1.83 GiB), writes ~5 files
   -> expire-snapshots
      why: oldest snapshot is 34d old (> 7d), 61 snapshots retained (keeping at least 3)
      removes up to 58 snapshots
 
-1 tables, 2 operations, 2.14 GiB to read
+1 tables, 2 operations, 1.83 GiB to read
 ```
 
 Every operation carries the measurement that triggered it and the threshold it
 crossed. If a plan surprises you, [`policy explain`](@/docs/policies.md#provenance)
 shows where each threshold came from.
+
+It reads 412 files, not 480: the partition triggered the rewrite, but only the
+files a rewrite would [improve](@/docs/compaction.md#eligible) are read.
 
 ## Run it
 
@@ -113,7 +120,8 @@ bergman run --audit-log /var/log/bergman.jsonl
 
 ```text
 prod.analytics.events
-  [ok] compact: 1 partitions: 480 files (2.14 GiB) rewritten into 5 (2.09 GiB)
+  [ok] compact: 412 files (1.83 GiB) rewritten into 5 (1.79 GiB) across 1 groups
+       in 1 partitions
   [ok] expire-snapshots: 58 snapshots expired
 
 1 tables, 2 operations succeeded in 47s
@@ -121,6 +129,17 @@ prod.analytics.events
 
 `run` builds the plan through exactly the same code `plan` does, then executes
 it. What you were shown is what happens.
+
+Both take `--table <glob>` to scope which tables are examined, and `--only` to
+scope which operations run:
+
+```bash
+# Reclaim storage tonight; rewrite nothing.
+bergman run --only remove-orphans,expire-snapshots
+```
+
+Any subset is safe: the per-table order is preserved, and dropping an operation
+only ever makes the others do less.
 
 > [!NOTE]
 > `bergman run` exits `2` when any operation failed or was refused, so a broken

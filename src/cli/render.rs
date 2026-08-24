@@ -37,7 +37,7 @@ pub fn inspect(health: &[TableHealth], format: Format) -> Result<()> {
         "TABLE",
         "FILES",
         "SIZE",
-        "AVG FILE",
+        "FILE SIZE p50/p95",
         "DELETES",
         "SNAPSHOTS",
         "MANIFESTS",
@@ -62,7 +62,17 @@ pub fn inspect(health: &[TableHealth], format: Format) -> Result<()> {
             Cell::new(h.table.to_string()),
             Cell::new(h.files.data_file_count.to_string()),
             Cell::new(human_bytes(h.files.data_bytes)),
-            Cell::new(human_bytes(h.files.average_file_size())),
+            // The median beside the 95th percentile rather than a mean.
+            // A mean hides the two shapes that matter and that pull it in
+            // opposite directions: a thousand tiny files with one huge one
+            // averages out to "healthy". The spread between these two numbers
+            // is the small-file problem and the unsplittable-file problem at a
+            // glance, and neither needs a configured threshold to be visible.
+            Cell::new(format!(
+                "{} / {}",
+                human_bytes(h.files.percentile(0.5)),
+                human_bytes(h.files.percentile(0.95))
+            )),
             // Delete files and the share of rows they name: the pair that says
             // whether a table's reads are amplified, which file counts alone do
             // not.
@@ -254,6 +264,12 @@ pub fn explain(table: &TableRef, decision: &Decision, format: Format) -> Result<
                 "compaction.trigger.min_file_size_ratio",
                 &format!("{:.2}", c.min_file_size_ratio.value),
                 &c.min_file_size_ratio.from.to_string(),
+            );
+            add(
+                &mut t,
+                "compaction.trigger.max_file_size_ratio",
+                &format!("{:.2}", c.max_file_size_ratio.value),
+                &c.max_file_size_ratio.from.to_string(),
             );
             add(
                 &mut t,
