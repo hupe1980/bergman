@@ -212,6 +212,24 @@ async-trait = "0.1"
 futures = { version = "0.3", default-features = false, features = ["std"] }
 uuid = { version = "1", features = ["v4"] }
 
+# Debug info dominates a debug build of this tree, and not by a little: with
+# full `-g`, `cargo test --all-features` writes about 12 GB. The cause is the
+# shape of the crate rather than its size — DataFusion, Arrow, Parquet and
+# aws-lc are all statically linked into the library, the binary, and *each* of
+# the dozen integration-test binaries.
+#
+# That exceeds the free disk on a hosted CI runner, where the failure is
+# genuinely nasty to read: the linker mmaps its output, the filesystem cannot
+# back the pages, and `rust-lld` dies with SIGBUS and an LLVM stack dump that
+# looks like a compiler bug.
+#
+# Line tables keep what a failing test actually needs — file and line in a
+# backtrace — and drop the type and variable information that is the bulk of
+# it. `[profile.test]` inherits this, which is where it matters most. Stepping
+# through in a debugger wants the rest: `CARGO_PROFILE_DEV_DEBUG=full cargo test`.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
