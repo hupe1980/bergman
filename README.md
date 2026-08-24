@@ -79,6 +79,11 @@ docker run --rm \
   ghcr.io/hupe1980/bergman:latest plan
 ```
 
+Or a static Linux binary from the
+[releases page](https://github.com/hupe1980/bergman/releases) — `x86_64` and
+`aarch64`, musl-linked, so there is no glibc version to match. Each archive
+ships a `.sha256` beside it.
+
 Or from source (requires Rust 1.94+):
 
 ```bash

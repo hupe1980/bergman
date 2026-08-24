@@ -115,9 +115,20 @@ msrv:
     rustup toolchain install "$msrv" --profile minimal 2>/dev/null || true; \
     cargo "+$msrv" check --all-features
 
-# Build the container image. Distroless and statically linked, so it needs no
-# base-image patching and runs anywhere.
+# Build the container image, the way the release does: a static musl binary
+# first, then a distroless image around it.
+#
+# The binary is compiled inside a musl container rather than on this machine, so
+# the recipe works from any dev machine — macOS included, where there is no musl
+# toolchain — and produces the same artifact CI does.
 image tag="bergman:dev":
+    mkdir -p dist
+    docker run --rm -v "$PWD":/src:ro -v "$PWD/dist":/out -w /src \
+        -e CARGO_TARGET_DIR=/tmp/target rust:1.94-alpine sh -c '\
+            apk add --no-cache musl-dev >/dev/null && \
+            cargo build --release --locked --all-features && \
+            cp /tmp/target/release/bergman \
+               /out/bergman-$(uname -m | sed "s/x86_64/amd64/;s/aarch64/arm64/")'
     docker build -t {{tag}} .
 
 # ============================================================================

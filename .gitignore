@@ -26,3 +26,6 @@ site/public/
 # Custom
 CONCEPT.md
 .DS_Store
+
+# Build output for the container image (see `just image`).
+dist/

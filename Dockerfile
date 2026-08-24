@@ -1,50 +1,23 @@
-# Bergman — a Rust-native maintenance engine for Apache Iceberg.
-#
-# The result is a statically linked musl binary on a distroless base: no shell,
-# no package manager, no libc to keep patched. A maintenance engine holds
+# Bergman's container image: a static musl binary on a distroless base. No
+# shell, no package manager, no libc to keep patched. A maintenance engine holds
 # catalog credentials and delete permission on a warehouse, so the smallest
-# reachable surface is worth the slightly longer build.
-
-# ---------------------------------------------------------------------------
-# Build
-# ---------------------------------------------------------------------------
-FROM rust:1.94-alpine AS build
-
-# `musl-dev` for the C runtime the linker needs; `pkgconfig` and `openssl-dev`
-# are deliberately absent — the tree is rustls-only, and `cargo deny` fails the
-# build if an OpenSSL dependency ever appears.
-RUN apk add --no-cache musl-dev
-
-WORKDIR /build
-
-# Dependencies first, in their own layer. Their sources change far less often
-# than ours, so a code-only edit reuses this and rebuilds in seconds.
-COPY Cargo.toml Cargo.lock ./
-RUN mkdir -p src \
-    && echo 'fn main() {}' > src/main.rs \
-    && echo '' > src/lib.rs \
-    && cargo build --release --locked \
-    && rm -rf src
-
-COPY src ./src
-COPY README.md ./
-
-# Default features plus `metrics`, which the daemon's `/metrics`, `/health` and
-# `/events` endpoints need. Spelled as an addition rather than as a full feature
-# list, so it cannot drift from whatever `default` becomes.
+# reachable surface is worth having.
 #
-# `touch` because cargo decides staleness by mtime, and the files copied above
-# can be older than the stub build that just ran.
-RUN touch src/main.rs src/lib.rs \
-    && cargo build --release --locked --features metrics \
-    && strip target/release/bergman
+# The binary is built outside this file rather than in a build stage of it, and
+# that is the point: the release workflow has already compiled exactly these
+# binaries for the tarballs it publishes, so the image ships *those* — the same
+# bytes an operator can verify against the published `.sha256`, not a second
+# compile that happens to agree. It also means nothing here executes, so buildx
+# produces both architectures with no emulation.
+#
+# `just image` builds the binary first and then this. See the justfile.
 
-# ---------------------------------------------------------------------------
-# Runtime
-# ---------------------------------------------------------------------------
 FROM gcr.io/distroless/static-debian12:nonroot
 
-COPY --from=build /build/target/release/bergman /usr/local/bin/bergman
+# `amd64` or `arm64`, set by buildx for each platform it is asked for. Nothing
+# in this file executes, so producing both needs no emulation at all.
+ARG TARGETARCH
+COPY dist/bergman-${TARGETARCH} /usr/local/bin/bergman
 
 # Non-root by default. Bergman needs no filesystem of its own — configuration
 # is mounted, and everything else lives in object storage.

@@ -1,9 +1,15 @@
 name: Release
 
-# Binaries and a container image, built from a tag.
+# Binaries, a container image and a crates.io publish, all from a tag.
 #
-# The musl targets are what releases publish: statically linked, so there is no
-# glibc version on the host to match and the same artifact runs on anything.
+# Three ways to get Bergman, and between them they cover everyone: a static
+# musl binary for a Linux host, the container image for anything that runs
+# containers, and `cargo install bergman` for a developer on any platform. That
+# is why the binary matrix is Linux-only.
+#
+# Nothing here is cross-compiled or emulated. Each binary is built on a runner
+# of its own architecture, and the image is assembled from those binaries rather
+# than compiled again.
 
 on:
   push:
@@ -24,12 +30,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Linux only, and both on a runner of their own architecture — so
+        # nothing is cross-compiled and nothing is emulated. GitHub's arm64
+        # Linux runners are what make that possible; before them this needed
+        # `cross`, whose last release still ships an Ubuntu 18.04 image too old
+        # to run the host binaries a current Rust emits.
+        #
+        # `musl`, so the binaries are statically linked: no glibc version on the
+        # host to match, and one artifact runs on anything.
+        #
+        # There is no macOS or Windows binary, and no gap where one would go.
+        # Bergman is a server-side maintenance engine — its deployments are
+        # cron, Kubernetes CronJobs, ECS and a daemon — and the two ways onto a
+        # laptop are the container image below and `cargo install bergman`,
+        # which works on every platform Rust does.
         include:
-          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, cross: true }
-          - { target: aarch64-unknown-linux-musl, os: ubuntu-latest, cross: true }
-          - { target: x86_64-apple-darwin, os: macos-latest, cross: false }
-          - { target: aarch64-apple-darwin, os: macos-latest, cross: false }
-          - { target: x86_64-pc-windows-msvc, os: windows-latest, cross: false }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -37,38 +54,39 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
 
-      # The build images are pinned in `Cross.toml`, not taken from cross's
-      # defaults: its last release still ships an Ubuntu 18.04 image for
-      # aarch64, too old to run the host binaries a current Rust emits.
-      - uses: taiki-e/install-action@cross
-        if: matrix.cross
-
-      - name: Build
-        shell: bash
+      # The musl C runtime and linker driver. The tree carries C dependencies —
+      # aws-lc, ring, zstd, lzma, blake3 — compiled here rather than fetched, so
+      # a musl target needs a musl toolchain even on a runner of the same
+      # architecture. `cmake` and `pkg-config` are what aws-lc-sys reaches for;
+      # they are preinstalled on the x86_64 runner images and named here anyway,
+      # because the arm64 ones are slimmer.
+      - name: Install musl toolchain
         run: |
-          # `--locked` so a release is built from exactly the dependency
-          # versions CI tested, not whatever resolved today.
-          if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --locked --target ${{ matrix.target }} --all-features
-          else
-            cargo build --release --locked --target ${{ matrix.target }} --all-features
-          fi
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq musl-tools musl-dev cmake pkg-config
+
+      # `--locked` so a release is built from exactly the dependency versions CI
+      # tested, not whatever resolved today.
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} --all-features
 
       - name: Package
         shell: bash
         run: |
           name="bergman-${{ github.ref_name }}-${{ matrix.target }}"
           mkdir "$name"
-          if [ -f "target/${{ matrix.target }}/release/bergman.exe" ]; then
-            cp "target/${{ matrix.target }}/release/bergman.exe" "$name/"
-          else
-            cp "target/${{ matrix.target }}/release/bergman" "$name/"
-          fi
+          cp "target/${{ matrix.target }}/release/bergman" "$name/"
           cp README.md LICENSE-APACHE LICENSE-MIT bergman.example.toml "$name/"
           tar czf "$name.tar.gz" "$name"
           # A checksum beside each archive, so a download can be verified
-          # without trusting the transport.
-          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          # without trusting the transport. Chosen by what exists rather than by
+          # runner: `sha256sum` is Linux, `shasum` is macOS, and Git Bash on
+          # Windows has only the first — which is how this broke before.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          else
+            shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
@@ -80,10 +98,35 @@ jobs:
   image:
     name: Container image
     runs-on: ubuntu-latest
+    # The binaries this image ships are the ones the job above already built,
+    # rather than a third and fourth compile of the same source. That is worth
+    # the serialisation: building arm64 from source here meant compiling the
+    # whole dependency tree under QEMU.
+    needs: [binaries]
     steps:
       - uses: actions/checkout@v5
-      - uses: docker/setup-qemu-action@v3
+
+      # No `setup-qemu-action`: the Dockerfile only copies files, so buildx
+      # produces both platforms without executing anything for either.
       - uses: docker/setup-buildx-action@v3
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Stage the binaries buildx will copy
+        run: |
+          mkdir -p dist
+          # `TARGETARCH` in a Dockerfile is Docker's spelling, not Rust's.
+          set -- "x86_64-unknown-linux-musl:amd64" "aarch64-unknown-linux-musl:arm64"
+          for pair in "$@"; do
+            target="${pair%:*}"; arch="${pair#*:}"
+            tar xzf artifacts/bergman-*-"$target".tar.gz
+            mv bergman-*-"$target"/bergman "dist/bergman-$arch"
+          done
+          chmod +x dist/*
+          ls -l dist
 
       - uses: docker/login-action@v3
         with:

@@ -20,6 +20,10 @@ docker run --rm \
   ghcr.io/hupe1980/bergman:latest inspect
 ```
 
+Or a static Linux binary from the
+[releases page](https://github.com/hupe1980/bergman/releases) — `x86_64` and
+`aarch64`, musl-linked, with a `.sha256` beside each archive.
+
 Or from source — Rust 1.94 or later:
 
 ```bash
