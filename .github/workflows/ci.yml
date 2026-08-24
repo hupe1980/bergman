@@ -31,7 +31,31 @@ jobs:
         # The test suite needs no containers and no cloud credentials — local
         # filesystem and in-memory storage are always compiled in — which is
         # what makes running it on three platforms cheap enough to be routine.
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            args: --all-features
+          - os: macos-latest
+            args: --all-features
+
+          # Windows runs everything that does not build a real table on disk.
+          #
+          # The five integration suites that do cannot run here, and not for a
+          # reason Bergman can fix: `iceberg`'s `LocalFsStorage::normalize_path`
+          # prepends `/` to any path lacking one and keeps a leading one, so a
+          # Windows drive path becomes `/C:/…` however the `file://` URL is
+          # spelled — a path no Windows API can open. Its own tests cover only
+          # POSIX paths.
+          #
+          # What still runs is the whole library — path normalization, the
+          # matcher, policy resolution, the audit sink against real files — plus
+          # every fixture-free suite. Making the other five work needs the
+          # upstream fix, or a fixture that addresses storage by bare path; both
+          # want a Windows machine to validate.
+          - os: windows-latest
+            args: >-
+              --all-features --lib
+              --test audit_trail --test commit_wire
+              --test example_config --test orphan_safety
     steps:
       - uses: actions/checkout@v5
 
@@ -52,7 +76,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all-features
+      - run: cargo test ${{ matrix.args }}
 
   features:
     name: Feature matrix
