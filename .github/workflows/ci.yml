@@ -30,32 +30,16 @@ jobs:
       matrix:
         # The test suite needs no containers and no cloud credentials — local
         # filesystem and in-memory storage are always compiled in — which is
-        # what makes running it on three platforms cheap enough to be routine.
-        include:
-          - os: ubuntu-latest
-            args: --all-features
-          - os: macos-latest
-            args: --all-features
-
-          # Windows runs everything that does not build a real table on disk.
-          #
-          # The five integration suites that do cannot run here, and not for a
-          # reason Bergman can fix: `iceberg`'s `LocalFsStorage::normalize_path`
-          # prepends `/` to any path lacking one and keeps a leading one, so a
-          # Windows drive path becomes `/C:/…` however the `file://` URL is
-          # spelled — a path no Windows API can open. Its own tests cover only
-          # POSIX paths.
-          #
-          # What still runs is the whole library — path normalization, the
-          # matcher, policy resolution, the audit sink against real files — plus
-          # every fixture-free suite. Making the other five work needs the
-          # upstream fix, or a fixture that addresses storage by bare path; both
-          # want a Windows machine to validate.
-          - os: windows-latest
-            args: >-
-              --all-features --lib
-              --test audit_trail --test commit_wire
-              --test example_config --test orphan_safety
+        # what makes running it on both platforms cheap enough to be routine.
+        #
+        # No Windows. Bergman publishes no Windows binary (see the release
+        # workflow for why), and it could not be tested properly there in any
+        # case: `iceberg`'s `LocalFsStorage::normalize_path` prepends `/` to any
+        # path lacking one, so a Windows drive path becomes `/C:/…` however the
+        # `file://` URL is spelled, and five of the integration suites build a
+        # real table on disk. Testing a platform nothing ships to, and only
+        # two-thirds of it, is a job that costs more than it says.
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v5
 
@@ -76,7 +60,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test ${{ matrix.args }}
+      - run: cargo test --all-features
 
   features:
     name: Feature matrix
@@ -174,20 +158,28 @@ jobs:
 
   portability:
     name: Build (${{ matrix.target }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        target:
-          # musl targets are the ones releases publish: statically linked, no
-          # glibc version to match against the host.
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
+        # The musl targets releases publish, built exactly the way the release
+        # workflow builds them: on a runner of their own architecture, so
+        # nothing is cross-compiled and nothing is emulated. Keeping the two in
+        # step is the point of this job — a release target that stopped
+        # building should fail a pull request, not a tag.
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@cross
-      - run: cross build --release --target ${{ matrix.target }} --all-features
+
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq musl-tools musl-dev cmake pkg-config
+
+      - run: cargo build --release --locked --target ${{ matrix.target }} --all-features

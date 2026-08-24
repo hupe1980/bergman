@@ -79,14 +79,10 @@ jobs:
           cp README.md LICENSE-APACHE LICENSE-MIT bergman.example.toml "$name/"
           tar czf "$name.tar.gz" "$name"
           # A checksum beside each archive, so a download can be verified
-          # without trusting the transport. Chosen by what exists rather than by
-          # runner: `sha256sum` is Linux, `shasum` is macOS, and Git Bash on
-          # Windows has only the first — which is how this broke before.
-          if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
-          else
-            shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
-          fi
+          # without trusting the transport. `sha256sum` because this matrix is
+          # Linux; macOS ships `shasum` and no `sha256sum`, which is what broke
+          # this the last time the matrix was wider.
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
 
       - uses: actions/upload-artifact@v4
         with:
