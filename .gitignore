@@ -23,8 +23,18 @@ target
 # Zola build output
 site/public/
 
+# Internal-only documents (not published) — the architecture notes and the backlog.
+# `D` and `R` numbers are resolvable only inside this folder, so nothing in the
+# published tree may cite one; see concepts/README.md.
+concepts/
+
+# Third-party specifications, protocol documents and reference implementations —
+# copyrighted, so local copies are not redistributed here. `specs/README.md`
+# indexes every one with its retrieval URL and `specs/fetch.sh` rebuilds the
+# folder from scratch; `concepts/REFERENCES.md` says what each is used for.
+/specs/
+
 # Custom
-CONCEPT.md
 .DS_Store
 
 # Build output for the container image (see `just image`).

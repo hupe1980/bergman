@@ -46,7 +46,7 @@ use iceberg::scan::FileScanTask;
 use iceberg::spec::DataFileFormat;
 use iceberg::table::Table;
 
-use crate::commit::{BranchRetention, RewriteFiles, SnapshotProducer, TableCommitter};
+use crate::commit::{BranchRetention, FileRef, RewriteFiles, SnapshotProducer, TableCommitter};
 use crate::error::{Error, Result};
 use crate::health::{FileIndex, PartitionKey as HealthPartitionKey};
 use crate::obs::{MaintenanceObserver, OperationContext};
@@ -207,7 +207,45 @@ struct FileGroup {
 }
 
 impl FileGroup {
-    /// What reading this group costs.
+    /// What rewriting this group buys, counted in file objects.
+    ///
+    /// - **Consolidation**, `inputs − outputs`: the objects a reader stops
+    ///   having to open.
+    /// - **Splittability**, `outputs − inputs`: one file too large to divide is
+    ///   a task no reader can parallelise, so producing *more* files than were
+    ///   consumed is equally the point.
+    /// - **Delete files applying**: retiring one removes an object every scan of
+    ///   the partition opens. Counted as applying rather than retirable, because
+    ///   whether a delete is shared is a whole-table question and this is a
+    ///   per-group estimate.
+    ///
+    /// The first two are `inputs.abs_diff(outputs)`: both measure how far the
+    /// group moves the partition toward one file per target-sized chunk, and a
+    /// group already at that shape correctly scores zero.
+    ///
+    /// Floored at 1, so a group admitted by a rule this does not model sorts by
+    /// cost rather than dividing to nothing.
+    fn benefit(&self, settings: &Settings) -> u64 {
+        let inputs = self.tasks.len();
+        // Deliberately not clamped to `inputs`: a group splitting an oversized
+        // file produces more files than it consumed, and that is the benefit,
+        // not an error in the estimate.
+        let outputs = if settings.target == 0 {
+            inputs
+        } else {
+            self.bytes().div_ceil(settings.target).max(1) as usize
+        };
+
+        let deletes: HashSet<&str> = self
+            .tasks
+            .iter()
+            .flat_map(|t| t.deletes.iter())
+            .map(|d| d.file_path.as_str())
+            .collect();
+
+        (inputs.abs_diff(outputs) + deletes.len()).max(1) as u64
+    }
+
     fn bytes(&self) -> u64 {
         self.tasks.iter().map(|t| t.file_size_in_bytes).sum()
     }
@@ -553,20 +591,34 @@ impl Job<'_> {
             }
         }
 
-        // Most consolidation first, so a cycle cut short has done its most
-        // valuable work: ranked by how many files each group removes, because
-        // that is what compaction is for. Ties break toward the cheaper group,
-        // then to the partition key and index, so two runs of an unchanged
-        // table do the same work in the same order. Spark exposes the same idea
-        // as `rewrite-job-order`.
-        groups.sort_by(|a, b| {
-            b.tasks
-                .len()
-                .cmp(&a.tasks.len())
-                .then_with(|| a.bytes().cmp(&b.bytes()))
+        // Best value first, because a cycle can end before it runs out of
+        // groups — a window closing, the byte budget spent, a `kill -9` — and
+        // what has been committed by then is what it achieved.
+        //
+        // That is a knapsack: benefit against cost, under a byte budget. Greedy
+        // by density is its standard approximation, and ranking on benefit alone
+        // would make cost irrelevant (D30 in the architecture notes).
+        //
+        // Compared by cross-multiplication rather than as a ratio: exact, and
+        // total, which `sort_by` requires and `f64` cannot promise. `u128`
+        // because benefit × bytes can exceed `u64`. Ties break to the partition
+        // key and index, so two runs of an unchanged table agree.
+        //
+        // Decorated once rather than recomputed in the comparator, which would
+        // allocate a set per comparison.
+        let mut ranked: Vec<(u64, u64, FileGroup)> = groups
+            .into_iter()
+            .map(|g| (g.benefit(self.settings), g.bytes().max(1), g))
+            .collect();
+        ranked.sort_by(|(ba, ca, a), (bb, cb, b)| {
+            // ba/ca > bb/cb  <=>  ba*cb > bb*ca
+            (*ba as u128 * *cb as u128)
+                .cmp(&(*bb as u128 * *ca as u128))
+                .reverse()
                 .then_with(|| a.partition.cmp(&b.partition))
                 .then_with(|| a.index.cmp(&b.index))
         });
+        let groups: Vec<FileGroup> = ranked.into_iter().map(|(_, _, g)| g).collect();
 
         Ok(groups)
     }
@@ -859,7 +911,12 @@ impl Job<'_> {
         // A group whose rows were entirely deleted produces no files. That is a
         // legitimate outcome — the rewrite removes the inputs and adds nothing —
         // and it is how a partition emptied by deletes finally stops being read.
-        let mut removed: Vec<String> = tasks.iter().map(|t| t.data_file_path.clone()).collect();
+        // Data files own their paths outright, so their identity is the path.
+        // The delete files appended below may not — see `FileRef`.
+        let mut removed: Vec<FileRef> = tasks
+            .iter()
+            .map(|t| FileRef::path(&t.data_file_path))
+            .collect();
         removed.extend(retirable.iter().cloned());
 
         let rewrite = RewriteFiles {
@@ -874,11 +931,21 @@ impl Job<'_> {
         };
 
         // The superseded files are announced before the commit that drops them,
-        // so an observer sees what a rewrite is about to replace — the same
-        // contract the deletion manifest has.
-        self.observer
-            .deleting_files(self.ctx, &rewrite.removed)
-            .await;
+        // so an observer sees what a rewrite is about to replace.
+        //
+        // Whole files only. A blob reference names a deletion vector inside a
+        // Puffin container that other, live vectors may share, and this hook's
+        // contract is "these paths are about to stop existing" — which is untrue
+        // of the container and is exactly the misreading that deletes live
+        // deletes. Dropping the entry is the commit's business; the file is the
+        // orphan scanner's, once nothing names it at all.
+        let announced: Vec<String> = rewrite
+            .removed
+            .iter()
+            .filter(|r| !r.is_blob())
+            .map(|r| r.path.clone())
+            .collect();
+        self.observer.deleting_files(self.ctx, &announced).await;
 
         self.committer
             .commit(self.ident, requirements, updates, self.ctx)
@@ -940,7 +1007,14 @@ impl Job<'_> {
             return Ok(0);
         };
 
-        self.observer.deleting_files(self.ctx, &dangling).await;
+        // Whole files only, for the reason in `rewrite_once`: retiring a
+        // deletion vector drops a manifest entry, never a Puffin file.
+        let announced: Vec<String> = dangling
+            .iter()
+            .filter(|r| !r.is_blob())
+            .map(|r| r.path.clone())
+            .collect();
+        self.observer.deleting_files(self.ctx, &announced).await;
         self.committer
             .commit(self.ident, requirements, updates, self.ctx)
             .await?;
@@ -957,56 +1031,83 @@ fn has_deletes(chunk: &[&FileScanTask]) -> bool {
     chunk.iter().any(|t| !t.deletes.is_empty())
 }
 
-/// What the manifests say a group's rewrite should produce.
+/// What the manifests say a group's rewrite should produce: a closed interval.
 ///
-/// Two shapes, because metadata supports two strengths of claim:
+/// A rewrite can only ever *remove* rows, and it can only remove rows a delete
+/// file names. Those two facts give a floor and a ceiling, and checking both is
+/// what makes the contract mean something on the tables it matters for:
 ///
-/// - With **no delete file** applying, the rewrite must reproduce every row it
-///   read — an equality. Breaking it produces a table that is wrong forever
-///   while looking fine.
-/// - With deletes applying, the exact figure is unknowable: a delete file's
-///   `record_count` is an upper bound (the same row may be named twice, and a
-///   positional delete may name a row already gone), so subtracting it would
-///   fail honest rewrites. But a rewrite can only ever remove rows, so the input
-///   count is a **ceiling** — and a group that exceeded it duplicated data,
-///   which is what a scan side executed twice looks like.
+/// - **Ceiling** — every row read, from every input. Exceeding it means rows
+///   were duplicated, which is what a scan side executed twice looks like.
+/// - **Floor** — the rows of the inputs that **no delete file applies to**.
+///   Nothing in the pipeline is allowed to drop those, whatever happens to
+///   their neighbours.
+///
+/// The floor is the half that earns its keep. With no delete applying, floor and
+/// ceiling coincide and the check is an equality — the strongest claim metadata
+/// supports. The moment a single delete file applies, a ceiling-only check stops
+/// detecting row *loss* entirely: a rewrite that silently dropped every row
+/// would sit comfortably under it. That would leave the weakest check on
+/// precisely the streaming and CDC tables this engine exists for.
+///
+/// The exact figure remains unknowable, and deliberately so: a delete file's
+/// `record_count` is an upper bound on what it removes — the same row may be
+/// named twice, and a positional delete may name a row already gone — so
+/// subtracting it would fail honest rewrites. Partitioning the inputs into
+/// "deletes apply" and "deletes do not" needs no such guess, because
+/// `FileScanTask::deletes` is exact per file.
 ///
 /// `None` when the scan reported no record count for some input, which happens
 /// when a task covers part of a file. Checking a number that was never complete
 /// would fail every rewrite of such a table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExpectedRows {
-    /// Rows in equal rows out.
-    Exactly(u64),
-    /// Deletes apply, so some rows legitimately disappear — but none may
-    /// appear.
-    AtMost(u64),
+struct ExpectedRows {
+    /// Rows that no delete file can remove, so none may go missing.
+    floor: u64,
+    /// Rows read, so none may be added.
+    ceiling: u64,
 }
 
 impl ExpectedRows {
     /// Why `produced` is wrong, if it is.
     fn violated_by(self, produced: u64) -> Option<String> {
-        match self {
-            Self::Exactly(expected) if produced != expected => Some(format!(
-                "read {expected} rows and wrote {produced}; \
-                 refusing to commit a rewrite that changed the row count"
-            )),
-            Self::AtMost(ceiling) if produced > ceiling => Some(format!(
-                "read at most {ceiling} rows and wrote {produced}; \
-                 a rewrite can only remove rows, so refusing to commit one that added them"
-            )),
-            _ => None,
+        if produced > self.ceiling {
+            return Some(format!(
+                "read {} rows and wrote {produced}; \
+                 a rewrite can only remove rows, so refusing to commit one that added them",
+                self.ceiling
+            ));
         }
+        if produced < self.floor {
+            return Some(if self.floor == self.ceiling {
+                format!(
+                    "read {} rows and wrote {produced}; \
+                     refusing to commit a rewrite that lost rows",
+                    self.ceiling
+                )
+            } else {
+                format!(
+                    "wrote {produced} rows, but {} of the {} rows read carry no delete file \
+                     and cannot legitimately disappear; refusing to commit",
+                    self.floor, self.ceiling
+                )
+            });
+        }
+        None
     }
 }
 
 fn expected_rows(tasks: &[FileScanTask]) -> Option<ExpectedRows> {
-    let total: u64 = tasks.iter().map(|t| t.record_count).sum::<Option<u64>>()?;
-    if tasks.iter().any(|t| !t.deletes.is_empty()) {
-        Some(ExpectedRows::AtMost(total))
-    } else {
-        Some(ExpectedRows::Exactly(total))
+    let mut floor = 0u64;
+    let mut ceiling = 0u64;
+    for task in tasks {
+        let rows = task.record_count?;
+        ceiling = ceiling.saturating_add(rows);
+        if task.deletes.is_empty() {
+            floor = floor.saturating_add(rows);
+        }
     }
+    Some(ExpectedRows { floor, ceiling })
 }
 
 /// Refuse sort columns the table does not have, before anything is read.
@@ -1038,8 +1139,18 @@ fn check_sort_columns(
 ///
 /// Split out so the rule can be tested directly: it is the one that resurrects
 /// deleted rows when it is wrong, and nothing fails visibly when it is.
-fn retirable_deletes(in_group: &HashSet<String>, elsewhere: &HashSet<String>) -> Vec<String> {
-    let mut out: Vec<String> = in_group.difference(elsewhere).cloned().collect();
+fn retirable_deletes(in_group: &HashSet<String>, elsewhere: &HashSet<String>) -> Vec<FileRef> {
+    // Paths, because a scan task is all this has to go on:
+    // `FileScanTaskDeleteFile` carries no `content_offset`, so a deletion vector
+    // is indistinguishable from its Puffin container here.
+    //
+    // That is safe rather than merely tolerable, and the direction matters. A
+    // `FileRef` with no offset does not match a deletion-vector entry, which
+    // carries one — so on a table that somehow reached this path with DVs, the
+    // removal fails the liveness check in `rewrite_files` **loudly**, instead of
+    // matching by path and taking the dangling vector's live siblings with it.
+    // Refusing to commit is the correct failure; silent resurrection is not.
+    let mut out: Vec<FileRef> = in_group.difference(elsewhere).map(FileRef::path).collect();
     out.sort();
     out
 }
@@ -1172,7 +1283,7 @@ mod tests {
 
         assert_eq!(
             retirable_deletes(&in_group, &elsewhere),
-            vec!["s3://b/t/d1.parquet".to_string()]
+            vec![FileRef::path("s3://b/t/d1.parquet")]
         );
     }
 
@@ -1183,7 +1294,7 @@ mod tests {
         let in_group = set(&["s3://b/t/d1.parquet"]);
         assert_eq!(
             retirable_deletes(&in_group, &HashSet::new()),
-            vec!["s3://b/t/d1.parquet".to_string()]
+            vec![FileRef::path("s3://b/t/d1.parquet")]
         );
     }
 
@@ -1279,33 +1390,147 @@ mod tests {
 
     #[test]
     fn rows_in_equal_rows_out_where_no_delete_applies() {
+        // Two files of ten rows each and nothing deleting any of them: floor and
+        // ceiling coincide, so the contract is an equality.
         let tasks = vec![task(10), task(20)];
-        assert_eq!(expected_rows(&tasks), Some(ExpectedRows::Exactly(20)));
+        let expected = expected_rows(&tasks).unwrap();
+        assert_eq!(
+            expected,
+            ExpectedRows {
+                floor: 20,
+                ceiling: 20
+            }
+        );
 
-        assert!(ExpectedRows::Exactly(20).violated_by(20).is_none());
-        assert!(ExpectedRows::Exactly(20).violated_by(19).is_some());
-        assert!(ExpectedRows::Exactly(20).violated_by(21).is_some());
+        assert!(expected.violated_by(20).is_none());
+        assert!(expected.violated_by(19).is_some(), "a lost row is a fault");
+        assert!(
+            expected.violated_by(21).is_some(),
+            "an added row is a fault"
+        );
     }
 
     #[test]
-    fn where_deletes_apply_the_input_count_is_a_ceiling() {
+    fn where_every_input_carries_a_delete_the_count_is_only_a_ceiling() {
         // A delete file's record count is an upper bound — the same row may be
-        // named twice — so an exact equality would fail every rewrite of a
-        // delete-heavy table for a reason that is not a fault. But a rewrite
-        // can only ever *remove* rows, so producing more than went in is a
-        // fault however many deletes applied.
-        let tasks = vec![with_a_delete(task(10)), task(20)];
-        assert_eq!(expected_rows(&tasks), Some(ExpectedRows::AtMost(20)));
+        // named twice — so an exact equality would fail honest rewrites. With no
+        // input exempt, the floor is zero and only duplication is detectable.
+        let tasks = vec![with_a_delete(task(10)), with_a_delete(task(20))];
+        let expected = expected_rows(&tasks).unwrap();
+        assert_eq!(
+            expected,
+            ExpectedRows {
+                floor: 0,
+                ceiling: 20
+            }
+        );
 
         assert!(
-            ExpectedRows::AtMost(20).violated_by(12).is_none(),
-            "deletes legitimately remove rows"
+            expected.violated_by(0).is_none(),
+            "a partition whose rows were all deleted legitimately produces nothing"
         );
-        assert!(ExpectedRows::AtMost(20).violated_by(20).is_none());
+        assert!(expected.violated_by(20).is_none());
         assert!(
-            ExpectedRows::AtMost(20).violated_by(21).is_some(),
+            expected.violated_by(21).is_some(),
             "a rewrite that added rows must be refused"
         );
+    }
+
+    #[test]
+    fn rows_of_inputs_no_delete_touches_may_not_go_missing() {
+        // The half a ceiling-only check cannot see. One input carries a delete
+        // and one does not, so ten of the twenty rows read are exempt from
+        // deletion and must survive. A rewrite that dropped them would pass a
+        // ceiling test and produce a table that is wrong forever.
+        let tasks = vec![with_a_delete(task(10)), task(20)];
+        let expected = expected_rows(&tasks).unwrap();
+        assert_eq!(
+            expected,
+            ExpectedRows {
+                floor: 10,
+                ceiling: 20
+            }
+        );
+
+        assert!(
+            expected.violated_by(10).is_none(),
+            "the delete may legitimately have removed all ten of its file's rows"
+        );
+        assert!(expected.violated_by(15).is_none());
+        assert!(
+            expected.violated_by(9).is_some(),
+            "dropping a row no delete file names is a fault, however many deletes applied"
+        );
+        assert!(expected.violated_by(21).is_some());
+    }
+
+    #[test]
+    fn a_cheap_group_outranks_an_expensive_one_of_similar_benefit() {
+        // The ordering defect this replaced: ranking by file count alone put a
+        // hundred 100 MB files ahead of ninety-nine 1 KB files, spending ten
+        // gigabytes of a bounded cycle to buy what ninety-nine kilobytes buys.
+        // A realistic target, because the ratio is what is under test.
+        let settings = Settings {
+            target: 512 * 1024 * 1024,
+            small: 384 * 1024 * 1024,
+            large: 920 * 1024 * 1024,
+            ..job(1 << 40, 100_000)
+        };
+
+        let expensive = FileGroup {
+            partition: HealthPartitionKey::unpartitioned(0),
+            index: 0,
+            tasks: (0..100).map(|_| task(100 * 1024 * 1024)).collect(),
+        };
+        let cheap = FileGroup {
+            partition: HealthPartitionKey::unpartitioned(0),
+            index: 1,
+            tasks: (0..99).map(|_| task(100)).collect(),
+        };
+
+        let (be, ce) = (expensive.benefit(&settings), expensive.bytes().max(1));
+        let (bc, cc) = (cheap.benefit(&settings), cheap.bytes().max(1));
+        assert!(
+            bc as u128 * ce as u128 > be as u128 * cc as u128,
+            "the cheap group must rank first: benefit {bc}/{cc} bytes vs {be}/{ce} bytes"
+        );
+        assert_eq!(be, 80, "a hundred 100 MB files become twenty 512 MB ones");
+        assert_eq!(bc, 98, "ninety-nine tiny files become one");
+    }
+
+    #[test]
+    fn a_group_that_retires_delete_files_is_worth_more_than_its_size_suggests() {
+        // Retiring a delete file removes an object every scan of the partition
+        // opens, so a delete-heavy group must outrank a plain small-file group
+        // of the same cost.
+        let settings = job(1 << 40, 100_000);
+        let plain = FileGroup {
+            partition: HealthPartitionKey::unpartitioned(0),
+            index: 0,
+            tasks: vec![task(100), task(100)],
+        };
+        let with_deletes = FileGroup {
+            partition: HealthPartitionKey::unpartitioned(0),
+            index: 1,
+            tasks: vec![with_a_delete(task(100)), task(100)],
+        };
+        assert!(
+            with_deletes.benefit(&settings) > plain.benefit(&settings),
+            "an applying delete file is benefit the size histogram cannot see"
+        );
+    }
+
+    #[test]
+    fn benefit_is_never_zero() {
+        // A group that earned its place by a rule `benefit` does not model must
+        // still sort by cost rather than dividing to nothing.
+        let settings = job(1 << 40, 100_000);
+        let at_target = FileGroup {
+            partition: HealthPartitionKey::unpartitioned(0),
+            index: 0,
+            tasks: vec![task(settings.small + 1)],
+        };
+        assert_eq!(at_target.benefit(&settings), 1);
     }
 
     #[test]

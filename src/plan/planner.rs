@@ -171,7 +171,23 @@ fn plan_compaction(
             continue;
         }
 
-        let eligible = if by_deletes {
+        // What a rewrite of this partition would actually read — and it must be
+        // a **superset** of what the executor will choose, or `bergman plan`
+        // promises less than `bergman run` does and the cycle's byte budget is
+        // charged for less than it spends.
+        //
+        // The executor reads a file when its size is a problem *or* a delete
+        // applies to it, and it knows which files carry deletes because a
+        // `FileScanTask` names them. The planner reads manifests, which record
+        // delete files but not which data file each one covers — so it cannot
+        // narrow, and must not pretend to.
+        //
+        // The condition is therefore "this partition has any delete file at
+        // all", not "its delete ratio crossed the trigger". Those are different
+        // questions, and using the trigger here was the bug: a partition holding
+        // a few deletes below the ratio still has at-target files the executor
+        // will rewrite, and every one of them was missing from the estimate.
+        let eligible = if partition.delete_file_count() > 0 {
             partition.all_eligible()
         } else {
             size_eligible

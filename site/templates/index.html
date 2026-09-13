@@ -45,7 +45,7 @@
     <div class="stat"><span class="stat__n">0</span><span class="stat__l">JVMs required</span></div>
     <div class="stat"><span class="stat__n">0</span><span class="stat__l">clusters to run</span></div>
     <div class="stat"><span class="stat__n">1</span><span class="stat__l">static binary</span></div>
-    <div class="stat"><span class="stat__n">7</span><span class="stat__l">checks before a delete</span></div>
+    <div class="stat"><span class="stat__n">8</span><span class="stat__l">checks before a delete</span></div>
   </div>
 </section>
 
@@ -55,7 +55,7 @@
     <p class="section__lede">
       It must never win against a foreground writer, and never corrupt one. Every
       design decision below follows from that — triggers instead of schedules,
-      replan instead of retry, and a deletion path with seven independent checks
+      replan instead of retry, and a deletion path with eight independent checks
       standing in front of it.
     </p>
 
@@ -99,7 +99,8 @@
           Dry run by default. A grace period with a hard 24-hour floor that cannot be
           configured away. Unknown file age means too young. Segment-wise containment,
           and a refusal to scan a location another table lives inside. Re-verification
-          against freshly loaded metadata, and a ceiling on the blast radius.
+          against freshly loaded metadata, a ceiling on the blast radius, and a refusal
+          when the listing and the table's metadata share no file at all.
         </p>
         <a class="pillar__link" href="{{ get_url(path='@/docs/orphans.md') }}">The safety model →</a>
       </article>

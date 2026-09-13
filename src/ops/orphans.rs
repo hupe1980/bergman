@@ -29,6 +29,19 @@
 //!    out to be, one scan deletes at most `limits.max_deletes_per_run` files and
 //!    says so — the same ceiling, through the same deleter, that expiration's
 //!    cleanup uses (see [`crate::ops::delete`]).
+//! 8. **The listing and the metadata must agree that at least one file exists.**
+//!    A reachable set full of files and a listing full of objects that do not
+//!    intersect at all means one of the two is describing a different world, and
+//!    every live file then looks exactly like garbage. This is the check that
+//!    stands between a mis-set location property — or a bucket alias, or a
+//!    scoped credential — and an emptied warehouse.
+//!
+//! A ninth stands slightly apart, because it guards the *input* rather than a
+//! candidate: a reachable set that came back **empty** for a table that has a
+//! current snapshot is a metadata read that went wrong, not a table containing
+//! nothing but garbage. Errors during that computation abort it outright for the
+//! same reason — a partial reachable set is indistinguishable from a complete
+//! one.
 
 use futures::StreamExt;
 
@@ -132,6 +145,9 @@ pub async fn run(
     let mut candidates: Vec<String> = Vec::new();
     let mut orphan_bytes = 0u64;
     let mut foreign_root: Option<String> = None;
+    // Check 8's evidence: how many of the table's own live files this listing
+    // actually returned. See the refusal below for why a zero is disqualifying.
+    let mut observed_reachable = 0usize;
 
     while let Some(object) = listing.next().await {
         let object = object?;
@@ -152,6 +168,7 @@ pub async fn run(
         }
 
         if reachable.contains(&object.path) {
+            observed_reachable += 1;
             continue;
         }
         // Check 4. The listing is already scoped to the location, but a store
@@ -185,6 +202,35 @@ pub async fn run(
 
     if let Some(nested) = &foreign_root {
         return Err(nested_refusal(table_ref, &location, nested));
+    }
+
+    // Check 8. A reachable set full of files and a listing full of objects
+    // that do not intersect at all means one of the two is describing a
+    // different world — a `location` changed after the data was written, a
+    // bucket alias or scheme spelling normalization did not fold together, a
+    // credential scoped to a subdirectory. Every live file then looks exactly
+    // like garbage, and checks 1-7 all pass it.
+    //
+    // A healthy table cannot reach here: its own `metadata.json`, manifest list
+    // and manifests live under its location, so a listing returns at least
+    // those. Zero overlap is an unanswered question, not an answer.
+    if scanned > 0
+        && observed_reachable == 0
+        && !reachable.is_empty()
+        && table.metadata().current_snapshot().is_some()
+    {
+        return Err(Error::refused(
+            "remove-orphans",
+            table_ref,
+            format!(
+                "listed {scanned} objects under {location} and none of the {} files this \
+                 table references were among them; the listing and the table's metadata \
+                 disagree about where its files are, so every object here would look like \
+                 garbage. Refusing rather than deleting {} of them",
+                reachable.len(),
+                candidates.len()
+            ),
+        ));
     }
 
     candidates.sort();

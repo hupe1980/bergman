@@ -38,7 +38,7 @@ mod snapshot;
 
 pub use auth::{Credential, TokenSource};
 pub use rest::RestCommitter;
-pub use snapshot::{BranchRetention, RewriteFiles, SnapshotProducer};
+pub use snapshot::{BranchRetention, FileRef, RewriteFiles, SnapshotProducer};
 
 use async_trait::async_trait;
 use iceberg::spec::FormatVersion;

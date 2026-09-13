@@ -1,6 +1,6 @@
 [package]
 name = "bergman"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["hupe1980"]
 description = "A Rust-native maintenance engine for Apache Iceberg — policy-driven compaction, snapshot expiration, and orphan cleanup with no JVM"

@@ -39,14 +39,24 @@ Bergman is pre-release. All four maintenance operations execute.
 | Compaction | ✅ | Upstream's scan + writers, Bergman's commit layer |
 | Dangling delete-file removal | ✅ | Bergman's commit layer — nothing else ever cleans these up |
 
-Format **v1 and v2** tables are rewritten. A **v3** table's data-plane
-operations are refused with a named reason — a **gap, not an impossibility**.
-The spec requires a rewrite to copy each row's `_row_id` into the file replacing
-it, and Iceberg's Java implementation does exactly that (Spark since 1.10.0).
-`iceberg-rust` does not yet expose the field to project or to write, so Bergman
-would renumber every row it touched. Snapshot expiration and orphan removal
-still run, so a v3 table's history stays bounded and its storage still gets
-reclaimed. The refusal appears in `bergman plan`, not only in a log line.
+Format **v1 and v2** tables are rewritten. A **v3** table's data-plane operations
+are refused with a named reason — a **gap, not an impossibility** — and there are
+two independent reasons, both upstream-shaped:
+
+- **Row lineage.** The spec requires a rewrite to copy each row's `_row_id` into
+  the file replacing it, and Iceberg's Java implementation does exactly that
+  (Spark since 1.10.0). `iceberg-rust` does not yet expose the field to project
+  or to write, so Bergman would renumber every row it touched.
+- **Deletion vectors.** v3 encodes position deletes as Puffin bitmap blobs, and
+  the released `iceberg-rust` has no decoder — so a rewrite could not see the
+  deletes it must apply.
+
+Snapshot expiration and orphan removal still run, so a v3 table's history stays
+bounded and its storage still gets reclaimed. On v3 that matters more than it
+sounds: a deletion vector is a blob inside a Puffin file, writers are not
+required to rewrite those files when a vector is superseded, and **orphan removal
+is the only thing that ever reclaims the space**. The refusal appears in
+`bergman plan`, not only in a log line.
 
 ### Why bergman owns its commit layer
 
@@ -233,10 +243,14 @@ into groups bounded by `max_group_bytes` (8 GiB) and `max_input_files` (10 000),
 and each group commits on its own — so one lost commit costs one group, and a
 partition larger than memory is still compactable.
 
-Groups run **most-consolidation-first**, so a cycle that ends early has done its
-most valuable work. Each group commits against the snapshot the previous one
-produced. After three groups fail in a row the table is left for the next cycle,
-since a failing group has already paid for a full rewrite before it fails.
+Groups run **best-value-per-byte first**, so a cycle that ends early — a window
+closing, a byte budget running out, a `kill -9` — has done its most valuable work.
+Benefit is the change in file count plus the delete files retired; cost is the
+bytes read. Ranking on file count alone would make cost decorative and spend a
+bounded cycle on the most expensive work first. Each group commits against the
+snapshot the previous one produced. After three groups fail in a row the table is
+left for the next cycle, since a failing group has already paid for a full rewrite
+before it fails.
 
 Each group is read with its delete files applied, optionally sorted, and written
 back at the target size honouring the table's own `write.parquet.*` settings. A
@@ -264,14 +278,19 @@ expiration's file cleanup all default off. Metadata-only snapshot expiration is
 the single exception, because unbounded snapshot growth is the most common
 Iceberg health problem.
 
-**Orphan removal has seven independent checks**, because it is the one
+**Orphan removal has eight independent checks**, because it is the one
 operation that can destroy a healthy table: dry run by default; a grace period
 with a hard 24-hour floor that cannot be configured away; unknown file age
 counts as too young; segment-wise containment, so `…/events` can never reach
 `…/events_archive`; a refusal to scan a location another table lives inside —
 detected from the listing itself, so a table deliberately excluded from
 maintenance is still protected; re-verification against freshly-loaded metadata
-before deleting; and a ceiling on how many files one operation may remove.
+before deleting; a ceiling on how many files one operation may remove; and a
+refusal when the listing and the table's metadata **share no file at all**,
+which is what a changed `location`, a bucket alias or a scoped credential looks
+like — every object is then old, unreferenced and contained, and every one of
+them is live. Each check is pinned by a pair of tests: one proving deletion was
+reachable, one proving the check is what prevented it.
 [Detail →](https://hupe1980.github.io/bergman/docs/orphans/)
 
 **One deleter, one safety model.** Orphan removal and expiration's file cleanup
@@ -290,14 +309,15 @@ rows there, and dropping it would bring them back — so the whole table is
 planned before anything is rewritten, because that question cannot be answered
 from inside the group.
 
-**Rows in equal rows out — or, where deletes apply, no more than went in.**
-Every file group compares what it wrote against what the manifests said it read,
-and refuses to commit when the comparison fails. With no delete file applying,
-the counts must be equal; where deletes apply the exact figure is unknowable
-from metadata, so the input count stands as a ceiling and a rewrite that
-*added* rows is refused. The outputs are abandoned and the orphan scanner
-reclaims them. A rewrite that silently lost rows is indistinguishable from one
-that worked, and the table it produces is wrong forever.
+**The row count must land in a known interval.** Every file group compares what it
+wrote against a ceiling — every row read, so a rewrite that *added* rows is
+refused — and a floor: the rows of inputs that **no delete file applies to**,
+which nothing may drop. With no delete applying the two coincide and the contract
+is an equality. The floor is what makes the check mean anything on a delete-heavy
+table, where a ceiling alone would let a rewrite lose every row and still pass.
+The outputs are abandoned and the orphan scanner reclaims them. A rewrite that
+silently lost rows is indistinguishable from one that worked, and the table it
+produces is wrong forever.
 
 **A carried-forward file keeps its sequence number.** A data file carried
 through a rewritten manifest keeps its own number, so delete files written
@@ -465,6 +485,12 @@ just ci            # everything above, in the order CI runs it
 Every optional feature is built **alone** in CI, not only under `--all-features`
 — a feature that compiles in that combination can be broken by itself, because
 another crate's feature unification was switching on what it needed.
+
+## Changelog
+
+Notable changes, including breaking ones and their migration notes, are in
+[CHANGELOG.md](CHANGELOG.md). Bergman is pre-1.0: breaking changes land in minor
+versions.
 
 ## License
 

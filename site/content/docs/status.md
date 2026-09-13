@@ -23,7 +23,7 @@ read as a healthy one:
 
 | | |
 |---|---|
-| **Rewriting a format v3 table** | Preserving row lineage needs `_row_id` projected out of the scan and written back, which upstream does not offer; and the snapshot would lack `first-row-id`, which the spec requires in v3. Expiration and orphan removal still run on it — see [Compaction](@/docs/compaction.md#format-v3) |
+| **Rewriting a format v3 table** | Two independent gaps, both upstream. **Row lineage**: `_row_id` must be projected out of the scan and written back, which upstream does not offer, and the snapshot would lack `first-row-id`, which the spec requires in v3. **Deletion vectors**: v3 encodes position deletes as Puffin blobs and the released `iceberg-rust` has no decoder, so a rewrite could not see the deletes it must apply. Expiration and orphan removal still run — and on v3 orphan removal is the *only* thing that reclaims superseded deletion-vector space. See [Compaction](@/docs/compaction.md#format-v3) |
 | **Anything but Parquet** | Upstream's reader opens a Parquet stream whatever a scan task's format says, and the writer is `ParquetWriterBuilder` — so it is a refusal in both directions, per table *and* per file |
 | **Rewriting across a partition-spec change** | Output goes out under the current spec; a commit claiming it replaces files partitioned differently would mis-file every row |
 | **Catalogs other than REST** | Each additional protocol is a second commit path to keep correct |
@@ -82,9 +82,8 @@ own action**, and upstream's actions commit through `iceberg::Catalog` —
 cannot be intercepted and re-delivered. Two consequences:
 
 - Expiration's commits carry no `X-Request-Id`, so they sit outside the audit
-  join described in [Rustberg](@/docs/rustberg.md#joined-audit-trails).
-  Reimplementing Java's `RemoveSnapshots` selection rules to gain a header would
-  be the worse trade; extra headers on `RestCatalogBuilder` are the natural
-  contribution.
+  join described in [Rustberg](@/docs/rustberg.md#joined-audit-trails). They are
+  still authorized and audited by the catalog under the same principal; only the
+  correlation by run id is missing.
 - The catalog client's token is renewed from outside, because it renews none of
   its own. See [Credentials](@/docs/operating.md#credentials).

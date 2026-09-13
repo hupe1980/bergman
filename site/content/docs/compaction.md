@@ -183,10 +183,24 @@ one that can drift, and the half that drifted would make `bergman plan` a promis
 
 ### How groups are ordered and bounded
 
-Groups run **most-consolidation-first**: ranked by how many files each removes,
-ties breaking toward the cheaper group and then the partition key, so two runs of
-an unchanged table do the same work in the same order. A cycle that ends early
-has then done its most valuable work first. Spark calls this
+Groups run **best value per byte first**, so a cycle that ends early — a window
+closing, a byte budget running out, a process killed — has done its most
+worthwhile work.
+
+| Term | Is |
+|---|---|
+| **Cost** | The bytes the group reads and writes, exact from the manifests |
+| **Benefit** | `\|inputs − outputs\|`, plus the delete files applying to the group |
+
+Benefit covers both directions: merging small files reduces the object count,
+and splitting an oversized one increases it — which is equally the point, since
+a file too large to divide is a task no reader can parallelise. Retiring a delete
+file counts too, because every scan of the partition currently opens it.
+
+Ranking on file count alone would make cost irrelevant: merging a hundred 100 MB
+files costs 10 GB of I/O for roughly what merging ninety-nine 1 KB files buys.
+Ties break to the partition key and index, so two runs of an unchanged table do
+the same work in the same order. Spark exposes a coarser version of this as
 `rewrite-job-order`.
 
 Each group commits against the snapshot the previous one produced, so no group
@@ -340,7 +354,7 @@ that does not apply to it would remove live rows.
 join uses `IS NOT DISTINCT FROM`, because `=` would keep every row whose delete
 key is null — forever, with nothing failing.
 
-## Rows in equal rows out
+## The row count must land in a known interval
 
 Every group checks its row count on **both sides**, and refuses to commit when
 either disagrees. The outputs are abandoned; the orphan scanner reclaims them
@@ -355,18 +369,24 @@ Every number involved is metadata, so both checks are free. A rewrite that
 silently lost rows is indistinguishable from one that worked, and the table it
 produces is wrong forever.
 
-The read side supports two strengths of claim:
+The manifests define a **closed interval** the output must land in:
 
-| Situation | The claim | Refused when |
+| Bound | Is | Breached when |
 |---|---|---|
-| No delete file applies | Rows in equal rows out | The counts differ at all |
-| Deletes apply | The input count is a **ceiling** | More rows came out than went in |
+| **Ceiling** | Every row read | More rows came out than went in — the output duplicated data |
+| **Floor** | The rows of inputs that **no delete file applies to** | Rows that nothing could legitimately delete went missing |
 
-Where deletes apply the exact figure is not knowable from metadata: a delete
-file's `record_count` is an upper bound, since the same row may be named twice
-and a positional delete may name a row already gone. But a rewrite can only ever
-*remove* rows, so the input count still bounds the output — and a group that
-produced more than it read has duplicated data.
+With no delete file applying, floor and ceiling coincide and the contract is an
+equality: rows in equal rows out.
+
+The floor is what makes the check mean anything on a delete-heavy table: a
+ceiling alone stops detecting row *loss* as soon as one delete file applies.
+
+The exact output count is not knowable from metadata — a delete file's
+`record_count` is an upper bound, since the same row may be named twice and a
+positional delete may name a row already gone. Bergman does not need it: a scan
+task names exactly which delete files apply to its data file, so the inputs that
+**no** delete touches are known precisely, and none of their rows may disappear.
 
 ## Sequence numbers
 
@@ -422,7 +442,11 @@ fragmented table as healthy.
 ## Format v3 {#format-v3}
 
 Bergman rewrites v1 and v2 tables. A **v3** table is refused, with a reason —
-and the reason is a gap, not an impossibility.
+and the reason is a gap, not an impossibility. There are **two** independent gaps,
+and both must close before a v3 table can be rewritten. Tracking them as one is
+how a half-fix ships looking complete.
+
+### Gap 1: row lineage
 
 Compaction of a v3 table is perfectly possible while spec-compliant. The spec
 says how: when a row moves to a different data file, its existing `_row_id`
@@ -458,6 +482,38 @@ It refuses, because the alternative fails silently. Three things go wrong:
    `added-rows` as *required* fields of a v3 snapshot — "required even if a
    commit does not assign any ID space". `iceberg-rust` enforces it, so such a
    commit is refused outright by any catalog applying updates through it.
+
+### Gap 2: deletion vectors
+
+v3 replaces position delete *files* with **deletion vectors** — Roaring bitmaps
+stored as `deletion-vector-v1` blobs inside Puffin files. The released
+`iceberg-rust` has no Puffin decoder at all, so a deletion vector reaches the
+scan as a position-delete task and is opened as Parquet, which fails.
+
+It fails **loudly**, which is the safe outcome: a scan that silently ignored the
+deletes would hand a rewrite rows that are supposed to be gone, and the rewritten
+table would have them back for good.
+
+Both gaps are upstream's to close, and neither is closed in the released crate.
+
+### One rule that outlives the refusal
+
+A deletion vector is a *blob at an offset* inside a Puffin file, and one Puffin
+file may hold the vectors of many data files. The spec is explicit that a writer
+removing a data file must drop that file's vector **from the delete manifest**,
+and is *not* required to rewrite the Puffin file.
+
+So retiring a deletion vector removes a manifest entry — never a file. Bergman
+identifies files by `(path, offset)` rather than by path precisely so that
+removing one vector cannot match a live sibling sharing its container. Deleting
+the container is a separate question with a different answer: it becomes garbage
+only when *nothing* references it any more, which is the orphan scanner's job.
+
+This also means **orphan removal matters more on v3, not less**. Superseded
+vectors accumulate inside live Puffin files that nobody rewrites, and reclaiming
+that space is something only an orphan scan ever does.
+
+### What still runs
 
 The refusal is scoped to what Bergman authors itself, so it covers compaction,
 dangling-delete removal and manifest rewriting. **Snapshot expiration and orphan

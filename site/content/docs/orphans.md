@@ -1,6 +1,6 @@
 +++
 title = "Orphan files"
-description = "The one operation that can destroy a healthy table, and the seven independent checks standing in front of it."
+description = "The one operation that can destroy a healthy table, and the eight independent checks standing in front of it."
 weight = 7
 +++
 An orphan is a file under a table's location that no retained metadata
@@ -26,9 +26,9 @@ older_than = "7d"
 That is not ceremony: the default has to be the safe one, because an operator
 who forgets to say should get a list, not an incident.
 
-## The seven checks
+## The eight checks
 
-Every candidate passes all seven before it is deleted. Each exists because of a
+Every candidate passes all eight before it is deleted. Each exists because of a
 specific way this goes wrong.
 
 ### 1. Dry run by default
@@ -176,6 +176,29 @@ the audit record, then delete with bounded concurrency. Two implementations of
 that would drift, and the half that drifted would be the half nobody was
 looking at.
 
+### 8. The listing and the metadata must agree that a file exists
+
+The scan lists a location, gets back ten thousand objects, and **not one of them**
+is a file the metadata references. Checks 1–7 all pass: the objects are old,
+unreferenced, inside the location, and no other table lives there. By every rule
+above they are garbage.
+
+They are almost certainly all live, and something is pointing at the wrong place
+— a `location` changed after the data was written, a bucket alias or URI scheme
+normalization did not fold together, a credential scoped to a subdirectory.
+
+A healthy table cannot reach this state: its own `metadata.json`, manifest list
+and manifests live under its location, so a listing returns at least those. Zero
+overlap is an unanswered question, not an answer:
+
+```text
+  [refused] remove-orphans: listed 10000 objects under s3://lake/wh/db/events and
+            none of the 8412 files this table references were among them; the
+            listing and the table's metadata disagree about where its files are
+```
+
+Nothing is deleted, and the fix is always configuration.
+
 ## Memory
 
 The listing is consumed as a **stream** and reduced to candidates as it arrives.
@@ -191,7 +214,7 @@ reclaim. Every other operation declines an empty table; this one does not.
 
 ## Two refusals
 
-Beyond the seven checks, the scanner declines outright in two situations.
+Beyond the eight checks, the scanner declines outright in two more situations.
 
 **A table with a current snapshot but no reachable files.** Far more likely than
 "this table is entirely garbage" is that something went wrong reading its

@@ -1143,16 +1143,19 @@ async fn a_table_that_keeps_failing_stops_rewriting_itself() {
 }
 
 #[tokio::test]
-async fn the_group_that_merges_the_most_files_goes_first() {
+async fn the_group_with_the_best_value_per_byte_goes_first() {
     // Every group commits on its own, so a cycle can end early for reasons that
-    // have nothing to do with the groups left over: a window closing, a
-    // `kill -9`, a table that starts conflicting. What has been committed by
-    // then is what the cycle achieved — so the order the groups run in decides
-    // how much good a truncated run did.
+    // have nothing to do with the groups left over: a window closing, the byte
+    // budget running out, a `kill -9`, a table that starts conflicting. What has
+    // been committed by then is what the cycle achieved — so the order the
+    // groups run in decides how much good a truncated run did.
     //
-    // Ranked by how many files each group removes, because that is what
-    // compaction is *for*. Here one partition holds six files and the other
-    // two; the six-file one must be rewritten first.
+    // Ranked by benefit *per byte read*, not by benefit alone: the cycle has a
+    // byte budget, which makes this a knapsack, and greedy-by-density is its
+    // standard approximation. Here both partitions hold equally-sized files, so
+    // density reduces to consolidation — six files collapsing to one removes
+    // five objects for six files' worth of I/O, against two collapsing to one
+    // removing a single object for two. The six-file group must go first.
     let fixture = TestTable::partitioned().unwrap();
 
     for _ in 0..2 {

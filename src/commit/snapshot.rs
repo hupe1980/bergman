@@ -37,14 +37,76 @@ use uuid::Uuid;
 use crate::error::{Error, Result};
 use crate::ops::reachability::normalize;
 
+/// Which file a manifest entry names — the identity a removal matches on.
+///
+/// **A path is not an identity.** It is for a data file, an equality delete file
+/// and a v2 position delete file, which own their file outright. It is not for a
+/// v3 **deletion vector**: that is a blob at an offset inside a Puffin file, and
+/// one Puffin file may hold the vectors of many data files.
+///
+/// So two live delete entries can share a path, and matching a removal by path
+/// alone would drop both when only one is dangling — resurrecting every row the
+/// survivor was hiding, silently. That is the one way this operation destroys
+/// data, and it is why identity is a type.
+///
+/// `offset` is `None` for everything that owns its file, so the common case
+/// compares exactly as a path did.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FileRef {
+    /// The containing file, normalized (see [`normalize`]).
+    pub path: String,
+    /// Byte offset of this entry's blob inside `path`. `Some` only for a
+    /// deletion vector, whose spec requires it.
+    pub offset: Option<i64>,
+}
+
+impl FileRef {
+    /// A file that owns its path outright.
+    pub fn path(path: impl AsRef<str>) -> Self {
+        Self {
+            path: normalize(path.as_ref()),
+            offset: None,
+        }
+    }
+
+    /// The identity of an existing manifest entry.
+    ///
+    /// Reads `content_offset` straight from the entry, so a deletion vector is
+    /// distinguished from its container and from its siblings without the
+    /// caller having to know which kind of delete it is looking at.
+    pub fn of_entry(entry: &ManifestEntry) -> Self {
+        Self {
+            path: normalize(entry.file_path()),
+            offset: entry.data_file().content_offset(),
+        }
+    }
+
+    /// Whether this reference names a blob inside a shared container rather
+    /// than a whole file — in which case removing the entry must never be
+    /// taken as licence to delete the file.
+    pub fn is_blob(&self) -> bool {
+        self.offset.is_some()
+    }
+}
+
+impl std::fmt::Display for FileRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.offset {
+            Some(offset) => write!(f, "{}@{offset}", self.path),
+            None => f.write_str(&self.path),
+        }
+    }
+}
+
 /// A rewrite: files to remove, files to add.
 ///
 /// Both sides are required to be disjoint and non-trivial by
 /// [`SnapshotProducer::rewrite_files`], which is the only way to build one.
 #[derive(Debug, Default, Clone)]
 pub struct RewriteFiles {
-    /// Paths of the data and delete files this rewrite supersedes.
-    pub removed: Vec<String>,
+    /// The data and delete entries this rewrite supersedes, by identity rather
+    /// than by path — see [`FileRef`].
+    pub removed: Vec<FileRef>,
     /// The replacements.
     pub added: Vec<DataFile>,
 }
@@ -195,7 +257,7 @@ impl<'a> SnapshotProducer<'a> {
             ));
         }
 
-        let removed: HashSet<String> = rewrite.removed.iter().map(|p| normalize(p)).collect();
+        let removed: HashSet<FileRef> = rewrite.removed.iter().cloned().collect();
 
         let existing = match parent {
             Some(parent) => self.load_manifests(parent).await?,
@@ -206,12 +268,12 @@ impl<'a> SnapshotProducer<'a> {
         // remove must actually be live. A path we cannot find means the plan
         // was built against a table that has since moved, and committing would
         // apply a decision to a world it was not made for.
-        let live_paths: HashSet<String> = existing
+        let live: HashSet<FileRef> = existing
             .iter()
             .flat_map(|m| m.entries.iter())
-            .map(|entry| normalize(entry.file_path()))
+            .map(FileRef::of_entry)
             .collect();
-        let missing = removed.difference(&live_paths).count();
+        let missing = removed.difference(&live).count();
         if missing > 0 {
             return Err(Error::StalePlan {
                 table: ident,
@@ -263,7 +325,7 @@ impl<'a> SnapshotProducer<'a> {
     pub async fn dangling_delete_files(
         &self,
         still_applied: &HashSet<String>,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<FileRef>> {
         let Some(parent) = self.table.metadata().current_snapshot() else {
             return Ok(Vec::new());
         };
@@ -295,13 +357,22 @@ impl<'a> SnapshotProducer<'a> {
             lowest_anywhere = Some(lowest_anywhere.unwrap_or(sequence).min(sequence));
         }
 
-        let mut dangling: Vec<String> = entries()
+        // Identity, not path: a Puffin container can hold a dangling deletion
+        // vector and a live one, and `dedup` on paths would collapse the two
+        // into a single removal that takes both. See [`FileRef`].
+        //
+        // `still_applied` is keyed by path because that is all upstream's scan
+        // reports, which makes it a *conservative* filter: a container with any
+        // live vector keeps every vector in it out of this list. Erring toward
+        // keeping a delete is the right direction — the sequence-number test
+        // below is the one allowed to be sharp.
+        let mut dangling: Vec<FileRef> = entries()
             .filter(|(_, entry)| entry.content_type() != DataContentType::Data)
             .filter(|(_, entry)| !still_applied.contains(&normalize(entry.file_path())))
             .filter(|(spec_id, entry)| {
                 is_dead_by_sequence(*spec_id, entry, &lowest, lowest_anywhere)
             })
-            .map(|(_, entry)| entry.file_path().to_string())
+            .map(|(_, entry)| FileRef::of_entry(entry))
             .collect();
 
         dangling.sort();
@@ -514,7 +585,7 @@ impl<'a> SnapshotProducer<'a> {
     async fn write_manifests(
         &self,
         existing: &[LoadedManifest],
-        removed: &HashSet<String>,
+        removed: &HashSet<FileRef>,
         added: &[DataFile],
     ) -> Result<Vec<ManifestFile>> {
         let metadata = self.table.metadata();
@@ -527,7 +598,7 @@ impl<'a> SnapshotProducer<'a> {
             let touched = loaded
                 .entries
                 .iter()
-                .any(|entry| removed.contains(&normalize(entry.file_path())));
+                .any(|entry| removed.contains(&FileRef::of_entry(entry)));
 
             if !touched {
                 manifests.push(loaded.file.clone());
@@ -537,7 +608,7 @@ impl<'a> SnapshotProducer<'a> {
             let survivors: Vec<&ManifestEntry> = loaded
                 .entries
                 .iter()
-                .filter(|entry| !removed.contains(&normalize(entry.file_path())))
+                .filter(|entry| !removed.contains(&FileRef::of_entry(entry)))
                 .collect();
 
             // A manifest whose every file was removed simply disappears.
@@ -862,11 +933,11 @@ struct Counts {
 }
 
 impl Counts {
-    fn of(existing: &[LoadedManifest], removed: &HashSet<String>, _added: &[DataFile]) -> Self {
+    fn of(existing: &[LoadedManifest], removed: &HashSet<FileRef>, _added: &[DataFile]) -> Self {
         let mut counts = Self::default();
         for entry in existing.iter().flat_map(|m| m.entries.iter()) {
             let file = entry.data_file();
-            let gone = removed.contains(&normalize(entry.file_path()));
+            let gone = removed.contains(&FileRef::of_entry(entry));
             match (gone, file.content_type()) {
                 (true, DataContentType::Data) => {
                     counts.removed_data += 1;
@@ -938,7 +1009,7 @@ mod tests {
         assert!(RewriteFiles::default().is_empty());
         assert!(
             !RewriteFiles {
-                removed: vec!["a".into()],
+                removed: vec![FileRef::path("a")],
                 added: vec![],
             }
             .is_empty()
@@ -1172,5 +1243,68 @@ mod tests {
         }
         let parsed: Refs = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(parsed.refs.is_empty());
+    }
+
+    /// The v3 hazard this type exists for.
+    ///
+    /// A deletion vector is a blob at an offset inside a Puffin file, and the
+    /// spec permits one Puffin file to hold the vectors of many data files. Two
+    /// live delete entries can therefore share a path, and a removal matched by
+    /// path alone would take both — resurrecting every row the surviving vector
+    /// was hiding, with nothing failing.
+    #[test]
+    fn two_deletion_vectors_in_one_puffin_file_are_different_files() {
+        let container = "s3://b/t/data/deletes-0001.puffin";
+        let first = FileRef {
+            path: normalize(container),
+            offset: Some(4),
+        };
+        let second = FileRef {
+            path: normalize(container),
+            offset: Some(2048),
+        };
+
+        assert_ne!(
+            first, second,
+            "vectors sharing a container must not compare equal"
+        );
+
+        let removing_only_the_first: HashSet<FileRef> = [first.clone()].into_iter().collect();
+        assert!(removing_only_the_first.contains(&first));
+        assert!(
+            !removing_only_the_first.contains(&second),
+            "removing one vector must never match its live sibling"
+        );
+    }
+
+    #[test]
+    fn a_whole_file_and_a_blob_inside_it_are_different_files() {
+        let path = "s3://b/t/data/deletes-0001.puffin";
+        let whole = FileRef::path(path);
+        let blob = FileRef {
+            path: normalize(path),
+            offset: Some(4),
+        };
+
+        assert!(!whole.is_blob());
+        assert!(blob.is_blob());
+        assert_ne!(
+            whole, blob,
+            "a path-only reference must not match a deletion-vector entry; \
+             failing the liveness check is the correct outcome, not matching it"
+        );
+    }
+
+    #[test]
+    fn a_file_that_owns_its_path_compares_as_a_path_did() {
+        // The common case must be unchanged, including path normalization.
+        assert_eq!(
+            FileRef::path("s3://b/t/data/a.parquet"),
+            FileRef::path("s3a://b/t//data/a.parquet")
+        );
+        assert_ne!(
+            FileRef::path("s3://b/t/data/a.parquet"),
+            FileRef::path("s3://b/t/data/b.parquet")
+        );
     }
 }

@@ -1,6 +1,6 @@
 +++
 title = "Documentation"
-description = "How Bergman measures table health, resolves policy, plans maintenance, and decides — seven checks deep — whether a file may be deleted."
+description = "How Bergman measures table health, resolves policy, plans maintenance, and decides — eight checks deep — whether a file may be deleted."
 sort_by = "weight"
 template = "docs-section.html"
 page_template = "docs-page.html"
