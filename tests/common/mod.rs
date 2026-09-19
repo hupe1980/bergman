@@ -300,6 +300,171 @@ impl TestTable {
         Ok(files.pop().expect("one data file"))
     }
 
+    /// Serialize a `deletion-vector-v1` blob: the bytes that go inside a Puffin
+    /// file for one data file's deleted positions.
+    ///
+    /// Written by hand because **no released `iceberg-rust` can write one** —
+    /// its serializer is an open PR upstream — and because a v3 fixture that
+    /// cannot produce a deletion vector cannot exercise any of the v3 claims.
+    /// The layout is the Puffin spec's, quoted here because every field of it is
+    /// a way to get this silently wrong:
+    ///
+    /// ```text
+    /// [u32 BE: len(magic + vector)] [magic D1 D3 39 64] [vector] [u32 BE: CRC-32]
+    /// ```
+    ///
+    /// Three details the spec is explicit about and a reader would not guess:
+    ///
+    /// - The length prefix counts the **magic and the vector**, not itself and
+    ///   not the CRC.
+    /// - The CRC covers the **magic and the vector** too — the same bytes the
+    ///   length describes.
+    /// - The length and CRC are **big**-endian while the Roaring bitmap inside
+    ///   is little-endian. The spec says why: big-endian was chosen for
+    ///   compatibility with Delta's deletion vectors.
+    ///
+    /// `RoaringTreemap::serialize_into` is already the "portable" format the
+    /// spec requires, so the vector needs no hand-rolling.
+    fn deletion_vector_blob(positions: &[u64]) -> Vec<u8> {
+        use roaring::RoaringTreemap;
+
+        const MAGIC: [u8; 4] = [0xD1, 0xD3, 0x39, 0x64];
+
+        let mut vector = Vec::new();
+        positions
+            .iter()
+            .copied()
+            .collect::<RoaringTreemap>()
+            .serialize_into(&mut vector)
+            .expect("serializing into a Vec cannot fail");
+
+        let mut body = Vec::with_capacity(MAGIC.len() + vector.len());
+        body.extend_from_slice(&MAGIC);
+        body.extend_from_slice(&vector);
+
+        let mut blob = Vec::with_capacity(4 + body.len() + 4);
+        blob.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        blob.extend_from_slice(&body);
+        blob.extend_from_slice(&crc32fast::hash(&body).to_be_bytes());
+        blob
+    }
+
+    /// Write **one Puffin file** holding a deletion vector for each
+    /// `(data file, deleted positions)` pair, and return the delete entries that
+    /// reference them.
+    ///
+    /// One file for all of them on purpose. A Puffin file is a *container*: the
+    /// spec tracks each vector by location, offset and length, so one file holds
+    /// the vectors of many data files, and that sharing is the single most
+    /// dangerous thing about the v3 delete model — removing one dead vector by
+    /// path takes its live siblings and resurrects every row they hid. A fixture
+    /// that could only write one vector per file could not express the shape
+    /// that goes wrong.
+    ///
+    /// The offsets come from reading the finished file's footer back rather than
+    /// from arithmetic over what was written. A `content_offset` computed by the
+    /// fixture and a `content_offset` the file actually has are different
+    /// claims, and only the second one is worth asserting against.
+    pub async fn write_deletion_vectors(
+        &self,
+        vectors: &[(&DataFile, &[u64])],
+    ) -> Result<Vec<DataFile>> {
+        use iceberg::puffin::{
+            Blob, CompressionCodec, DELETION_VECTOR_V1, PuffinReader, PuffinWriter,
+        };
+        use iceberg::spec::{DataContentType, DataFileBuilder};
+
+        let location = format!(
+            "{}/data/{}-deletes.puffin",
+            self.location(),
+            uuid::Uuid::new_v4()
+        );
+        let output = self
+            .file_io
+            .new_output(&location)
+            .map_err(|e| Error::Storage(Box::new(e)))?;
+
+        let mut writer = PuffinWriter::new(&output, HashMap::new(), false)
+            .await
+            .map_err(|e| Error::Storage(Box::new(e)))?;
+
+        for (data_file, positions) in vectors {
+            // The spec *requires* both of these properties on the blob, and
+            // requires `compression-codec` to be absent — a deletion vector is
+            // never compressed.
+            let properties = HashMap::from([
+                (
+                    "referenced-data-file".to_string(),
+                    data_file.file_path().to_string(),
+                ),
+                ("cardinality".to_string(), positions.len().to_string()),
+            ]);
+
+            writer
+                .add(
+                    Blob::builder()
+                        .r#type(DELETION_VECTOR_V1.to_string())
+                        .fields(vec![])
+                        .snapshot_id(0)
+                        .sequence_number(0)
+                        .data(Self::deletion_vector_blob(positions))
+                        .properties(properties)
+                        .build(),
+                    CompressionCodec::None,
+                )
+                .await
+                .map_err(|e| Error::Storage(Box::new(e)))?;
+        }
+
+        writer
+            .close()
+            .await
+            .map_err(|e| Error::Storage(Box::new(e)))?;
+
+        // Read the footer back for the offsets the file really has.
+        let input = self
+            .file_io
+            .new_input(&location)
+            .map_err(|e| Error::Storage(Box::new(e)))?;
+        let reader = PuffinReader::new(input);
+        let metadata = reader
+            .file_metadata()
+            .await
+            .map_err(|e| Error::Storage(Box::new(e)))?
+            .clone();
+
+        let size = self
+            .file_io
+            .new_input(&location)
+            .map_err(|e| Error::Storage(Box::new(e)))?
+            .metadata()
+            .await
+            .map_err(|e| Error::Storage(Box::new(e)))?
+            .size;
+
+        let mut entries = Vec::with_capacity(vectors.len());
+        for (blob, (data_file, positions)) in metadata.blobs().iter().zip(vectors) {
+            entries.push(
+                DataFileBuilder::default()
+                    .content(DataContentType::PositionDeletes)
+                    .file_path(location.clone())
+                    .file_format(DataFileFormat::Puffin)
+                    // A delete entry carries the partition of the data it
+                    // deletes from; a tuple from another partition would make
+                    // it apply to files it was never about.
+                    .partition(data_file.partition().clone())
+                    .record_count(positions.len() as u64)
+                    .file_size_in_bytes(size)
+                    .referenced_data_file(Some(data_file.file_path().to_string()))
+                    .content_offset(Some(blob.offset() as i64))
+                    .content_size_in_bytes(Some(blob.length() as i64))
+                    .build()
+                    .map_err(|e| Error::config(format!("delete entry: {e}")))?,
+            );
+        }
+        Ok(entries)
+    }
+
     /// Append data files as a new snapshot.
     ///
     /// Uses Bergman's own snapshot producer where it can, so the fixture and
@@ -312,7 +477,7 @@ impl TestTable {
     /// only ever run against an empty table.
     pub async fn append(&self, files: Vec<DataFile>) -> Result<()> {
         if self.committer.metadata().format_version() == iceberg::spec::FormatVersion::V3 {
-            return self.append_as_a_writer_would(files).await;
+            return self.append_as_a_writer_would(files, Vec::new()).await;
         }
 
         use bergman::commit::{BranchRetention, RewriteFiles, SnapshotProducer};
@@ -342,7 +507,11 @@ impl TestTable {
     /// `TableMetadataBuilder::add_snapshot` rejects a v3 snapshot without it —
     /// which is one of the reasons Bergman refuses to write one rather than
     /// guessing at the numbers.
-    async fn append_as_a_writer_would(&self, files: Vec<DataFile>) -> Result<()> {
+    async fn append_as_a_writer_would(
+        &self,
+        files: Vec<DataFile>,
+        deletes: Vec<DataFile>,
+    ) -> Result<()> {
         use iceberg::spec::{
             FormatVersion, ManifestFile, ManifestListWriter, ManifestWriterBuilder, Operation,
             Snapshot, SnapshotReference, SnapshotRetention, Summary,
@@ -374,34 +543,71 @@ impl TestTable {
             None => Vec::new(),
         };
 
-        let location = format!(
-            "{}/metadata/{snapshot_id}-data-{}.avro",
-            self.location(),
-            uuid::Uuid::new_v4()
-        );
-        let output = self
-            .file_io
-            .new_output(&location)
-            .map_err(|e| Error::Storage(Box::new(e)))?;
-
-        let mut writer = ManifestWriterBuilder::new(
-            output,
-            Some(snapshot_id),
-            metadata.current_schema().clone(),
-            metadata.default_partition_spec().as_ref().clone(),
-        )
-        .build_v3_data();
-        for file in files {
-            writer
-                .add_file(file, sequence_number)
+        if !files.is_empty() {
+            let location = format!(
+                "{}/metadata/{snapshot_id}-data-{}.avro",
+                self.location(),
+                uuid::Uuid::new_v4()
+            );
+            let output = self
+                .file_io
+                .new_output(&location)
                 .map_err(|e| Error::Storage(Box::new(e)))?;
+
+            let mut writer = ManifestWriterBuilder::new(
+                output,
+                Some(snapshot_id),
+                metadata.current_schema().clone(),
+                metadata.default_partition_spec().as_ref().clone(),
+            )
+            .build_v3_data();
+            for file in files {
+                writer
+                    .add_file(file, sequence_number)
+                    .map_err(|e| Error::Storage(Box::new(e)))?;
+            }
+            manifests.push(
+                writer
+                    .write_manifest_file()
+                    .await
+                    .map_err(|e| Error::Storage(Box::new(e)))?,
+            );
         }
-        manifests.push(
-            writer
-                .write_manifest_file()
-                .await
-                .map_err(|e| Error::Storage(Box::new(e)))?,
-        );
+
+        // A *delete* manifest, which is a different kind rather than a data
+        // manifest holding different entries: `ManifestContentType` is on the
+        // manifest-list entry, and reachability, health analysis and the
+        // dangling-delete scan all branch on it.
+        if !deletes.is_empty() {
+            let location = format!(
+                "{}/metadata/{snapshot_id}-delete-{}.avro",
+                self.location(),
+                uuid::Uuid::new_v4()
+            );
+            let output = self
+                .file_io
+                .new_output(&location)
+                .map_err(|e| Error::Storage(Box::new(e)))?;
+
+            let mut writer = ManifestWriterBuilder::new(
+                output,
+                Some(snapshot_id),
+                metadata.current_schema().clone(),
+                metadata.default_partition_spec().as_ref().clone(),
+            )
+            .build_v3_deletes();
+            for delete in deletes {
+                writer
+                    .add_file(delete, sequence_number)
+                    .map_err(|e| Error::Storage(Box::new(e)))?;
+            }
+            manifests.push(
+                writer
+                    .write_manifest_file()
+                    .await
+                    .map_err(|e| Error::Storage(Box::new(e)))?,
+            );
+        }
 
         let list_location = format!(
             "{}/metadata/snap-{snapshot_id}-{}.avro",
@@ -837,6 +1043,8 @@ pub fn op_env<'a>(
 ) -> bergman::ops::OpEnv<'a> {
     static NOOP: bergman::obs::NoopObserver = bergman::obs::NoopObserver;
     bergman::ops::OpEnv {
+        io_concurrency: 8,
+        compaction_parallelism: 2,
         table,
         ident,
         loader,
@@ -941,7 +1149,14 @@ impl TestTable {
     /// manifest, because Bergman only ever adds data files. A delete file has
     /// to go in a delete manifest, so the fixture builds this commit itself
     /// with upstream's writers — which is exactly what a streaming writer does.
+    ///
+    /// A v3 table goes the other way, for the same reason [`Self::append`] does:
+    /// its snapshot must declare a row-id range, which this path does not write.
     pub async fn append_deletes(&self, deletes: Vec<DataFile>) -> Result<()> {
+        if self.committer.metadata().format_version() == iceberg::spec::FormatVersion::V3 {
+            return self.append_as_a_writer_would(Vec::new(), deletes).await;
+        }
+
         use iceberg::spec::{
             FormatVersion, ManifestFile, ManifestListWriter, ManifestWriterBuilder, Operation,
             Snapshot, SnapshotReference, SnapshotRetention, Summary,

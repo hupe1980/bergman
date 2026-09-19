@@ -14,9 +14,9 @@
 //!   through leaves a record of what was about to go. The ceiling is applied
 //!   *before* the announcement: a record naming files that were never going to
 //!   be touched is a misleading record.
-//! - **Deletion is concurrent but bounded.** A million objects one round trip
-//!   at a time takes hours; ten thousand at once is how a shared bucket starts
-//!   throttling everybody.
+//! - **Deletion is concurrent but bounded**, by `limits.io_concurrency`. A
+//!   million objects one round trip at a time takes hours; ten thousand at once
+//!   is how a shared bucket starts throttling everybody.
 //! - **One undeletable file does not stop the rest.** The metadata is already
 //!   correct before anything is deleted, so a failure leaves a leak rather than
 //!   a corruption.
@@ -29,9 +29,6 @@ use futures::stream::{self, StreamExt};
 
 use crate::error::Result;
 use crate::obs::{MaintenanceObserver, OperationContext};
-
-/// How many deletions are in flight at once.
-pub const DELETE_CONCURRENCY: usize = 32;
 
 /// Something that can remove an object by path.
 ///
@@ -94,6 +91,7 @@ pub async fn announce_and_delete(
     observer: &dyn MaintenanceObserver,
     ctx: OperationContext<'_>,
     doomed: &[String],
+    concurrency: usize,
 ) -> Deletion {
     if doomed.is_empty() {
         return Deletion::default();
@@ -116,7 +114,7 @@ pub async fn announce_and_delete(
                 }
             }
         })
-        .buffer_unordered(DELETE_CONCURRENCY)
+        .buffer_unordered(concurrency.max(1))
         .collect()
         .await;
 

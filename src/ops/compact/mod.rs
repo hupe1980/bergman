@@ -100,6 +100,11 @@ struct Job<'a> {
     settings: &'a Settings,
     observer: &'a dyn MaintenanceObserver,
     ctx: OperationContext<'a>,
+    /// How many object-store requests this job may keep in flight, from
+    /// `limits.io_concurrency`.
+    concurrency: usize,
+    /// How much machine one group's rewrite may use.
+    tuning: rewrite::Tuning,
 }
 
 /// One snapshot, in the three views a rewrite needs.
@@ -125,15 +130,16 @@ impl TableState {
         loader: &dyn TableLoader,
         ident: &TableIdent,
         table_ref: &TableRef,
+        concurrency: usize,
     ) -> Result<Self> {
         let table = loader.reload(ident).await?;
-        Self::of(table, table_ref).await
+        Self::of(table, table_ref, concurrency).await
     }
 
     /// The same, for a table already in hand.
-    async fn of(table: Table, table_ref: &TableRef) -> Result<Self> {
+    async fn of(table: Table, table_ref: &TableRef, concurrency: usize) -> Result<Self> {
         let tasks = plan_all(&table).await?;
-        let files = crate::health::file_index(table_ref, &table).await?;
+        let files = crate::health::file_index(table_ref, &table, concurrency).await?;
         Ok(Self {
             table,
             tasks,
@@ -277,6 +283,11 @@ pub async fn run(
         });
     }
 
+    // Compaction reads every manifest in the table before it reads a byte of
+    // data. A table whose manifests are encrypted is refused by name here as
+    // well as in the planner.
+    env.require_readable_manifests("compact")?;
+
     // Refused before the table is scanned. A v3 table's row lineage cannot
     // survive a rewrite Bergman performs (see `crate::commit::authoring_refusal`),
     // and discovering that after reading a partition would be a full data read
@@ -332,7 +343,7 @@ pub async fn run(
     // and finding delete files that apply to nothing at all. The manifest index
     // comes with it, because the scan omits a file's partition and a delete
     // file's format and both are needed per group.
-    let mut state = TableState::of(table.clone(), table_ref).await?;
+    let mut state = TableState::of(table.clone(), table_ref, env.io_concurrency).await?;
 
     let job = Job {
         ident: env.ident,
@@ -341,6 +352,11 @@ pub async fn run(
         settings: &resolved,
         observer: env.observer,
         ctx: env.ctx,
+        concurrency: env.io_concurrency,
+        tuning: rewrite::Tuning {
+            parallelism: env.compaction_parallelism,
+            read_concurrency: env.io_concurrency,
+        },
     };
 
     let groups = job.build_groups(&state, partitions)?;
@@ -370,7 +386,7 @@ pub async fn run(
                 // read is metadata only, and it is the same read the retry
                 // would have done anyway; doing it here means doing it *before*
                 // the wasted rewrite rather than after.
-                match TableState::load(job.loader, job.ident, table_ref).await {
+                match TableState::load(job.loader, job.ident, table_ref, job.concurrency).await {
                     Ok(fresh) => state = fresh,
                     // The table cannot be re-read, so no later group can be
                     // offered honestly. Stopping keeps what has been committed
@@ -722,8 +738,10 @@ impl Job<'_> {
                     tokio::time::sleep(retry_delay(attempt)).await;
 
                     borrowed = None;
-                    reloaded =
-                        Some(TableState::load(self.loader, self.ident, self.ctx.table).await?);
+                    reloaded = Some(
+                        TableState::load(self.loader, self.ident, self.ctx.table, self.concurrency)
+                            .await?,
+                    );
                 }
                 Err(e) => return Err(e),
             }
@@ -861,6 +879,7 @@ impl Job<'_> {
             self.settings.target,
             self.settings.sort.as_deref(),
             self.settings.memory_budget,
+            self.tuning,
         )
         .await?;
         let written = rewritten.files;
@@ -1245,6 +1264,11 @@ mod tests {
         };
         let committer = NoCommit;
         let job = Job {
+            concurrency: 4,
+            tuning: rewrite::Tuning {
+                parallelism: 1,
+                read_concurrency: 4,
+            },
             ident: &TableIdent::from_strs(["d", "t"]).unwrap(),
             loader: &NoLoad,
             committer: &committer,
@@ -1326,6 +1350,11 @@ mod tests {
         };
         let committer = NoCommit;
         let job = Job {
+            concurrency: 4,
+            tuning: rewrite::Tuning {
+                parallelism: 1,
+                read_concurrency: 4,
+            },
             ident: &TableIdent::from_strs(["d", "t"]).unwrap(),
             loader: &NoLoad,
             committer: &committer,
@@ -1359,6 +1388,11 @@ mod tests {
         };
         let committer = NoCommit;
         let job = Job {
+            concurrency: 4,
+            tuning: rewrite::Tuning {
+                parallelism: 1,
+                read_concurrency: 4,
+            },
             ident: &TableIdent::from_strs(["d", "t"]).unwrap(),
             loader: &NoLoad,
             committer: &committer,

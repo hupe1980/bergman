@@ -112,6 +112,12 @@ pub async fn run(
         ));
     }
 
+    // The reachable set is built by walking every manifest, and it is the
+    // input to deletion. A table whose manifests cannot be read has no
+    // reachable set, so nothing here may proceed — refused by name rather than
+    // aborting somewhere inside the walk.
+    env.require_readable_manifests("remove-orphans")?;
+
     let location = table.metadata().location().to_string();
 
     // Check 5, first half: the tables Bergman happens to have examined. Cheap,
@@ -120,7 +126,7 @@ pub async fn run(
         return Err(nested_refusal(table_ref, &location, nested));
     }
 
-    let reachable = reachability::compute(table_ref, table).await?;
+    let reachable = reachability::compute(table_ref, table, env.io_concurrency).await?;
     // A table with metadata but no reachable files at all is not a table with
     // nothing but garbage under it — far more likely, something went wrong
     // reading it. Deleting on that basis would empty the warehouse.
@@ -262,7 +268,7 @@ pub async fn run(
     // Check 6. Listing a large table takes long enough for a writer to commit,
     // and any file that commit referenced is now live.
     let fresh = env.loader.reload(env.ident).await?;
-    let reachable_now = reachability::compute(table_ref, &fresh).await?;
+    let reachable_now = reachability::compute(table_ref, &fresh, env.io_concurrency).await?;
 
     let (mut doomed, reprieved) = reverify(candidates, &reachable_now);
     outcome.reprieved = reprieved;
@@ -294,7 +300,7 @@ pub async fn run(
         });
     }
 
-    let deletion = announce_and_delete(store, observer, ctx, &doomed).await;
+    let deletion = announce_and_delete(store, observer, ctx, &doomed, env.io_concurrency).await;
     outcome.deleted = deletion.deleted;
     outcome.failed = deletion.failed;
 

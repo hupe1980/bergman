@@ -49,36 +49,89 @@ use crate::error::Result;
 /// Why Bergman will not author a snapshot for a table of this format version,
 /// if it will not.
 ///
-/// Only format 3 answers. V3 introduces **row lineage**: every row carries a
-/// `_row_id` and a `_last_updated_sequence_number`, a snapshot must declare the
-/// `first-row-id` it starts from and how many rows it added, and each manifest
-/// carries the base its entries count from. Three things follow, and each on
-/// its own is disqualifying:
+/// Only format 3 answers, and it answers for **two independent reasons** — both
+/// must close before a v3 table can be rewritten:
 ///
-/// 1. A rewrite must carry every row's existing `_row_id` through to the file
-///    that replaces it. Upstream's `ArrowReader` does not project the field and
-///    its `RollingFileWriter` will not accept it, so a rewrite would renumber
-///    every row it touched — and a `MERGE` or a CDC consumer joining on row id
-///    would then match the wrong rows, with nothing failing.
-/// 2. A manifest holding *existing* files, written fresh, has no `first-row-id`
-///    of its own, so `ManifestListWriter` assigns it a new range — moving files
-///    that were never rewritten to row ids they never had.
-/// 3. The snapshot would be invalid, not merely wrong: the spec lists
-///    `first-row-id` and `added-rows` as *required* fields of a v3 snapshot.
-///    `iceberg-rust` enforces that, so the commit is refused outright by any
-///    catalog applying updates through it.
+/// - **Row lineage.** A rewrite must copy each row's existing `_row_id` into the
+///   file replacing it. Bin-packing moves rows between files, so the new file's
+///   positional inheritance would give them different ids; preserving them means
+///   writing a physical column, which no released writer supports. Without it a
+///   rewrite renumbers every row it touches and nothing fails.
+/// - **Deletion vectors.** v3 encodes position deletes as `deletion-vector-v1`
+///   Puffin blobs, which the released reader cannot decode — so a rewrite could
+///   not see the deletes it must apply and would write those rows back.
 ///
-/// Operations that do not go through Bergman's snapshot producer — expiration,
-/// which is upstream's own action, and orphan removal, which commits nothing —
-/// stay available on a v3 table.
+/// The refusal sits above the commit layer rather than relying on a catalog to
+/// reject the result, because the failure it prevents is silent.
+///
+/// Operations that do not go through the snapshot producer stay available:
+/// expiration is upstream's own action and orphan removal commits nothing, so a
+/// v3 table's history stays bounded and its storage still gets reclaimed.
 pub fn authoring_refusal(format_version: FormatVersion) -> Option<&'static str> {
     match format_version {
         FormatVersion::V1 | FormatVersion::V2 => None,
         FormatVersion::V3 => Some(
-            "the table is Iceberg format v3, whose row lineage Bergman cannot yet preserve \
-             through a rewrite; snapshot expiration and orphan removal still run",
+            "the table is Iceberg format v3, and Bergman cannot yet rewrite one for two \
+             independent reasons: its row lineage cannot be preserved through a rewrite \
+             (the `_row_id` of every moved row must be written back as a physical column, \
+             which no released writer supports), and its deletion vectors cannot be read \
+             at all (the released crate has no `deletion-vector-v1` decoder), so a rewrite \
+             would resurrect every row they hide. Snapshot expiration and orphan removal \
+             still run",
         ),
     }
+}
+
+/// The error every v3 writer path returns, because none of them is implemented.
+///
+/// [`authoring_refusal`] refuses a v3 table in three places before anything is
+/// written, so reaching a writer is a bug rather than a table's fault. The arms
+/// exist as errors rather than as `build_v3_*` calls **on purpose**: upstream's
+/// v3 manifest and manifest-list writers are real and would produce files a
+/// catalog accepts, so a plausible-looking "lift the refusal" change is one
+/// match arm away from a table whose every rewritten row is silently
+/// renumbered.
+///
+/// Lifting the refusal is not one arm. It is, at minimum: a writer that
+/// persists `_row_id` and `_last_updated_sequence_number` as physical columns,
+/// a `first_row_id` on every added `DataFile`, a snapshot carrying
+/// `first-row-id` and `added-rows`, and a `TableUpdate` advancing the table's
+/// `next-row-id` by exactly the rows added. Until all of those exist, an error
+/// here is the honest answer.
+pub(crate) fn v3_writer_unimplemented(table: impl std::fmt::Display) -> crate::error::Error {
+    crate::error::Error::refused(
+        "rewrite",
+        table.to_string(),
+        "reached a format v3 writer, which Bergman does not implement: preserving row \
+         lineage through a rewrite needs a physical `_row_id` column, a per-file \
+         `first_row_id`, and a snapshot that advances the table's `next-row-id`. \
+         Producing a v3 snapshot without all of them renumbers rows silently",
+    )
+}
+
+/// Where a table's metadata files belong.
+///
+/// Iceberg lets a table say, with `write.metadata.path`, that its manifests and
+/// manifest lists live somewhere other than `<location>/metadata` — a separate
+/// prefix with its own lifecycle rules, storage class or IAM policy is the usual
+/// reason, and on some deployments it is a different bucket.
+///
+/// Bergman writes manifests and manifest lists itself, so it has to honour this
+/// or it puts them where the table said they do not go. The released
+/// `iceberg-rust` does not read the property at all (0.11.0 adds it), which is
+/// why this is here rather than borrowed.
+///
+/// The trailing slash is trimmed so callers can join with `/` unconditionally.
+pub(crate) fn metadata_dir(metadata: &iceberg::spec::TableMetadata) -> String {
+    metadata
+        .properties()
+        .get("write.metadata.path")
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .map_or_else(
+            || format!("{}/metadata", metadata.location().trim_end_matches('/')),
+            |p| p.trim_end_matches('/').to_string(),
+        )
 }
 
 /// Delivers a commit to a catalog.
@@ -170,5 +223,72 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0.len(), 1);
         assert_eq!(calls[0].1.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod metadata_dir_tests {
+    use std::collections::HashMap;
+
+    use iceberg::spec::{
+        FormatVersion, NestedField, PrimitiveType, Schema, SortOrder, TableMetadata,
+        TableMetadataBuilder, Type, UnboundPartitionSpec,
+    };
+
+    use super::metadata_dir;
+
+    fn metadata(properties: &[(&str, &str)]) -> TableMetadata {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap();
+        TableMetadataBuilder::new(
+            schema,
+            UnboundPartitionSpec::builder().build(),
+            SortOrder::unsorted_order(),
+            "s3://bucket/wh/db/t/".to_string(),
+            FormatVersion::V2,
+            properties
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect::<HashMap<_, _>>(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata
+    }
+
+    #[test]
+    fn a_table_that_says_nothing_gets_the_conventional_directory() {
+        // The control, and it also pins the trailing-slash handling: the table
+        // location above ends in one, and a doubled slash in a manifest path is
+        // a path no reachability set built from the metadata would match.
+        assert_eq!(metadata_dir(&metadata(&[])), "s3://bucket/wh/db/t/metadata");
+    }
+
+    #[test]
+    fn a_table_that_names_a_metadata_path_gets_it() {
+        // The guarded case. Writing a manifest to `<location>/metadata` when the
+        // table said otherwise puts it in a prefix with different lifecycle
+        // rules, a different storage class, or — where the property names
+        // another bucket — no write permission at all.
+        assert_eq!(
+            metadata_dir(&metadata(&[(
+                "write.metadata.path",
+                "s3://meta-bucket/t/md/"
+            )])),
+            "s3://meta-bucket/t/md"
+        );
+    }
+
+    #[test]
+    fn an_empty_metadata_path_is_not_a_declaration() {
+        assert_eq!(
+            metadata_dir(&metadata(&[("write.metadata.path", "  ")])),
+            "s3://bucket/wh/db/t/metadata"
+        );
     }
 }

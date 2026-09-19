@@ -596,6 +596,12 @@ impl Bergman {
         let now = Utc::now();
         let ident = crate::catalog::to_table_ident(&table_plan.table)?;
         let env = crate::ops::OpEnv {
+            io_concurrency: self.policy.limits().io_concurrency,
+            compaction_parallelism: self
+                .policy
+                .limits()
+                .compaction_parallelism
+                .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get())),
             table,
             ident: &ident,
             loader: &catalog.client,
@@ -619,7 +625,7 @@ impl Bergman {
                 // the cost the cadence exists to bound.
                 self.orphan_scans
                     .lock()
-                    .expect("orphan scan ledger")
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(table_plan.table.clone(), now);
 
                 crate::ops::orphans::run(
@@ -657,7 +663,7 @@ impl Bergman {
     fn other_locations(&self, table: &TableRef) -> Vec<String> {
         self.locations
             .lock()
-            .expect("location ledger")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .filter(|(known, _)| *known != table)
             .map(|(_, location)| location.clone())
@@ -715,7 +721,7 @@ impl Bergman {
             last_orphan_scan: self
                 .orphan_scans
                 .lock()
-                .expect("orphan scan ledger")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(table)
                 .copied(),
         };
@@ -759,7 +765,14 @@ impl Bergman {
             _ => 8 * 1024 * 1024,
         };
 
-        let health = crate::health::analyze(table_ref, &table, target, now).await?;
+        let health = crate::health::analyze(
+            table_ref,
+            &table,
+            target,
+            now,
+            self.policy.limits().io_concurrency,
+        )
+        .await?;
 
         // Remembered so orphan removal can refuse a table that another table
         // lives inside (see `crate::ops::orphans`, check 5). Recorded here
@@ -767,7 +780,7 @@ impl Bergman {
         // maintain comes through this function first.
         self.locations
             .lock()
-            .expect("location ledger")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(table_ref.clone(), health.location.clone());
 
         Ok((health, decision))

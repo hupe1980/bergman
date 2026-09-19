@@ -72,13 +72,14 @@ pub(super) async fn rewrite_group(
     target: u64,
     sort: Option<&[SortColumn]>,
     memory_budget: u64,
+    tuning: Tuning,
 ) -> Result<Written> {
     let buckets = bucket_by_equality_deletes(group);
-    let ctx = session(memory_budget)?;
+    let ctx = session(memory_budget, tuning.parallelism)?;
 
     let mut combined: Option<datafusion::prelude::DataFrame> = None;
     for (index, (deletes, tasks)) in buckets.iter().enumerate() {
-        let df = bucket_frame(&ctx, table, tasks, deletes, index).await?;
+        let df = bucket_frame(&ctx, table, tasks, deletes, index, tuning).await?;
         combined = Some(match combined {
             None => df,
             Some(existing) => existing.union(df).map_err(datafusion_error)?,
@@ -211,6 +212,7 @@ async fn bucket_frame(
     tasks: &[&FileScanTask],
     deletes: &[EqualityDelete],
     index: usize,
+    tuning: Tuning,
 ) -> Result<datafusion::prelude::DataFrame> {
     // Positional deletes stay on the task, where upstream turns them into a
     // Parquet row selection. Equality deletes are stripped, because we are
@@ -226,7 +228,7 @@ async fn bucket_frame(
         .collect();
 
     let data_table = format!("{DATA_TABLE}_{index}");
-    let data = read_tasks(table, data_tasks)?;
+    let data = read_tasks(table, data_tasks, tuning)?;
     let data_schema = data.schema();
     ctx.register_table(&data_table, streaming_table(data)?)
         .map_err(datafusion_error)?;
@@ -252,7 +254,7 @@ async fn bucket_frame(
     {
         let delete_table = format!("{DELETE_TABLE}_{index}_{set}");
         let delete_tasks = delete_scan_tasks(table, &deletes, &join_columns)?;
-        let delete_rows = read_tasks(table, delete_tasks)?;
+        let delete_rows = read_tasks(table, delete_tasks, tuning)?;
 
         ctx.register_table(&delete_table, streaming_table(delete_rows)?)
             .map_err(datafusion_error)?;
@@ -298,12 +300,27 @@ async fn bucket_frame(
     df.select(projection).map_err(datafusion_error)
 }
 
-/// A session whose memory is bounded and whose spills go to disk.
+/// How much machine one rewrite may use.
+///
+/// Two numbers with different units and different reasons, bundled so a caller
+/// cannot swap them: one bounds **threads**, the other bounds **outstanding
+/// object-store requests**. Conflating them is how a compactor ends up either
+/// CPU-starved on a fat machine or hammering a bucket from a small one.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Tuning {
+    /// `DataFusion`'s `target_partitions` — the CPU width of the plan.
+    pub parallelism: usize,
+    /// How many data files the Arrow reader fetches at once.
+    pub read_concurrency: usize,
+}
+
+/// A session whose memory is bounded, whose spills go to disk, and whose plan
+/// is as wide as the machine allows.
 ///
 /// Real accounting rather than an estimate from compressed file sizes:
 /// `DataFusion` tracks what its operators actually reserve, and spills the sort
 /// and the join build side when they reach it.
-fn session(memory_budget: u64) -> Result<SessionContext> {
+fn session(memory_budget: u64, parallelism: usize) -> Result<SessionContext> {
     use datafusion::execution::disk_manager::DiskManagerBuilder;
     use datafusion::execution::memory_pool::FairSpillPool;
     use datafusion::execution::runtime_env::RuntimeEnvBuilder;
@@ -318,19 +335,46 @@ fn session(memory_budget: u64) -> Result<SessionContext> {
         .build_arc()
         .map_err(datafusion_error)?;
 
-    let config = SessionConfig::new()
-        // One partition. Bergman's parallelism is across tables and file
-        // groups, both of which are already bounded and both of which commit
-        // separately; adding intra-group parallelism here would multiply the
-        // memory budget by the core count without changing how much work a
-        // cycle does.
-        .with_target_partitions(1);
+    // The plan is as wide as the deployment allows. This used to be pinned to
+    // one partition on the argument that parallelism lives across tables and
+    // file groups — which is true and was not sufficient: groups within a table
+    // commit sequentially by construction (each is offered against the snapshot
+    // the last one produced), so a single table's rewrite was serial whatever
+    // the host had. A table with one hot partition is exactly the table that
+    // needs compacting, and it got one core.
+    //
+    // Widening is safe with respect to the two things that could break:
+    //
+    // - **Memory** is bounded by the session's pool, not by partition count, so
+    //   more partitions spill sooner rather than resident more.
+    // - **Sort order** survives, because a global `Sort` plans as
+    //   `SortPreservingMergeExec` over per-partition `SortExec`s and yields a
+    //   single ordered output partition. Unsorted output is coalesced in
+    //   arbitrary order, which is what bin-packing already assumes.
+    let config = SessionConfig::new().with_target_partitions(parallelism.max(1));
 
     Ok(SessionContext::new_with_config_rt(config, runtime))
 }
 
+/// The number of bytes fetched speculatively from the end of each Parquet file
+/// to find its footer.
+///
+/// Without a hint the reader fetches the 8-byte length, then the footer: two
+/// round trips per file. One over-fetch of 64 KiB covers the footer of an
+/// ordinary Iceberg data file outright, so the second trip disappears. On a
+/// group of ten thousand small files that is ten thousand round trips against
+/// object storage, which is the whole latency budget of a small-file compaction.
+///
+/// Sized to be generous and still cheap: over-fetching costs bandwidth that is
+/// already being paid to read the file.
+const PARQUET_FOOTER_HINT: usize = 64 * 1024;
+
 /// Read a set of scan tasks through upstream's Arrow reader.
-fn read_tasks(table: &Table, tasks: Vec<FileScanTask>) -> Result<SendableRecordBatchStream> {
+fn read_tasks(
+    table: &Table,
+    tasks: Vec<FileScanTask>,
+    tuning: Tuning,
+) -> Result<SendableRecordBatchStream> {
     let file_io: FileIO = table.file_io().clone();
     // Borrows the caller's runtime rather than creating one — the library's
     // "bring your own runtime" contract reaches even here.
@@ -348,7 +392,13 @@ fn read_tasks(table: &Table, tasks: Vec<FileScanTask>) -> Result<SendableRecordB
     );
 
     let task_stream = futures::stream::iter(tasks.into_iter().map(Ok)).boxed();
-    let reader = ArrowReaderBuilder::new(file_io, runtime).build();
+    let reader = ArrowReaderBuilder::new(file_io, runtime)
+        // Reading a file group is latency-bound, not CPU-bound: upstream
+        // defaults this to the core count, which is the wrong unit for object
+        // storage and far too low for a group of small files.
+        .with_data_file_concurrency_limit(tuning.read_concurrency.max(1))
+        .with_metadata_size_hint(PARQUET_FOOTER_HINT)
+        .build();
     let batches = reader
         .read(task_stream)
         .map_err(|e| Error::Storage(Box::new(e)))?
@@ -752,7 +802,7 @@ mod tests {
     ///
     /// The shape of this plan is the reason `DataFusion` is a dependency at all,
     /// so it is asserted rather than assumed — see the test below.
-    async fn anti_join_plan(columns: &[&str]) -> String {
+    async fn anti_join_plan(columns: &[&str], parallelism: usize) -> String {
         use datafusion::arrow::array::Int32Array;
         use datafusion::arrow::datatypes::{DataType, Field, Schema};
         use datafusion::datasource::MemTable;
@@ -775,7 +825,12 @@ mod tests {
         let table =
             || Arc::new(MemTable::try_new(schema.clone(), vec![vec![batch.clone()]]).unwrap());
 
-        let ctx = SessionContext::new();
+        // Bergman's **own** session, not a default one. The property under test
+        // is a property of the plan this crate builds, and a default context
+        // shares neither its memory pool nor its `target_partitions` — so a
+        // change to `session` could turn the join into a nested loop with this
+        // test still passing.
+        let ctx = session(64 * 1024 * 1024, parallelism).unwrap();
         ctx.register_table("data_0", table()).unwrap();
         ctx.register_table("eq_deletes_0", table()).unwrap();
 
@@ -827,32 +882,37 @@ mod tests {
         // partitions would just stop finishing.
         //
         // So the physical plan is asserted, on one column and on several.
-        for columns in [&["id"][..], &["id", "region"][..]] {
-            let plan = anti_join_plan(columns).await;
-            assert!(
-                plan.contains("HashJoinExec"),
-                "the anti-join must be a hash join, got:\n{plan}"
-            );
-            assert!(
-                !plan.contains("NestedLoopJoinExec"),
-                "a nested-loop join is quadratic in the delete count:\n{plan}"
-            );
-            // And it must still be null-safe. Nulls-equal is what makes an
-            // Iceberg equality delete naming NULL remove rows whose value is
-            // null; a hash join that lost it would be fast and wrong, and the
-            // rows it failed to delete would stay visible forever.
-            assert!(
-                plan.contains("NullsEqual: true"),
-                "the join must keep Iceberg's null-matching semantics:\n{plan}"
-            );
-            // Every column must become a join key. One left behind in the
-            // filter is one the hash table does not probe on, which is a
-            // slower plan reached silently.
-            for name in columns {
+        // Both widths, because widening the plan is what introduces
+        // `RepartitionExec` between the scan and the join — the place a join
+        // could quietly become something else.
+        for parallelism in [1usize, 4] {
+            for columns in [&["id"][..], &["id", "region"][..]] {
+                let plan = anti_join_plan(columns, parallelism).await;
                 assert!(
-                    plan.contains(&format!("{name}@")),
-                    "{name} is not a join key:\n{plan}"
+                    plan.contains("HashJoinExec"),
+                    "the anti-join must be a hash join, got:\n{plan}"
                 );
+                assert!(
+                    !plan.contains("NestedLoopJoinExec"),
+                    "a nested-loop join is quadratic in the delete count:\n{plan}"
+                );
+                // And it must still be null-safe. Nulls-equal is what makes an
+                // Iceberg equality delete naming NULL remove rows whose value is
+                // null; a hash join that lost it would be fast and wrong, and the
+                // rows it failed to delete would stay visible forever.
+                assert!(
+                    plan.contains("NullsEqual: true"),
+                    "the join must keep Iceberg's null-matching semantics:\n{plan}"
+                );
+                // Every column must become a join key. One left behind in the
+                // filter is one the hash table does not probe on, which is a
+                // slower plan reached silently.
+                for name in columns {
+                    assert!(
+                        plan.contains(&format!("{name}@")),
+                        "{name} is not a join key:\n{plan}"
+                    );
+                }
             }
         }
     }

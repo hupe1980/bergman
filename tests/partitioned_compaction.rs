@@ -41,6 +41,7 @@ async fn planned_partitions(fixture: &TestTable) -> Vec<PartitionKey> {
         &table,
         8 * 1024 * 1024,
         chrono::Utc::now(),
+        8,
     )
     .await
     .unwrap();

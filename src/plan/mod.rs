@@ -365,6 +365,8 @@ mod tests {
                 manifests: ManifestHealth::default(),
                 files: FileHealth::default(),
                 partitions: Vec::new(),
+                object_storage_layout: false,
+                unreadable: None,
             },
             policy: effective,
             operations: ops

@@ -132,8 +132,8 @@ so nothing is serialised between them.
 Scale-out is stateless replicas with disjoint `[[rules]]` or disjoint catalog
 `namespaces` — no broker, no consensus service. Optimistic catalog commits
 already make double-execution safe, so sharding is a cost optimization rather
-than a correctness requirement. Automatic shard assignment is
-[not built](@/docs/status.md#limits).
+than a correctness requirement. Shards are assigned by the rules you write; there
+is no automatic assignment and no coordination between replicas.
 
 ## The executor {#executor}
 
@@ -195,8 +195,8 @@ alternative is worse). The split is deliberate:
   `iceberg-catalog-rest` sends, because they are the same serialized types.
 
 Operations are written against a `TableCommitter` trait rather than the
-transport, so when upstream lands `OverwriteAction` a second implementation
-wraps it and nothing above `src/commit` changes.
+transport, so an upstream action that can express a rewrite becomes a second
+implementation and nothing above `src/commit` changes.
 
 Four invariants govern a produced snapshot. Each loses or corrupts data when
 broken, and none of them fails visibly:

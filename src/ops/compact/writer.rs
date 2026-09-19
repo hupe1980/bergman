@@ -122,6 +122,7 @@ fn writer_properties(
 ) -> parquet::file::properties::WriterProperties {
     use parquet::basic::{Compression, GzipLevel, ZstdLevel};
     use parquet::file::properties::WriterProperties;
+    use parquet::schema::types::ColumnPath;
 
     let properties = metadata.properties();
     let get = |key: &str| properties.get(key).map(|s| s.trim().to_ascii_lowercase());
@@ -172,6 +173,142 @@ fn writer_properties(
     {
         builder = builder.set_data_page_size_limit(size);
     }
+    if let Some(size) = properties
+        .get("write.parquet.dict-size-bytes")
+        .and_then(|s| s.trim().parse::<usize>().ok())
+    {
+        builder = builder.set_dictionary_page_size_limit(size);
+    }
+    if let Some(rows) = properties
+        .get("write.parquet.page-row-limit")
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|rows| *rows > 0)
+    {
+        builder = builder.set_data_page_row_count_limit(rows);
+    }
+
+    // Bloom filters, which a rewrite must carry over for the same reason it
+    // carries over the sort order: the table's owner turned them on for a
+    // column they filter by, and a rewritten file without one silently makes
+    // every such query read more. Iceberg spells this per column —
+    // `write.parquet.bloom-filter-enabled.column.<name>` — with an optional
+    // false-positive probability beside it.
+    //
+    // A malformed value is ignored rather than fatal, the same rule the rest of
+    // this function follows: a rewrite must not fail over a table property
+    // somebody typed wrong.
+    for (key, value) in properties {
+        if let Some(column) = key.strip_prefix(BLOOM_ENABLED_PREFIX) {
+            if let Ok(on) = value.trim().parse::<bool>() {
+                builder = builder
+                    .set_column_bloom_filter_enabled(ColumnPath::from(column.to_string()), on);
+            }
+        } else if let Some(column) = key.strip_prefix(BLOOM_FPP_PREFIX)
+            && let Ok(fpp) = value.trim().parse::<f64>()
+            && fpp > 0.0
+            && fpp < 1.0
+        {
+            builder =
+                builder.set_column_bloom_filter_fpp(ColumnPath::from(column.to_string()), fpp);
+        }
+    }
 
     builder.build()
+}
+
+/// Iceberg's per-column bloom-filter switch.
+const BLOOM_ENABLED_PREFIX: &str = "write.parquet.bloom-filter-enabled.column.";
+/// Iceberg's per-column bloom-filter false-positive probability.
+const BLOOM_FPP_PREFIX: &str = "write.parquet.bloom-filter-fpp.column.";
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use iceberg::spec::{
+        FormatVersion, NestedField, PrimitiveType, Schema, SortOrder, TableMetadata,
+        TableMetadataBuilder, Type, UnboundPartitionSpec,
+    };
+    use parquet::schema::types::ColumnPath;
+
+    use super::*;
+
+    fn metadata(properties: &[(&str, &str)]) -> TableMetadata {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(2, "region", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap();
+        TableMetadataBuilder::new(
+            schema,
+            UnboundPartitionSpec::builder().build(),
+            SortOrder::unsorted_order(),
+            "file:///tmp/t".to_string(),
+            FormatVersion::V2,
+            properties
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect::<HashMap<_, _>>(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata
+    }
+
+    #[test]
+    fn a_table_that_asks_for_no_bloom_filter_gets_none() {
+        // The control. A rewrite must not invent filters either: they cost
+        // write time and file size, and a table that did not ask for one is
+        // saying it does not want to pay.
+        let properties = writer_properties(&metadata(&[]));
+        assert!(
+            !properties
+                .bloom_filter_properties(&ColumnPath::from("id"))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_column_the_table_asks_to_bloom_filter_keeps_its_filter() {
+        // The guarded case, and the reason it matters: the owner turned this on
+        // for a column they filter by. A rewritten file without the filter is
+        // one every such query reads more of, and nothing says so.
+        let properties = writer_properties(&metadata(&[
+            ("write.parquet.bloom-filter-enabled.column.id", "true"),
+            ("write.parquet.bloom-filter-fpp.column.id", "0.02"),
+        ]));
+
+        let id = properties
+            .bloom_filter_properties(&ColumnPath::from("id"))
+            .expect("the filter the table asked for");
+        assert!((id.fpp - 0.02).abs() < 1e-9, "fpp not carried: {}", id.fpp);
+
+        // And only that column: a global switch where Iceberg spells a
+        // per-column one would filter every column in the table.
+        assert!(
+            properties
+                .bloom_filter_properties(&ColumnPath::from("region"))
+                .is_none(),
+            "a column the table said nothing about must not gain a filter"
+        );
+    }
+
+    #[test]
+    fn a_malformed_property_does_not_fail_the_rewrite() {
+        // Same rule as the compression level above it: a rewrite must not be
+        // refused over a table property somebody typed wrong. The filter is
+        // simply not applied.
+        let properties = writer_properties(&metadata(&[
+            ("write.parquet.bloom-filter-enabled.column.id", "yes please"),
+            ("write.parquet.dict-size-bytes", "lots"),
+        ]));
+        assert!(
+            properties
+                .bloom_filter_properties(&ColumnPath::from("id"))
+                .is_none()
+        );
+    }
 }

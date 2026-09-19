@@ -18,14 +18,6 @@ use crate::health::{
 };
 use crate::policy::TableRef;
 
-/// How many manifests are read concurrently.
-///
-/// Manifests are small Avro files fetched over the network, so this is latency-
-/// bound like discovery is. The bound exists so that analyzing a table with
-/// tens of thousands of manifests does not open tens of thousands of
-/// connections.
-const MANIFEST_CONCURRENCY: usize = 16;
-
 /// Analyze a table's condition from its metadata.
 ///
 /// Reads the current snapshot's manifest list and every manifest in it. No data
@@ -39,7 +31,9 @@ pub async fn analyze(
     table: &Table,
     manifest_target_size: u64,
     now: DateTime<Utc>,
+    concurrency: usize,
 ) -> Result<TableHealth> {
+    let concurrency = concurrency.max(1);
     let metadata = table.metadata();
 
     let snapshots = snapshot_health(metadata, now);
@@ -49,21 +43,40 @@ pub async fn analyze(
         .properties()
         .get("write.format.default")
         .map(|s| s.trim().to_ascii_lowercase());
+    let object_storage_layout = metadata
+        .properties()
+        .get("write.object-storage.enabled")
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
+
+    // Two early exits, and the reason they are separate matters: one describes
+    // a table with nothing in it, the other a table Bergman cannot see into.
+    // Both leave the manifest-derived figures at their defaults, and only
+    // `unreadable` tells them apart.
+    let base = |unreadable: Option<String>| TableHealth {
+        table: table_ref.clone(),
+        format_version,
+        write_format: write_format.clone(),
+        object_storage_layout,
+        location: location.clone(),
+        current_spec_id: metadata.default_partition_spec_id(),
+        snapshots: snapshots.clone(),
+        manifests: ManifestHealth::default(),
+        files: FileHealth::default(),
+        partitions: Vec::new(),
+        unreadable,
+    };
+
+    // Asked before the manifest list is fetched, so an encrypted table costs
+    // one property lookup rather than a download and an Avro parse failure
+    // every cycle (see `super::unreadable_reason`).
+    if let Some(reason) = super::unreadable_reason(metadata) {
+        return Ok(base(Some(reason)));
+    }
 
     // A table with no current snapshot has never been written to. Everything
     // below would read a manifest list that does not exist.
     let Some(snapshot) = metadata.current_snapshot() else {
-        return Ok(TableHealth {
-            table: table_ref.clone(),
-            format_version,
-            write_format,
-            location,
-            current_spec_id: metadata.default_partition_spec_id(),
-            snapshots,
-            manifests: ManifestHealth::default(),
-            files: FileHealth::default(),
-            partitions: Vec::new(),
-        });
+        return Ok(base(None));
     };
 
     let file_io = table.file_io();
@@ -146,7 +159,7 @@ pub async fn analyze(
                 Ok::<_, Error>(tally)
             }
         })
-        .buffer_unordered(MANIFEST_CONCURRENCY)
+        .buffer_unordered(concurrency)
         .try_collect()
         .await?;
 
@@ -175,6 +188,8 @@ pub async fn analyze(
         manifests,
         files,
         partitions,
+        object_storage_layout,
+        unreadable: None,
     })
 }
 
@@ -221,7 +236,12 @@ impl FileIndex {
 }
 
 /// Walk the current snapshot's manifests and index what the scan omits.
-pub async fn file_index(table_ref: &TableRef, table: &Table) -> Result<FileIndex> {
+pub async fn file_index(
+    table_ref: &TableRef,
+    table: &Table,
+    concurrency: usize,
+) -> Result<FileIndex> {
+    let concurrency = concurrency.max(1);
     let metadata = table.metadata();
     let Some(snapshot) = metadata.current_snapshot() else {
         return Ok(FileIndex::default());
@@ -280,7 +300,7 @@ pub async fn file_index(table_ref: &TableRef, table: &Table) -> Result<FileIndex
                 Ok::<_, Error>((partitions, formats))
             }
         })
-        .buffer_unordered(MANIFEST_CONCURRENCY)
+        .buffer_unordered(concurrency)
         .try_collect()
         .await?;
 

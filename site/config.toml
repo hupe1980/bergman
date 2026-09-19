@@ -1,6 +1,6 @@
 base_url = "https://hupe1980.github.io/bergman"
 title = "Bergman"
-description = "A Rust-native maintenance engine for Apache Iceberg. Policy-driven snapshot expiration, orphan cleanup and compaction planning — one crate, one binary, no JVM."
+description = "A Rust-native maintenance engine for Apache Iceberg. Policy-driven compaction, snapshot expiration, manifest rewriting and orphan cleanup — one crate, one binary, no JVM."
 default_language = "en"
 author = "hupe1980"
 

@@ -23,16 +23,23 @@ target
 # Zola build output
 site/public/
 
-# Internal-only documents (not published) — the architecture notes and the backlog.
-# `D` and `R` numbers are resolvable only inside this folder, so nothing in the
-# published tree may cite one; see concepts/README.md.
+# Internal-only documents (not published) — the architecture notes, the backlog,
+# and under `references/` the third-party specifications and reference
+# implementations they are written against. `D` and `R` numbers are resolvable
+# only inside this folder, so nothing in the published tree may cite one; see
+# concepts/README.md.
+#
+# The references are copyrighted publications and are not redistributed here.
+# `concepts/references/README.md` records every retrieval URL and
+# `concepts/references/fetch.sh` rebuilds the folder from scratch, so an index
+# entry with no file is fine and a file with no entry is invisible.
 concepts/
 
-# Third-party specifications, protocol documents and reference implementations —
-# copyrighted, so local copies are not redistributed here. `specs/README.md`
-# indexes every one with its retrieval URL and `specs/fetch.sh` rebuilds the
-# folder from scratch; `concepts/REFERENCES.md` says what each is used for.
-/specs/
+# Agent instructions — the round procedure and whatever else is added beside it.
+# Internal for the same reason `concepts/` is: it cites `D` and `R` numbers, names
+# specific past defects, and describes the private design folder it operates on,
+# none of which resolves for a reader of the published tree.
+.claude/
 
 # Custom
 .DS_Store

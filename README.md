@@ -39,24 +39,25 @@ Bergman is pre-release. All four maintenance operations execute.
 | Compaction | ✅ | Upstream's scan + writers, Bergman's commit layer |
 | Dangling delete-file removal | ✅ | Bergman's commit layer — nothing else ever cleans these up |
 
-Format **v1 and v2** tables are rewritten. A **v3** table's data-plane operations
-are refused with a named reason — a **gap, not an impossibility** — and there are
-two independent reasons, both upstream-shaped:
+Two kinds of table are **refused by name** rather than half-maintained. In both
+cases the refusal appears in `bergman plan`, not only in a log line.
 
-- **Row lineage.** The spec requires a rewrite to copy each row's `_row_id` into
-  the file replacing it, and Iceberg's Java implementation does exactly that
-  (Spark since 1.10.0). `iceberg-rust` does not yet expose the field to project
-  or to write, so Bergman would renumber every row it touched.
-- **Deletion vectors.** v3 encodes position deletes as Puffin bitmap blobs, and
-  the released `iceberg-rust` has no decoder — so a rewrite could not see the
-  deletes it must apply.
+**Format v3** rewrites are blocked by two independent gaps, both upstream-shaped:
+its **row lineage** cannot be preserved — a rewrite must copy each row's `_row_id`
+into the file replacing it, which means a physical column no released writer
+supports, so Bergman would renumber every row it touched — and its **deletion
+vectors** cannot be read, so a rewrite could not see the deletes it must apply.
 
-Snapshot expiration and orphan removal still run, so a v3 table's history stays
-bounded and its storage still gets reclaimed. On v3 that matters more than it
-sounds: a deletion vector is a blob inside a Puffin file, writers are not
+**Encrypted tables** (`encryption.key-id`) have their manifests *and* manifest
+lists encrypted, which Bergman does not decrypt, so compaction, manifest
+rewriting and orphan removal are refused.
+
+**Snapshot expiration still runs on both**, because it works from `metadata.json`
+alone — unbounded snapshot growth should not be the price of encrypting a table or
+upgrading it to v3. On a v3 table orphan removal runs too, and that matters more
+than it sounds: a deletion vector is a blob inside a Puffin file, writers are not
 required to rewrite those files when a vector is superseded, and **orphan removal
-is the only thing that ever reclaims the space**. The refusal appears in
-`bergman plan`, not only in a log line.
+is the only thing that ever reclaims the space**.
 
 ### Why bergman owns its commit layer
 
@@ -253,7 +254,9 @@ left for the next cycle, since a failing group has already paid for a full rewri
 before it fails.
 
 Each group is read with its delete files applied, optionally sorted, and written
-back at the target size honouring the table's own `write.parquet.*` settings. A
+back at the target size honouring the table's own settings — `write.parquet.*`
+(compression, row-group and page sizing, dictionary size, per-column bloom
+filters), `write.data.path`, `write.metadata.path`, and its `sort-order`. A
 delete file is retired only when every data file it applies to is inside the
 group; ones left applying to nothing are removed separately, since nothing else
 ever cleans them up.
@@ -277,6 +280,12 @@ writer, and never corrupt one.
 expiration's file cleanup all default off. Metadata-only snapshot expiration is
 the single exception, because unbounded snapshot growth is the most common
 Iceberg health problem.
+
+**A table Bergman cannot fully read is refused, not guessed at.** Every manifest
+walk is all-or-nothing — one unreadable manifest aborts the whole computation
+rather than returning a short set — so nothing is ever deleted on the strength of
+a partial reading. What the refusal adds is the *reason*, once, in the plan,
+instead of an opaque parse failure retried every cycle forever.
 
 **Orphan removal has eight independent checks**, because it is the one
 operation that can destroy a healthy table: dry run by default; a grace period
@@ -468,6 +477,27 @@ cardinality budget.
 
 Local filesystem and in-memory storage are always available, which is what keeps
 the test suite free of containers. Embedders build `--no-default-features`.
+
+### Resource limits
+
+Two knobs decide how much machine maintenance may use, and they are deliberately
+in different units:
+
+```toml
+[limits]
+io_concurrency = 32          # object-store requests in flight, per operation
+# compaction_parallelism = 8 # CPU threads per file group; omit for the machine's
+```
+
+`io_concurrency` bounds what is latency-bound — reading manifests, deleting
+files — so the useful number is far above the core count. `compaction_parallelism`
+bounds what is CPU-bound: the `target_partitions` of the DataFusion plan that
+applies equality deletes and sorts. Raising it does not raise the memory ceiling;
+`compaction.max_sort_memory` does, and the spill pool is shared across threads.
+
+They are parameters rather than constants because an embedder sharing an HTTP
+connection pool with the rest of a service has to be able to say how much of it
+maintenance may take.
 
 ---
 

@@ -48,6 +48,22 @@ pub struct TableHealth {
     /// explanation is wanted, which is why this reaches the plan as a note.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_format: Option<String>,
+    /// Whether the table asks for the object-storage file layout
+    /// (`write.object-storage.enabled`).
+    ///
+    /// Iceberg inserts a deterministic hash into a data file's path when this is
+    /// on, so that a hot table's objects spread across S3 prefixes instead of
+    /// concentrating in one and collecting 503s. Bergman's writer uses upstream's
+    /// `DefaultLocationGenerator`, which does not — and the released crate offers
+    /// no generator that does — so a rewrite quietly moves files out of the
+    /// layout the table asked for.
+    ///
+    /// Carried here so the planner can *say so* rather than leave it silent. It
+    /// is not a refusal: the table still reads correctly, every path is recorded
+    /// in the metadata, and refusing to compact a table over its prefix layout
+    /// would be worse than the deviation.
+    #[serde(default)]
+    pub object_storage_layout: bool,
     /// The partition spec new files are written under.
     ///
     /// A table whose spec has evolved holds files under several at once, and
@@ -63,6 +79,59 @@ pub struct TableHealth {
     pub files: FileHealth,
     /// The same, split by partition — the granularity compaction works at.
     pub partitions: Vec<PartitionHealth>,
+    /// Why this table's manifests could not be read, if they could not.
+    ///
+    /// When set, every figure derived from a manifest — [`Self::files`],
+    /// [`Self::manifests`] and [`Self::partitions`] — is **absent rather than
+    /// zero**, and every operation that needs one is refused by name rather
+    /// than left to fail on an Avro parse error every cycle forever.
+    /// [`Self::snapshots`] and the metadata log stay exact, because they come
+    /// from `metadata.json` rather than from a manifest.
+    ///
+    /// Distinguishing "unreadable" from "empty" is the whole point: a table
+    /// with no files and a table Bergman cannot read produce the same zeroes,
+    /// and one of them is healthy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreadable: Option<String>,
+}
+
+/// Why Bergman cannot read this table's manifests, if it cannot.
+///
+/// Today there is one answer, and it is **encryption**. Iceberg native
+/// encryption went GA in Java 1.11.0: a table declaring `encryption.key-id`
+/// has its data files, its manifests *and its manifest lists* encrypted, with
+/// v3 metadata carrying the wrapped keys in `encryption-keys`. Bergman opens
+/// manifests with `ManifestList::parse_with_version` and
+/// `ManifestFile::load_manifest`, neither of which decrypts anything.
+///
+/// **This is an operability refusal, not a safety one, and the difference is
+/// worth stating precisely.** Every manifest walk in Bergman is all-or-nothing
+/// — `reachability::compute` and the analyzer both `try_collect`, so one
+/// unreadable manifest aborts the whole computation rather than returning a
+/// short set. Nothing is ever deleted on the strength of a partial reading.
+/// What actually happens without this check is an opaque Avro parse failure,
+/// re-attempted every cycle, with `bergman plan` unable to say why. That is a
+/// violation of "nothing silent" rather than a data-loss path.
+///
+/// Detected from metadata Bergman already holds, so it costs nothing and needs
+/// no upgrade. Supporting such tables — rather than refusing them — becomes
+/// possible on `iceberg` 0.11.0, which reads and writes encrypted Puffin,
+/// Parquet, manifests and manifest lists.
+pub fn unreadable_reason(metadata: &iceberg::spec::TableMetadata) -> Option<String> {
+    let declares_key = metadata
+        .properties()
+        .get("encryption.key-id")
+        .is_some_and(|v| !v.trim().is_empty());
+
+    if declares_key || metadata.encryption_keys_iter().len() > 0 {
+        return Some(
+            "the table uses Iceberg native encryption (encryption.key-id), so its manifests \
+             and manifest lists are encrypted and Bergman cannot read them; only operations \
+             that need no manifest can run"
+                .to_string(),
+        );
+    }
+    None
 }
 
 /// Snapshot and history condition.
@@ -265,5 +334,76 @@ mod tests {
         // Out-of-range percentiles clamp rather than panic on the index.
         assert_eq!(h.percentile(1.5), 50);
         assert_eq!(h.percentile(-0.5), 10);
+    }
+}
+
+#[cfg(test)]
+mod readability_tests {
+    use std::collections::HashMap;
+
+    use iceberg::spec::{
+        FormatVersion, NestedField, PrimitiveType, Schema, SortOrder, TableMetadataBuilder, Type,
+        UnboundPartitionSpec,
+    };
+
+    use super::*;
+
+    fn metadata(properties: HashMap<String, String>) -> iceberg::spec::TableMetadata {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap();
+        TableMetadataBuilder::new(
+            schema,
+            UnboundPartitionSpec::builder().build(),
+            SortOrder::unsorted_order(),
+            "file:///tmp/t".to_string(),
+            FormatVersion::V2,
+            properties,
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata
+    }
+
+    #[test]
+    fn an_ordinary_table_is_readable() {
+        // The control. Without it, the test below passes just as happily
+        // against a detector that refuses everything — which is the failure
+        // mode a guarded-only test has, and the reason the orphan suite is
+        // written in pairs.
+        assert!(unreadable_reason(&metadata(HashMap::new())).is_none());
+
+        // And a table that merely mentions encryption in an unrelated property
+        // is still readable: the check must key on the spec's own property, not
+        // on a substring.
+        let mut properties = HashMap::new();
+        properties.insert("comment".into(), "encryption.key-id is not set".into());
+        assert!(unreadable_reason(&metadata(properties)).is_none());
+    }
+
+    #[test]
+    fn a_table_declaring_an_encryption_key_is_refused_by_name() {
+        let mut properties = HashMap::new();
+        properties.insert("encryption.key-id".into(), "kms-key-1".into());
+
+        let reason = unreadable_reason(&metadata(properties)).expect("must be refused");
+        assert!(
+            reason.contains("encryption.key-id"),
+            "the reason must name what to look at: {reason}"
+        );
+    }
+
+    #[test]
+    fn an_empty_encryption_key_is_not_a_declaration() {
+        // A property set to the empty string is a configuration mistake, not an
+        // encrypted table. Refusing it would take a readable table out of
+        // maintenance for a typo.
+        let mut properties = HashMap::new();
+        properties.insert("encryption.key-id".into(), "   ".into());
+        assert!(unreadable_reason(&metadata(properties)).is_none());
     }
 }

@@ -170,6 +170,43 @@ pub struct Limits {
     /// from cron or its orchestrator. This is for the daemon, which has none.
     #[serde(default, with = "humantime_serde::option")]
     pub operation_timeout: Option<Duration>,
+
+    /// How many object-store requests one operation keeps in flight.
+    ///
+    /// Bounds the two things that are latency-bound rather than CPU-bound:
+    /// reading a table's manifests, and deleting files. Both are dominated by
+    /// per-request round trips against object storage, so the useful number is
+    /// far above the core count and has nothing to do with it.
+    ///
+    /// It is a **parameter rather than a constant** because an embedder sharing
+    /// one HTTP connection pool with the rest of a service has to be able to
+    /// say how much of it maintenance may take — which the library contract
+    /// promises and four hard-coded constants quietly broke.
+    ///
+    /// The ceiling is honest: the manifest walk is two flat phases, not a
+    /// nested fan-out, so this is the number of outstanding requests and not a
+    /// factor in one.
+    #[serde(default = "Limits::default_io_concurrency")]
+    pub io_concurrency: usize,
+
+    /// How many CPU threads one file group's rewrite may use.
+    ///
+    /// The rewrite is a `DataFusion` plan — an equality-delete anti-join and,
+    /// where the table is sorted, a global sort — and this is its
+    /// `target_partitions`. **Absent means the machine's available
+    /// parallelism**, which is the right default and was not the original one:
+    /// the executor ran on a single partition, so a group's whole data plane
+    /// was serial however many cores the host had.
+    ///
+    /// Raising it does not raise the memory ceiling. The spill pool is
+    /// per-session and shared across partitions, so more threads means more
+    /// spilling under pressure rather than more resident bytes — which is why
+    /// this and `compaction.max_sort_memory` are independent knobs.
+    ///
+    /// Set it to 1 to get the old behaviour in a container pinned to one core,
+    /// or where maintenance must stay out of a co-tenant's way.
+    #[serde(default)]
+    pub compaction_parallelism: Option<usize>,
 }
 
 impl Limits {
@@ -179,6 +216,10 @@ impl Limits {
 
     fn default_max_deletes_per_run() -> usize {
         100_000
+    }
+
+    fn default_io_concurrency() -> usize {
+        32
     }
 
     /// Validate what can be checked without contacting anything.
@@ -193,6 +234,16 @@ impl Limits {
                 "limits.max_deletes_per_run is 0, which would delete nothing while still \
                  paying for every listing; set orphans.mode = \"dry-run\" and \
                  snapshots.delete_files = false to report without deleting",
+            ));
+        }
+        if self.compaction_parallelism == Some(0) {
+            return Err(Error::policy(
+                "limits.compaction_parallelism is 0; omit it for the machine's parallelism,                  or set 1 for a single thread",
+            ));
+        }
+        if self.io_concurrency == 0 {
+            return Err(Error::policy(
+                "limits.io_concurrency is 0, which would issue no object-store request at all",
             ));
         }
         if self.operation_timeout == Some(Duration::ZERO) {
@@ -213,6 +264,8 @@ impl Default for Limits {
             max_deletes_per_run: Self::default_max_deletes_per_run(),
             maintenance_window: None,
             operation_timeout: None,
+            io_concurrency: Self::default_io_concurrency(),
+            compaction_parallelism: None,
         }
     }
 }

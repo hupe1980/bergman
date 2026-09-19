@@ -629,9 +629,13 @@ impl<'a> SnapshotProducer<'a> {
             let mut writer = match (is_delete_manifest, format_version) {
                 (false, FormatVersion::V1) => builder.build_v1(),
                 (false, FormatVersion::V2) => builder.build_v2_data(),
-                (false, FormatVersion::V3) => builder.build_v3_data(),
                 (true, FormatVersion::V2) => builder.build_v2_deletes(),
-                (true, FormatVersion::V3) => builder.build_v3_deletes(),
+                // See `super::v3_writer_unimplemented`: upstream's v3 writers
+                // work, which is exactly why calling them here would be a
+                // silent data bug rather than a compile error.
+                (_, FormatVersion::V3) => {
+                    return Err(super::v3_writer_unimplemented(self.table.identifier()));
+                }
                 (true, FormatVersion::V1) => {
                     return Err(Error::metadata(
                         self.table.identifier().to_string(),
@@ -673,7 +677,9 @@ impl<'a> SnapshotProducer<'a> {
             let mut writer = match format_version {
                 FormatVersion::V1 => builder.build_v1(),
                 FormatVersion::V2 => builder.build_v2_data(),
-                FormatVersion::V3 => builder.build_v3_data(),
+                FormatVersion::V3 => {
+                    return Err(super::v3_writer_unimplemented(self.table.identifier()));
+                }
             };
 
             for file in added {
@@ -724,8 +730,8 @@ impl<'a> SnapshotProducer<'a> {
         let parent_id = parent.map(|p| p.snapshot_id());
         let metadata = self.table.metadata();
         let location = format!(
-            "{}/metadata/snap-{}-{}.avro",
-            metadata.location().trim_end_matches('/'),
+            "{}/snap-{}-{}.avro",
+            super::metadata_dir(metadata),
             self.snapshot_id,
             Uuid::new_v4()
         );
@@ -745,13 +751,13 @@ impl<'a> SnapshotProducer<'a> {
             FormatVersion::V2 => {
                 ManifestListWriter::v2(output, self.snapshot_id, parent_id, sequence_number)
             }
-            FormatVersion::V3 => ManifestListWriter::v3(
-                output,
-                self.snapshot_id,
-                parent_id,
-                sequence_number,
-                Some(metadata.next_row_id()),
-            ),
+            // `ManifestListWriter::v3` would take `metadata.next_row_id()` and
+            // produce a list a catalog accepts — while nothing advances
+            // `next-row-id`, so every later snapshot would claim the same
+            // range. That is the trap, and it is why this is an error.
+            FormatVersion::V3 => {
+                return Err(super::v3_writer_unimplemented(self.table.identifier()));
+            }
         };
 
         writer
@@ -767,8 +773,8 @@ impl<'a> SnapshotProducer<'a> {
 
     pub(crate) fn new_manifest_output(&self, kind: &str) -> Result<iceberg::io::OutputFile> {
         let location = format!(
-            "{}/metadata/{}-m-{}-{}.avro",
-            self.table.metadata().location().trim_end_matches('/'),
+            "{}/{}-m-{}-{}.avro",
+            super::metadata_dir(self.table.metadata()),
             self.snapshot_id,
             kind,
             Uuid::new_v4()

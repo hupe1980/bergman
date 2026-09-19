@@ -54,6 +54,9 @@ use crate::util::human_bytes;
 /// re-packs are the ones the table had when the attempt began — and a
 /// concurrent commit changes them.
 pub async fn run(env: &OpEnv<'_>, settings: &EffectiveManifests) -> Result<OperationResult> {
+    // Re-packing manifests means reading every one of them first.
+    env.require_readable_manifests("rewrite-manifests")?;
+
     let ident = env.ident;
     let ctx = env.ctx;
     let mut current = env.table.clone();
@@ -305,8 +308,8 @@ async fn write_packed(
     let mut manifests = Vec::new();
     for chunk in entries.chunks(entries_per_manifest) {
         let location = format!(
-            "{}/metadata/{snapshot_id}-m-{}-{}-{}.avro",
-            metadata.location().trim_end_matches('/'),
+            "{}/{snapshot_id}-m-{}-{}-{}.avro",
+            crate::commit::metadata_dir(metadata),
             match kind {
                 ManifestKind::Data => "data",
                 ManifestKind::Deletes => "delete",
@@ -328,10 +331,22 @@ async fn write_packed(
         let mut writer = match (kind, format_version) {
             (ManifestKind::Data, FormatVersion::V1) => builder.build_v1(),
             (ManifestKind::Data, FormatVersion::V2) => builder.build_v2_data(),
-            (ManifestKind::Data, FormatVersion::V3) => builder.build_v3_data(),
             (ManifestKind::Deletes, FormatVersion::V2) => builder.build_v2_deletes(),
-            (ManifestKind::Deletes, FormatVersion::V3) => builder.build_v3_deletes(),
-            (ManifestKind::Deletes, FormatVersion::V1) => unreachable!("checked above"),
+            // See `crate::commit::v3_writer_unimplemented`. Refused above by
+            // `check_authorable`; an error rather than `build_v3_*` so that
+            // lifting that refusal cannot quietly enable a writer that drops
+            // row lineage.
+            (_, FormatVersion::V3) => {
+                return Err(crate::commit::v3_writer_unimplemented(table.identifier()));
+            }
+            // A v1 table cannot hold delete files; checked above, and an error
+            // rather than a panic because this is somebody else's metadata.
+            (ManifestKind::Deletes, FormatVersion::V1) => {
+                return Err(Error::metadata(
+                    table.identifier().to_string(),
+                    "format v1 table carries delete files",
+                ));
+            }
         };
 
         for entry in chunk {

@@ -61,12 +61,42 @@ pub struct OpEnv<'a> {
     /// is a property of *deleting*, not of orphan removal or of expiration: one
     /// deleter, one safety model (see [`delete`]).
     pub max_deletes_per_run: usize,
+    /// How many object-store requests this operation may keep in flight, from
+    /// `limits.io_concurrency`.
+    ///
+    /// On the environment for the same reason as the delete ceiling: it is a
+    /// property of talking to storage, not of any one operation, and the
+    /// library contract promises concurrency is a parameter rather than a
+    /// constant compiled in.
+    pub io_concurrency: usize,
+    /// How many CPU threads one file group's rewrite may use, from
+    /// `limits.compaction_parallelism` resolved against the machine.
+    pub compaction_parallelism: usize,
 }
 
 impl<'a> OpEnv<'a> {
     /// The table being maintained.
     pub fn table_ref(&self) -> &'a crate::policy::TableRef {
         self.ctx.table
+    }
+
+    /// Refuse an operation that needs to read a manifest, when this table's
+    /// manifests cannot be read.
+    ///
+    /// The planner already refuses these ([`crate::plan`]), so this is the
+    /// second of the two entry points the library has: an embedder calling an
+    /// operation directly gets the same named refusal rather than an Avro
+    /// parse error from three layers down. A rule enforced at one of two entry
+    /// points is a rule with a hole in it.
+    pub fn require_readable_manifests(&self, operation: &'static str) -> crate::error::Result<()> {
+        match crate::health::unreadable_reason(self.table.metadata()) {
+            None => Ok(()),
+            Some(reason) => Err(crate::error::Error::refused(
+                operation,
+                self.table_ref(),
+                reason,
+            )),
+        }
     }
 }
 
@@ -127,7 +157,10 @@ pub fn retry_delay(attempt: usize) -> Duration {
             .try_into()
             .expect("16"),
     );
-    ceiling - Duration::from_millis(draw % span)
+    // `saturating_sub`, not `-`: `draw % span` is below `ceiling / 2` for every
+    // attempt this is called with, but a subtraction that is only correct
+    // because of the caller's bounds is a panic waiting for a fourth attempt.
+    ceiling.saturating_sub(Duration::from_millis(draw % span))
 }
 
 #[cfg(test)]

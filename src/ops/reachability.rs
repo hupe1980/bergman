@@ -8,7 +8,7 @@
 //! reachable set is indistinguishable from a complete one and would license
 //! deleting everything it failed to read.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use futures::stream::{self, StreamExt, TryStreamExt};
 use iceberg::spec::ManifestList;
@@ -16,12 +16,6 @@ use iceberg::table::Table;
 
 use crate::error::{Error, Result};
 use crate::policy::TableRef;
-
-/// How many manifest lists are walked concurrently.
-const SNAPSHOT_CONCURRENCY: usize = 8;
-
-/// How many manifests are read concurrently within one snapshot.
-const MANIFEST_CONCURRENCY: usize = 16;
 
 /// Every file a table's retained metadata refers to.
 #[derive(Debug, Default, Clone)]
@@ -65,13 +59,6 @@ impl ReachableSet {
 
     fn insert_metadata(&mut self, path: &str) {
         self.metadata_files.insert(normalize(path));
-    }
-
-    fn merge(&mut self, other: ReachableSet) {
-        self.data_files.extend(other.data_files);
-        self.metadata_files.extend(other.metadata_files);
-        self.statistics_files.extend(other.statistics_files);
-        self.metadata_json.extend(other.metadata_json);
     }
 }
 
@@ -130,9 +117,14 @@ fn collapse_slashes(path: &str) -> String {
 ///
 /// Walks **all** retained snapshots, not only the current one: a snapshot kept
 /// for time travel needs its data files as much as the current one does.
-pub async fn compute(table_ref: &TableRef, table: &Table) -> Result<ReachableSet> {
+pub async fn compute(
+    table_ref: &TableRef,
+    table: &Table,
+    concurrency: usize,
+) -> Result<ReachableSet> {
     let metadata = table.metadata();
     let mut reachable = ReachableSet::default();
+    let concurrency = concurrency.max(1);
 
     // Statistics and partition statistics, which expiration must also clean up
     // and the orphan scanner must never delete.
@@ -169,78 +161,111 @@ pub async fn compute(table_ref: &TableRef, table: &Table) -> Result<ReachableSet
         metadata.location().trim_end_matches('/')
     )));
 
-    let snapshots: Vec<_> = metadata.snapshots().cloned().collect();
+    let file_io = table.file_io();
+    let format_version = metadata.format_version();
 
-    let per_snapshot: Vec<ReachableSet> = stream::iter(snapshots)
+    // **Two flat phases rather than a nested fan-out**, and that is the whole
+    // shape of this function.
+    //
+    // Walking manifests inside a per-snapshot task reads better and bounds
+    // nothing: `s` snapshots each reading `m` manifests puts `s × m` requests
+    // in flight, so the two limits multiply and the real ceiling is whatever
+    // their product happens to be. Flattening makes `concurrency` mean what it
+    // says — the number of object-store requests this computation has
+    // outstanding — which is what an embedder sharing a connection pool needs
+    // it to mean.
+    //
+    // Phase one: every retained snapshot's manifest list. A snapshot kept for
+    // time travel needs its data files as much as the current one does, so this
+    // is all of them, not just the head.
+    let manifest_lists: Vec<(String, ManifestList)> = stream::iter(metadata.snapshots())
         .map(|snapshot| {
+            let file_io = file_io.clone();
             let table_ref = table_ref.clone();
-            let file_io = table.file_io().clone();
-            let format_version = metadata.format_version();
             async move {
-                let mut set = ReachableSet::default();
-                let manifest_list_path = snapshot.manifest_list();
-                set.insert_metadata(manifest_list_path);
-
+                let path = snapshot.manifest_list().to_string();
                 let bytes = file_io
-                    .new_input(manifest_list_path)
+                    .new_input(&path)
                     .map_err(|e| Error::Storage(Box::new(e)))?
                     .read()
                     .await
                     .map_err(|e| Error::Storage(Box::new(e)))?;
-
-                let manifest_list = ManifestList::parse_with_version(&bytes, format_version)
-                    .map_err(|e| {
+                let list =
+                    ManifestList::parse_with_version(&bytes, format_version).map_err(|e| {
                         Error::metadata(&table_ref, format!("unreadable manifest list: {e}"))
                     })?;
-
-                let per_manifest: Vec<Vec<String>> = stream::iter(manifest_list.entries())
-                    .map(|manifest_file| {
-                        let file_io = file_io.clone();
-                        async move {
-                            let manifest = manifest_file
-                                .load_manifest(&file_io)
-                                .await
-                                .map_err(|e| Error::Storage(Box::new(e)))?;
-
-                            // Every entry, including `Deleted` ones. A deleted
-                            // entry names a file this snapshot removed — but an
-                            // *older* retained snapshot still reads it, and
-                            // reachability is the union over all of them. The
-                            // health analyzer skips these; this must not.
-                            Ok::<_, Error>(
-                                manifest
-                                    .entries()
-                                    .iter()
-                                    .map(|e| e.file_path().to_string())
-                                    .collect::<Vec<_>>(),
-                            )
-                        }
-                    })
-                    .buffer_unordered(MANIFEST_CONCURRENCY)
-                    .try_collect()
-                    .await?;
-
-                for entry in manifest_list.entries() {
-                    set.insert_metadata(&entry.manifest_path);
-                }
-                for paths in per_manifest {
-                    for path in paths {
-                        set.insert_data(&path);
-                    }
-                }
-
-                Ok::<_, Error>(set)
+                Ok::<_, Error>((path, list))
             }
         })
-        .buffer_unordered(SNAPSHOT_CONCURRENCY)
+        .buffer_unordered(concurrency)
         // `try_collect` aborts on the first error, which is the property this
         // computation needs: a partial reachable set looks exactly like a
         // complete one and would license deleting everything unread.
         .try_collect()
         .await?;
 
-    for set in per_snapshot {
-        reachable.merge(set);
+    // Phase two: every manifest named by any of them, in one flat pass.
+    // Deduplicated first, because snapshots share manifests — an append-only
+    // table's tenth snapshot names the same nine manifests its ninth did, so a
+    // naive walk re-reads the whole history once per snapshot.
+    let mut manifest_paths: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for (list_path, list) in &manifest_lists {
+        reachable.insert_metadata(list_path);
+        for entry in list.entries() {
+            reachable.insert_metadata(&entry.manifest_path);
+            if seen.insert(normalize(&entry.manifest_path)) {
+                manifest_paths.push(entry.manifest_path.clone());
+            }
+        }
+    }
+
+    // Keyed by path, so the entries a manifest holds are read once however many
+    // snapshots name it. `ManifestFile` is needed to load it, so the first
+    // entry seen for each path is kept.
+    let mut by_path: HashMap<String, &iceberg::spec::ManifestFile> = HashMap::new();
+    for (_, list) in &manifest_lists {
+        for entry in list.entries() {
+            by_path
+                .entry(normalize(&entry.manifest_path))
+                .or_insert(entry);
+        }
+    }
+
+    let files: Vec<Vec<String>> = stream::iter(
+        manifest_paths
+            .iter()
+            .filter_map(|p| by_path.get(&normalize(p))),
+    )
+    .map(|manifest_file| {
+        let file_io = file_io.clone();
+        async move {
+            let manifest = manifest_file
+                .load_manifest(&file_io)
+                .await
+                .map_err(|e| Error::Storage(Box::new(e)))?;
+
+            // Every entry, including `Deleted` ones. A deleted entry names
+            // a file this snapshot removed — but an *older* retained
+            // snapshot still reads it, and reachability is the union over
+            // all of them. The health analyzer skips these; this must not.
+            Ok::<_, Error>(
+                manifest
+                    .entries()
+                    .iter()
+                    .map(|e| e.file_path().to_string())
+                    .collect::<Vec<_>>(),
+            )
+        }
+    })
+    .buffer_unordered(concurrency)
+    .try_collect()
+    .await?;
+
+    for paths in files {
+        for path in paths {
+            reachable.insert_data(&path);
+        }
     }
 
     Ok(reachable)

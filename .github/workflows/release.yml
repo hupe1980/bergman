@@ -10,6 +10,20 @@ name: Release
 # Nothing here is cross-compiled or emulated. Each binary is built on a runner
 # of its own architecture, and the image is assembled from those binaries rather
 # than compiled again.
+#
+# **The job order is by increasing irreversibility**, and it is strictly serial:
+#
+#     verify -> binaries -> image -> crates.io -> GitHub release
+#
+# A GHCR tag can be deleted and a GitHub release can be deleted. **A crates.io
+# version cannot** — the number is burned even after a yank — so it goes as late
+# as possible, after everything that can still fail has not. The GitHub release
+# is last because it is the announcement: it must not appear for a version whose
+# image or crate never shipped.
+#
+# `verify` exists because `ci.yml` runs on branches and pull requests, not tags.
+# Without it a tag pointing anywhere — an unmerged commit, a force-pushed ref —
+# would publish untested code to a registry that never forgets.
 
 on:
   push:
@@ -24,9 +38,31 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Runs against the tagged commit, which nothing else does. Not the full CI
+  # matrix — that gates the merge — but the checks whose failure must stop a
+  # release: the suite, the lints, and that the crate Cargo would collect is
+  # complete and builds from the collected copy.
+  verify:
+    name: Verify the tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-features --all-targets -- -D warnings
+      - run: cargo test --all-features --locked
+      # `cargo publish` verifies too, but only once it is already uploading.
+      # This catches a crate missing a licence or a README before anything
+      # irreversible happens.
+      - run: cargo package --locked --all-features
+
   binaries:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    needs: [verify]
     strategy:
       fail-fast: false
       matrix:
@@ -137,7 +173,10 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable={{is_default_branch}}
+            # `is_default_branch` is never true here — this workflow only runs
+            # on tags — so `latest` has to key off the tag itself. Excluded for
+            # a pre-release (`v1.0.0-rc.1`), which must not become `latest`.
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
 
       - uses: docker/build-push-action@v6
         with:
@@ -152,8 +191,12 @@ jobs:
   publish:
     name: Publish to crates.io
     runs-on: ubuntu-latest
-    needs: [binaries, image]
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [image]
+    # The irreversible step. `workflow_dispatch` is a rehearsal — it builds and
+    # verifies everything and publishes nothing — so it is excluded here as well
+    # as from the image push. Testing the release path must never be able to
+    # burn a version number.
+    if: github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -168,8 +211,11 @@ jobs:
   release:
     name: GitHub release
     runs-on: ubuntu-latest
-    needs: [binaries]
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Last, and after the publish rather than beside it: this is the
+    # announcement, and it must not exist for a version whose image or crate
+    # never shipped.
+    needs: [publish]
+    if: github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/download-artifact@v4
         with:

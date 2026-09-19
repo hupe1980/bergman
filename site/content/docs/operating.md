@@ -218,6 +218,18 @@ Both knobs are worth lowering on a small node. Going below the pool size does
 not fail — the sort and the anti-join spill to disk — it just gets slower, so
 give the container writable scratch space if you tighten it.
 
+`limits.compaction_parallelism` does **not** enter that budget. It is the thread
+width of one group's plan, and the memory pool is per session and shared across
+threads, so widening it spills sooner rather than holding more. On a CPU-limited
+container, pin it to the CPU quota rather than letting it read the host's core
+count:
+
+```text
+# 2 CPUs requested in Kubernetes
+[limits]
+compaction_parallelism = 2
+```
+
 ## Exit codes
 
 | Code | Meaning |

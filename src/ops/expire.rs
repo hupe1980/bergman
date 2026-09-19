@@ -36,11 +36,19 @@ pub async fn run(
     let table_ref = env.table_ref();
     let (observer, ctx, now) = (env.observer, env.ctx, env.now);
 
+    // Expiring snapshots is the one operation that needs no manifest: upstream's
+    // action works from `metadata.json` alone. Its *cleanup* half does not, so
+    // on a table whose manifests cannot be read the metadata half still runs and
+    // the cleanup half is skipped — out loud, in the result, because a silently
+    // skipped cleanup reads exactly like one that found nothing.
+    let unreadable = crate::health::unreadable_reason(table.metadata());
+    let cleanup = settings.delete_files.value && unreadable.is_none();
+
     // The reachable set is computed *before* the commit, while the snapshots
     // still exist. Afterwards, the files they referenced are unreachable by
     // construction and there would be nothing left to diff against.
-    let before = if settings.delete_files.value {
-        Some(reachability::compute(table_ref, table).await?)
+    let before = if cleanup {
+        Some(reachability::compute(table_ref, table, env.io_concurrency).await?)
     } else {
         None
     };
@@ -83,6 +91,7 @@ pub async fn run(
                 observer,
                 ctx,
                 env.max_deletes_per_run,
+                env.io_concurrency,
             )
             .await?
         }
@@ -90,7 +99,12 @@ pub async fn run(
     };
 
     let mut detail = format!("{removed} snapshots expired");
-    if settings.delete_files.value {
+    if settings.delete_files.value && !cleanup {
+        detail.push_str(
+            ", file cleanup skipped: it needs the reachable set, and this table's              manifests cannot be read",
+        );
+    }
+    if cleanup {
         detail.push_str(&format!(", {} files deleted", deletion.deleted));
         if deletion.withheld > 0 {
             // Not a loss: what the ceiling withholds is now unreferenced by
@@ -200,8 +214,9 @@ async fn delete_now_unreachable(
     observer: &dyn MaintenanceObserver,
     ctx: OperationContext<'_>,
     ceiling: usize,
+    concurrency: usize,
 ) -> Result<Deletion> {
-    let after = reachability::compute(table_ref, updated).await?;
+    let after = reachability::compute(table_ref, updated, concurrency).await?;
     let location = updated.metadata().location();
 
     let mut doomed: Vec<String> = Vec::new();
@@ -255,7 +270,8 @@ async fn delete_now_unreachable(
         );
     }
 
-    let mut deletion = announce_and_delete(updated.file_io(), observer, ctx, &doomed).await;
+    let mut deletion =
+        announce_and_delete(updated.file_io(), observer, ctx, &doomed, concurrency).await;
     deletion.withheld = withheld;
     Ok(deletion)
 }

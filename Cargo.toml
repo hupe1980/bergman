@@ -1,6 +1,6 @@
 [package]
 name = "bergman"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 authors = ["hupe1980"]
 description = "A Rust-native maintenance engine for Apache Iceberg — policy-driven compaction, snapshot expiration, and orphan cleanup with no JVM"
@@ -211,6 +211,22 @@ tempfile = "3"
 async-trait = "0.1"
 futures = { version = "0.3", default-features = false, features = ["std"] }
 uuid = { version = "1", features = ["v4"] }
+
+# Building a format v3 deletion vector by hand, which the fixture does because
+# no released `iceberg-rust` can write one (its `deletion-vector-v1` serializer
+# is still an open PR upstream). Both are already in the tree as transitive
+# dependencies of `iceberg`, so naming them here adds no crate to the build —
+# it only makes them nameable from a test.
+#
+# `roaring`'s `RoaringTreemap::serialize_into` is exactly the "portable" layout
+# the Puffin spec requires: a u64 little-endian bitmap count, then each bitmap
+# keyed by a little-endian u32, ordered by unsigned key because the map behind
+# it is a `BTreeMap`.
+roaring = "0.11"
+# CRC-32 **IEEE**, which is what the spec's bare "CRC-32" means here — settled
+# against the decoder that will eventually read these blobs, which computes
+# `crc32fast::hash` over the magic and the vector.
+crc32fast = "1"
 
 # Debug info dominates a debug build of this tree, and not by a little: with
 # full `-g`, `cargo test --all-features` writes about 12 GB. The cause is the

@@ -51,7 +51,7 @@ pub fn plan_table(
     // first write that died between staging its data and committing leaves
     // them under the table location with nothing to reference them, and
     // nothing but the orphan scanner will ever reclaim them.
-    if health.is_empty() {
+    if health.is_empty() && health.unreadable.is_none() {
         let op = plan_orphan_removal(health, policy, context, now)?;
         return Some(TablePlan {
             table: health.table.clone(),
@@ -62,17 +62,48 @@ pub fn plan_table(
         });
     }
 
-    if let Some(op) = plan_compaction(health, policy, now, &mut notes) {
-        operations.push(op);
-    }
-    if let Some(op) = plan_manifest_rewrite(health, policy, &mut notes) {
-        operations.push(op);
-    }
-    if let Some(op) = plan_expiration(health, policy) {
-        operations.push(op);
-    }
-    if let Some(op) = plan_orphan_removal(health, policy, context, now) {
-        operations.push(op);
+    // A table whose manifests Bergman cannot read — today that means an
+    // encrypted one ([`crate::health::unreadable_reason`]). Everything that
+    // needs a manifest is refused here, by name and once, rather than failing
+    // on an Avro parse error every cycle with `bergman plan` unable to say why.
+    //
+    // Snapshot expiration is deliberately *not* refused: upstream's action
+    // works from `metadata.json` alone, so a table nobody can otherwise
+    // maintain still has its history bounded — which is the most common
+    // Iceberg health problem there is. Its file-cleanup half does need
+    // reachability, and `crate::ops::expire` skips exactly that half and says
+    // so.
+    if let Some(reason) = &health.unreadable {
+        notes.push(format!(
+            "{reason}. Compaction, manifest rewriting and orphan removal are refused; \
+             snapshot expiration still runs, metadata-only"
+        ));
+        if let Some(op) = plan_expiration(health, policy) {
+            operations.push(op);
+        }
+        if operations.is_empty() {
+            // Still worth a plan entry: the note is the whole point.
+            return Some(TablePlan {
+                table: health.table.clone(),
+                health: health.clone(),
+                policy: Box::new(policy.clone()),
+                operations,
+                notes,
+            });
+        }
+    } else {
+        if let Some(op) = plan_compaction(health, policy, now, &mut notes) {
+            operations.push(op);
+        }
+        if let Some(op) = plan_manifest_rewrite(health, policy, &mut notes) {
+            operations.push(op);
+        }
+        if let Some(op) = plan_expiration(health, policy) {
+            operations.push(op);
+        }
+        if let Some(op) = plan_orphan_removal(health, policy, context, now) {
+            operations.push(op);
+        }
     }
 
     if operations.is_empty() && notes.is_empty() {
@@ -110,6 +141,21 @@ fn plan_compaction(
     if let Some(reason) = crate::commit::authoring_refusal(health.format_version) {
         notes.push(format!("compaction is enabled but cannot run: {reason}"));
         return None;
+    }
+
+    // The table asked for hashed file paths and a rewrite will not produce them.
+    // Not a refusal — every output path is recorded in the metadata and the
+    // table reads correctly — but not silent either: repeated compaction moves
+    // a hot table's objects into one S3 prefix, which is the throttling the
+    // property exists to avoid. Stated once per plan rather than per file.
+    if health.object_storage_layout {
+        notes.push(
+            "the table sets write.object-storage.enabled, and Bergman's writer does not \
+             produce the hashed layout: rewritten files land under the plain data path. \
+             The table stays correct — every path is in the metadata — but repeated \
+             compaction concentrates its objects in one prefix"
+                .to_string(),
+        );
     }
 
     // Bergman reads and writes only Parquet, so a table asking for anything
@@ -482,6 +528,8 @@ mod tests {
             manifests: ManifestHealth::default(),
             files,
             partitions,
+            object_storage_layout: false,
+            unreadable: None,
         }
     }
 
@@ -974,6 +1022,126 @@ mod tests {
             plan.notes[0].contains("format v3"),
             "got: {}",
             plan.notes[0]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_table_keeps_only_the_operation_that_needs_no_manifest() {
+        // The guarded half of the pair. An encrypted table's manifests cannot
+        // be read, so compaction, manifest rewriting and orphan removal are all
+        // refused — but expiration works from `metadata.json` alone and is the
+        // one thing that still bounds a table nobody can otherwise maintain.
+        let policy = effective(UNREADABLE_POLICY);
+        let mut health = health_with(
+            vec![partition("d=1", &[10; 10], 100, 0, 0)],
+            snapshots(10, Duration::from_secs(30 * 86400)),
+        );
+        health.unreadable = Some("encrypted".into());
+
+        let plan = plan_table(&health, &policy, PlanContext::default(), Utc::now()).unwrap();
+        assert_eq!(
+            plan.operations.iter().map(|op| op.kind).collect::<Vec<_>>(),
+            vec![OperationKind::ExpireSnapshots],
+            "only the metadata-only operation may survive an unreadable table"
+        );
+        assert!(
+            plan.notes.iter().any(|n| n.contains("refused")),
+            "the refusal must be stated, not merely acted on: {:?}",
+            plan.notes
+        );
+    }
+
+    #[test]
+    fn the_same_table_read_normally_gets_everything() {
+        // The control. Identical health with `unreadable` cleared must plan the
+        // operations the test above asserts are absent — otherwise that test
+        // would pass just as happily against a fixture that never triggered
+        // anything, which is the failure mode a guarded-only test has.
+        let policy = effective(UNREADABLE_POLICY);
+        let health = health_with(
+            vec![partition("d=1", &[10; 10], 100, 0, 0)],
+            snapshots(10, Duration::from_secs(30 * 86400)),
+        );
+        assert!(health.unreadable.is_none());
+
+        let plan = plan_table(&health, &policy, PlanContext::default(), Utc::now()).unwrap();
+        let kinds: Vec<_> = plan.operations.iter().map(|op| op.kind).collect();
+        assert!(
+            kinds.contains(&OperationKind::Compact),
+            "the fixture must be one compaction would otherwise run on: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&OperationKind::RemoveOrphans),
+            "and one orphan removal would otherwise run on: {kinds:?}"
+        );
+    }
+
+    /// A policy that turns on everything an unreadable table must lose, so the
+    /// pair above compares like with like.
+    const UNREADABLE_POLICY: &str = r#"
+        [[rules]]
+        match = "prod.db.t"
+        [rules.compaction]
+        enabled = true
+        [rules.compaction.trigger]
+        small_file_ratio = 0.1
+        min_input_files = 2
+        [rules.snapshots]
+        max_age = "7d"
+        min_to_keep = 1
+        [rules.orphans]
+        enabled = true
+        older_than = "7d"
+        "#;
+
+    #[test]
+    fn a_hashed_layout_the_rewrite_will_not_reproduce_is_reported() {
+        // Not a refusal — the table stays correct and every path is in its
+        // metadata — but not silent either, which is the whole of principle 6.
+        let policy = effective(COMPACT_ON);
+        let mut health = health_with(
+            vec![partition("d=1", &[10, 10, 10, 10, 10, 10], 100, 0, 0)],
+            snapshots(1, Duration::from_secs(60)),
+        );
+        health.object_storage_layout = true;
+
+        let plan = plan_table(&health, &policy, PlanContext::default(), Utc::now()).unwrap();
+        assert!(
+            plan.notes
+                .iter()
+                .any(|n| n.contains("write.object-storage.enabled")),
+            "the deviation must be named: {:?}",
+            plan.notes
+        );
+        // And compaction still runs: a prefix layout is not worth declining to
+        // maintain a table over.
+        assert!(
+            plan.operations
+                .iter()
+                .any(|op| op.kind == OperationKind::Compact)
+        );
+    }
+
+    #[test]
+    fn a_table_that_asked_for_no_hashed_layout_gets_no_note() {
+        // The control. Without it the test above passes against a planner that
+        // emits the note unconditionally, which would put a paragraph on every
+        // plan of every table and train operators to skip the notes.
+        let policy = effective(COMPACT_ON);
+        let health = health_with(
+            vec![partition("d=1", &[10, 10, 10, 10, 10, 10], 100, 0, 0)],
+            snapshots(1, Duration::from_secs(60)),
+        );
+        assert!(!health.object_storage_layout);
+
+        let plan = plan_table(&health, &policy, PlanContext::default(), Utc::now()).unwrap();
+        assert!(
+            !plan
+                .notes
+                .iter()
+                .any(|n| n.contains("write.object-storage.enabled")),
+            "got: {:?}",
+            plan.notes
         );
     }
 

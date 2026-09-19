@@ -14,25 +14,41 @@ Bergman is pre-release. All four maintenance operations execute.
 | Manifest rewrite | Bergman's commit layer |
 | Compaction | Upstream's scan and writers, `DataFusion`, Bergman's commit layer |
 
-## Limits
+## What it will not do {#limits}
 
-What Bergman declines to do, and says so rather than guessing. Every one of
-these appears in `bergman plan` and in the run report with its reason, not only
-in a log line — a table whose configured maintenance can never apply must not
-read as a healthy one:
+Every one of these appears in `bergman plan` and in the run report with its
+reason — a table whose configured maintenance can never apply must not read as a
+healthy one.
+
+**Refused, with the reason named per table and per operation:**
 
 | | |
 |---|---|
-| **Rewriting a format v3 table** | Two independent gaps, both upstream. **Row lineage**: `_row_id` must be projected out of the scan and written back, which upstream does not offer, and the snapshot would lack `first-row-id`, which the spec requires in v3. **Deletion vectors**: v3 encodes position deletes as Puffin blobs and the released `iceberg-rust` has no decoder, so a rewrite could not see the deletes it must apply. Expiration and orphan removal still run — and on v3 orphan removal is the *only* thing that reclaims superseded deletion-vector space. See [Compaction](@/docs/compaction.md#format-v3) |
-| **Anything but Parquet** | Upstream's reader opens a Parquet stream whatever a scan task's format says, and the writer is `ParquetWriterBuilder` — so it is a refusal in both directions, per table *and* per file |
-| **Rewriting across a partition-spec change** | Output goes out under the current spec; a commit claiming it replaces files partitioned differently would mis-file every row |
-| **Catalogs other than REST** | Each additional protocol is a second commit path to keep correct |
-| **Z-order clustering** | Global sort within a file group works; space-filling curves are an optimization rather than table health |
-| **`OpenTelemetry` export** | The library emits `tracing`; a subscriber in your process exports it today |
+| **Rewriting a format v3 table** | Row lineage cannot be preserved through a rewrite, and deletion vectors cannot be read. Expiration and orphan removal still run — see [Compaction](@/docs/compaction.md#format-v3) |
+| **Rewriting or scanning an encrypted table** | `encryption.key-id` encrypts the manifests and manifest lists Bergman reads. Snapshot expiration still runs; it needs no manifest |
+| **Anything but Parquet** | Refused per table *and* per file, since a table can hold files in a format it no longer writes |
+| **Rewriting across a partition-spec change** | Output goes out under the current spec; claiming it replaces files partitioned differently would mis-file every row |
+| **Any branch but `main`** | A commit moving `main` to a snapshot descending from something else is not maintenance |
+
+**Reported, not refused:** a table setting `write.object-storage.enabled` gets
+rewritten files under the plain data path. The table stays correct — every path
+is in its metadata — but repeated compaction concentrates its objects in one
+prefix, so the plan says so once per table.
+
+**Out of scope by design:**
+
+| | |
+|---|---|
+| **Catalogs other than REST** | Each protocol is a second commit path to keep correct |
+| **Z-order and Hilbert clustering** | Global sort within a file group works; space-filling curves are an optimization rather than table health |
+| **`OpenTelemetry` export** | The library emits `tracing`; a subscriber in your process exports it |
 | **A NATS or Kafka client** | Notifications arrive over HTTP and the bridge is yours — see [Operating](@/docs/operating.md#reacting-to-commits) |
-| **Rewriting position delete files** | Java has an action of its own for coalescing small live position deletes. Bergman retires them the expensive way, as a side effect of compaction, and removes the ones that apply to nothing. The middle case needs a reader and writer for a file type Bergman otherwise never writes |
-| **Stamping `sort_order_id` on rewritten files** | Output is clustered and its bounds are tight, but the file does not advertise *which* order it satisfies. No upstream writer path sets it, and rebuilding the `DataFile` by hand to add it would silently drop whatever upstream adds next |
-| **Rewriting into a different partition spec** | Java exposes it as `outputSpecId`. It is how a table is *migrated* to a new spec — which changes what the table is, not how it is laid out, so a maintenance run must never do it by accident |
+| **Rewriting into a different partition spec** | Java exposes it as `outputSpecId`. It changes what a table *is*, so a maintenance run must never do it by accident |
+| **SQL, BI or any query API** | Bergman writes tables; it does not answer questions about their contents |
+
+A refusal is never a partial result. Every manifest walk is all-or-nothing — one
+unreadable manifest aborts the computation rather than returning a short set — so
+nothing is deleted on the strength of a table only partly read.
 
 Scale out by running replicas with disjoint `[[rules]]` or disjoint catalog
 `namespaces`; optimistic commits already make overlap safe.

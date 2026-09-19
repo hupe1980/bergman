@@ -267,6 +267,26 @@ max_parallel_tables = 4
 # by hitting it: what is withheld is reported and reclaimed by the next pass.
 max_deletes_per_run = 100000
 
+# How many object-store requests one operation keeps in flight.
+#
+# Bounds the two things that are latency-bound rather than CPU-bound — reading a
+# table's manifests, and deleting files — so the useful number is far above the
+# core count and has nothing to do with it. Raise it against object storage that
+# tolerates it; lower it when Bergman is embedded in a service whose HTTP
+# connection pool it shares.
+io_concurrency = 32
+
+# How many CPU threads one file group's rewrite may use: the `target_partitions`
+# of the DataFusion plan that applies equality deletes and sorts.
+#
+# Commented out means the machine's available parallelism, which is the right
+# default. Set it to 1 in a container pinned to one core, or where maintenance
+# must stay out of a co-tenant's way. It does not change the memory ceiling —
+# `compaction.max_sort_memory` does, and the spill pool is shared across threads,
+# so more threads means more spilling under pressure rather than more resident
+# bytes.
+# compaction_parallelism = 8
+
 # Only begin work inside this window. A cycle already under way runs to
 # completion — stopping mid-rewrite would leave files written and uncommitted.
 #

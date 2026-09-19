@@ -174,9 +174,33 @@ would make the other a line that does nothing.
 max_parallel_tables       = 4
 max_rewrite_bytes_per_run = 536870912000   # 500 GiB
 max_deletes_per_run       = 100000         # blast-radius ceiling, every deleter
+io_concurrency            = 32             # object-store requests in flight
+# compaction_parallelism  = 8              # CPU threads per group; omit for auto
 maintenance_window        = "22:00-06:00 Europe/Berlin"
 operation_timeout         = "1h"           # optional; bounds unbounded waiting
 ```
+
+### Two units, deliberately
+
+`io_concurrency` and `compaction_parallelism` look alike and bound different
+things, which is why they are separate rather than one "parallelism" knob.
+
+`io_concurrency` bounds what is **latency-bound**: reading a table's manifests,
+and deleting files. Both are dominated by per-request round trips against object
+storage, so the useful number is far above the core count and has nothing to do
+with it. The manifest walk is two flat phases rather than a nested fan-out, so
+this is the number of outstanding requests and not a factor in one. Lower it when
+Bergman is embedded in a service whose HTTP connection pool it shares.
+
+`compaction_parallelism` bounds what is **CPU-bound**: the `target_partitions` of
+the DataFusion plan that applies equality deletes and sorts a file group. Absent
+means the machine's available parallelism. Set it to `1` in a container pinned to
+one core, or where maintenance must stay out of a co-tenant's way.
+
+Raising `compaction_parallelism` does **not** raise the memory ceiling.
+`compaction.max_sort_memory` does, and the spill pool is per session and shared
+across threads — so more threads means more spilling under pressure rather than
+more resident bytes.
 
 `max_deletes_per_run` caps how many files any single operation may delete —
 [orphan removal](@/docs/orphans.md) and

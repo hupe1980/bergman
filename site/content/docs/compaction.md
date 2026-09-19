@@ -329,6 +329,15 @@ max_sort_memory = 2147483648   # 2 GiB; defaults to 1 GiB
 `max_sort_memory` is the executor's memory pool. The sort and the join's build
 side spill to disk when they reach it, so no group is too large to sort.
 
+The plan runs at `limits.compaction_parallelism` threads, defaulting to the
+machine's available parallelism. That is a separate knob from the memory pool on
+purpose: the pool is per *session* and shared across threads, so widening the
+plan makes it spill sooner rather than hold more. Groups within a table commit
+sequentially by construction — each is offered against the snapshot the last one
+produced — so without this a single table's rewrite would use one core however
+large the host, and a table with one hot partition is exactly the table that
+needs compacting.
+
 DataFusion sits behind the default-on `compaction` feature and adds ~70 crates
 to a tree that already carries Arrow, Parquet and tokio — it resolves to the
 same `arrow` 58 that `iceberg` 0.10 pins, so batches pass with no conversion.
@@ -441,95 +450,60 @@ fragmented table as healthy.
 
 ## Format v3 {#format-v3}
 
-Bergman rewrites v1 and v2 tables. A **v3** table is refused, with a reason —
-and the reason is a gap, not an impossibility. There are **two** independent gaps,
-and both must close before a v3 table can be rewritten. Tracking them as one is
-how a half-fix ships looking complete.
+Bergman rewrites v1 and v2 tables. A **v3** table's rewrite is refused, with the
+reason in the plan. Two things block it independently, and both must close:
 
-### Gap 1: row lineage
+- **Row lineage.** A rewrite must copy each row's existing `_row_id` into the file
+  replacing it. Bin-packing moves rows between files, so the new file's positional
+  inheritance would give them different ids — preserving them means writing a
+  physical column, which no released writer supports.
+- **Deletion vectors.** v3 encodes position deletes as `deletion-vector-v1` Puffin
+  blobs, and the released reader has no decoder for them, so a rewrite could not
+  see the deletes it must apply.
 
-Compaction of a v3 table is perfectly possible while spec-compliant. The spec
-says how: when a row moves to a different data file, its existing `_row_id`
-"must be copied into the new data file", and its `_last_updated_sequence_number`
-with it if the row was not modified. Iceberg's Java implementation does this —
-Spark since 1.10.0 ([#13555](https://github.com/apache/iceberg/pull/13555)),
-Flink since [#14149](https://github.com/apache/iceberg/pull/14149).
+### Why refusing beats trying
 
-What Bergman lacks is the capability, and the gap is in the *read* path.
-`iceberg-rust` reserves the field ids but populates nothing: the reader resolves
-a projected id against the table schema, so `_row_id` fails with "field not
-found" even when the column is there, and `FileScanTask` carries neither the
-file's `first_row_id` nor its data sequence number, so the inherited values
-cannot be computed either.
+Because the alternative fails silently. Without a physical `_row_id`, readers
+fall back to inheritance and **every row the rewrite touched is renumbered** — a
+`MERGE` or a CDC consumer joining on row id starts matching the wrong rows, and
+nothing fails. A rewrite that could not see a table's deletion vectors would
+write the rows they hide straight back in, and they would stay.
 
-Hand-rolling it meanwhile would mean replacing both ends — upstream's reader, to
-recover `_pos` through a positional-delete row selection, and its
-`ParquetWriter`, whose `DataFile` output carries column sizes, value counts and
-per-column bounds Bergman would then have to compute itself. That is a fork in
-all but name. The upstream fix is far smaller: two fields on `FileScanTask`, and
-reader and writer support for two field ids the crate has already reserved.
-
-It refuses, because the alternative fails silently. Three things go wrong:
-
-1. Without the projection, output files carry no `_row_id`, so readers fall
-   back to inheritance — `first_row_id + _pos` of the *new* file. Every row the
-   rewrite touched is **renumbered**, and a `MERGE` or a CDC consumer joining on
-   row id starts matching the wrong rows, with nothing failing.
-2. A manifest holding *existing* files, written fresh, has no `first-row-id` of
-   its own, so the manifest-list writer assigns it a new range — moving files
-   that were never rewritten to row ids they never had.
-3. The snapshot would be **invalid**. The spec lists `first-row-id` and
-   `added-rows` as *required* fields of a v3 snapshot — "required even if a
-   commit does not assign any ID space". `iceberg-rust` enforces it, so such a
-   commit is refused outright by any catalog applying updates through it.
-
-### Gap 2: deletion vectors
-
-v3 replaces position delete *files* with **deletion vectors** — Roaring bitmaps
-stored as `deletion-vector-v1` blobs inside Puffin files. The released
-`iceberg-rust` has no Puffin decoder at all, so a deletion vector reaches the
-scan as a position-delete task and is opened as Parquet, which fails.
-
-It fails **loudly**, which is the safe outcome: a scan that silently ignored the
-deletes would hand a rewrite rows that are supposed to be gone, and the rewritten
-table would have them back for good.
-
-Both gaps are upstream's to close, and neither is closed in the released crate.
-
-### One rule that outlives the refusal
-
-A deletion vector is a *blob at an offset* inside a Puffin file, and one Puffin
-file may hold the vectors of many data files. The spec is explicit that a writer
-removing a data file must drop that file's vector **from the delete manifest**,
-and is *not* required to rewrite the Puffin file.
-
-So retiring a deletion vector removes a manifest entry — never a file. Bergman
-identifies files by `(path, offset)` rather than by path precisely so that
-removing one vector cannot match a live sibling sharing its container. Deleting
-the container is a separate question with a different answer: it becomes garbage
-only when *nothing* references it any more, which is the orphan scanner's job.
-
-This also means **orphan removal matters more on v3, not less**. Superseded
-vectors accumulate inside live Puffin files that nobody rewrites, and reclaiming
-that space is something only an orphan scan ever does.
+So the refusal sits above the commit layer rather than relying on a catalog to
+reject the result.
 
 ### What still runs
 
-The refusal is scoped to what Bergman authors itself, so it covers compaction,
-dangling-delete removal and manifest rewriting. **Snapshot expiration and orphan
-removal still run** — the first is upstream's own action and the second commits
-nothing — so a v3 table's history stays bounded and its storage still gets
-reclaimed.
+The refusal covers what Bergman authors itself: compaction, dangling-delete
+removal and manifest rewriting. **Snapshot expiration and orphan removal still
+run** — the first is upstream's own action, the second commits nothing — so a v3
+table's history stays bounded and its storage still gets reclaimed.
 
 ```text
 prod.streaming.events
   rule: prod.streaming.*
-  note: compaction is enabled but cannot run: the table is Iceberg format v3,
-        whose row lineage Bergman cannot yet preserve through a rewrite;
-        snapshot expiration and orphan removal still run
+  note: compaction is enabled but cannot run: the table is Iceberg format v3, and
+        Bergman cannot yet rewrite one for two independent reasons: its row lineage
+        cannot be preserved through a rewrite (the `_row_id` of every moved row must
+        be written back as a physical column, which no released writer supports), and
+        its deletion vectors cannot be read at all (the released crate has no
+        `deletion-vector-v1` decoder), so a rewrite would resurrect every row they
+        hide. Snapshot expiration and orphan removal still run
   -> expire-snapshots
      why: oldest snapshot is 30d old (> 7d), 41 snapshots retained (keeping at least 3)
 ```
+
+### A deletion vector is not a file
+
+One Puffin file holds the vectors of many data files, and the spec requires a
+writer removing a data file to drop that file's vector **from the delete
+manifest** — not to rewrite the Puffin file. So retiring a vector removes a
+manifest entry, never a file: Bergman identifies files by `(path, offset)` so that
+removing one vector cannot match a live sibling sharing its container.
+
+This is why **orphan removal matters more on v3, not less**. Superseded vectors
+accumulate inside live Puffin files that nobody rewrites, and an orphan scan is
+the only thing that ever reclaims that space.
 
 ## Sort-based clustering
 
@@ -617,4 +591,19 @@ other writer:
 | `write.parquet.compression-level` | Codec level, where the codec has one |
 | `write.parquet.row-group-size-bytes` | Row-group size |
 | `write.parquet.page-size-bytes` | Data page size |
+| `write.parquet.page-row-limit` | Rows per data page |
+| `write.parquet.dict-size-bytes` | Dictionary page size |
+| `write.parquet.bloom-filter-enabled.column.<col>` | Per-column bloom filters |
+| `write.parquet.bloom-filter-fpp.column.<col>` | Their false-positive probability |
 | `write.target-file-size-bytes` | The size output files roll at |
+| `write.data.path` | Where data files go |
+| `write.metadata.path` | Where manifests and manifest lists go |
+| *its `sort-order`* | The clustering a rewrite reproduces — see [Sort-based clustering](#sort-based-clustering) |
+
+A malformed value falls back to the default rather than failing the rewrite: a
+table property somebody typed wrong should not take a table out of maintenance.
+
+**The one opinion a rewrite cannot reproduce is the hashed object-storage
+layout** (`write.object-storage.enabled`): rewritten files land under the plain
+data path, and `bergman plan` says so once per table rather than leaving it
+silent — see [Status](@/docs/status.md#limits).

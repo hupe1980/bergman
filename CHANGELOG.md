@@ -5,6 +5,58 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 Bergman is pre-1.0: **breaking changes land in minor versions**, each with a migration note.
 
+## [0.3.0] — 2026-09-18
+
+**Breaking:** `[limits]` gained two optional keys, `TableHealth` gained a field, and
+`health::analyze`, `health::file_index`, `reachability::compute` and `ops::delete` take a
+concurrency argument. A `bergman.toml` written for 0.2.0 parses unchanged.
+
+### Added
+
+- **Encrypted tables are refused by name, per operation.** Iceberg native encryption
+  (`encryption.key-id`) encrypts a table's manifests and manifest lists, which Bergman cannot
+  read, so compaction, manifest rewriting and orphan removal are refused with that reason in
+  `bergman plan`. Snapshot expiration still runs — it needs no manifest — with its file-cleanup
+  half skipped and reported.
+- **`limits.compaction_parallelism`** — CPU threads for one file group's rewrite. Absent means
+  the machine's available parallelism.
+- **`limits.io_concurrency`** (default 32) — object-store requests in flight per operation,
+  covering manifest reads and deletions.
+
+### Changed
+
+- **Compaction uses every core.** The executor ran on a single DataFusion partition, so one
+  table's rewrite used one core whatever the host had. Memory is unaffected: the spill pool is
+  per session, not per partition.
+- **The Parquet reader is tuned for object storage** — a 64 KiB footer size hint removes a round
+  trip per file, and data-file concurrency follows `io_concurrency` rather than the core count.
+- **Manifests shared between snapshots are read once.** The reachability walk re-read the whole
+  history once per snapshot.
+- **The v3 refusal names both of its reasons**, row lineage and deletion vectors, rather than
+  only the first.
+
+### Fixed
+
+- **`write.metadata.path` was ignored**, so manifests and manifest lists were written to
+  `<location>/metadata` whatever the table said — and failed with no useful error where that
+  prefix is not writable.
+- **Bloom filters and dictionary settings were dropped on rewrite.**
+  `write.parquet.bloom-filter-enabled.column.*`, `-fpp.column.*`, `dict-size-bytes` and
+  `page-row-limit` are honoured now, as the other `write.parquet.*` settings already were.
+- **`write.object-storage.enabled` is reported rather than silently ignored.** Bergman cannot
+  produce the hashed layout, so repeated compaction concentrates a table's objects in one
+  prefix; `bergman plan` now says so once per table.
+- **The format v3 writer paths returned invalid snapshots if reached.** They are explicit errors
+  now, so lifting the v3 refusal cannot accidentally enable a writer that renumbers rows.
+- **Two panics became errors:** a poisoned ledger mutex in the daemon, and a format v1 table
+  carrying delete files.
+
+### Security
+
+- **rustls 0.23.43 → 0.23.45** ([RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285)):
+  TLS 1.3 handshake messages accepted across encryption-level boundaries. On the path of every
+  catalog commit and object-store request.
+
 ## [0.2.0] — 2026-09-13
 
 A correctness release. Four defects were found by auditing the implementation
@@ -52,6 +104,24 @@ orphan checks are load-bearing. Three of the five were silent.
 
 ### Changed
 
+- **The release pipeline is ordered by increasing irreversibility** and runs
+  strictly serially: verify → binaries → image → crates.io → GitHub release. A
+  crates.io version is permanent even after a yank, while a GHCR tag and a
+  GitHub release can be deleted, so the step that cannot be undone runs after
+  everything that can still fail has not. Previously the GitHub release ran
+  beside the image and the publish, so it could announce a version whose image
+  push had failed and whose crate never published.
+- **The release workflow now verifies the tagged commit.** `ci.yml` runs on
+  branches and pull requests, not tags, so nothing checked what a tag actually
+  pointed at before publishing it. Releases now run the suite, the lints and
+  `cargo package` first.
+- **`workflow_dispatch` is a true rehearsal.** It skipped the container push but
+  still ran `cargo publish` when dispatched against a tag — skipping the
+  reversible artefact and performing the irreversible one. It now publishes
+  nothing.
+- **The container `latest` tag works.** It was gated on `is_default_branch`,
+  which is never true in a tag-triggered workflow, so `latest` was never
+  applied. It now follows the tag, and is withheld from pre-releases.
 - **Breaking:** `RewriteFiles::removed` is `Vec<FileRef>` rather than
   `Vec<String>`, and `SnapshotProducer::dangling_delete_files` returns
   `Vec<FileRef>`. *Migration:* wrap paths with `FileRef::path(p)`. A `FileRef`
@@ -68,5 +138,6 @@ Initial release. Table health analysis, snapshot expiration with file cleanup,
 orphan-file removal, manifest rewriting, and compaction with delete-file
 application — as one crate, one binary, and a library, on `iceberg-rust`.
 
+[0.3.0]: https://github.com/hupe1980/bergman/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/hupe1980/bergman/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/hupe1980/bergman/releases/tag/v0.1.0

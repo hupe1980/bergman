@@ -123,8 +123,12 @@ signal handler, and reads no configuration file on its own initiative. It emits
 [`tracing`](https://docs.rs/tracing) spans and events; what listens is yours.
 
 **Bring your own runtime.** Every entry point is a plain `async fn` on the
-caller's runtime. Concurrency limits are parameters (`limits.max_parallel_tables`),
-never process-wide statics.
+caller's runtime. Every concurrency limit is a parameter, never a constant
+compiled in: `limits.max_parallel_tables` bounds tables in flight,
+`limits.io_concurrency` bounds object-store requests per operation (manifest
+reads and deletions), and `limits.compaction_parallelism` bounds the CPU width of
+a rewrite. An embedder sharing an HTTP connection pool with the rest of a service
+has to be able to say how much of it maintenance may take.
 
 **No background threads, including for credentials.** Nothing is renewed on a
 timer Bergman owns. `refresh_credentials()` is a method you call — see
