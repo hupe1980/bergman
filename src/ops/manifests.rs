@@ -105,11 +105,6 @@ async fn attempt_rewrite(
 
     let retention = BranchRetention::load(table).await?;
     let producer = SnapshotProducer::new(table, retention);
-    // Before any manifest is read, let alone written: a rewrite Bergman cannot
-    // commit should cost a metadata lookup, not a full pass over the table's
-    // manifest set followed by a refusal.
-    producer.check_authorable()?;
-
     let snapshot_id = producer.snapshot_id();
     let loaded = producer.load_manifests(parent).await?;
 
@@ -332,13 +327,11 @@ async fn write_packed(
             (ManifestKind::Data, FormatVersion::V1) => builder.build_v1(),
             (ManifestKind::Data, FormatVersion::V2) => builder.build_v2_data(),
             (ManifestKind::Deletes, FormatVersion::V2) => builder.build_v2_deletes(),
-            // See `crate::commit::v3_writer_unimplemented`. Refused above by
-            // `check_authorable`; an error rather than `build_v3_*` so that
-            // lifting that refusal cannot quietly enable a writer that drops
-            // row lineage.
-            (_, FormatVersion::V3) => {
-                return Err(crate::commit::v3_writer_unimplemented(table.identifier()));
-            }
+            // Entries carry their materialized `first_row_id` (see
+            // `crate::catalog::read`), so the fresh range the manifest list
+            // assigns this manifest renumbers none of their rows.
+            (ManifestKind::Data, FormatVersion::V3) => builder.build_v3_data(),
+            (ManifestKind::Deletes, FormatVersion::V3) => builder.build_v3_deletes(),
             // A v1 table cannot hold delete files; checked above, and an error
             // rather than a panic because this is somebody else's metadata.
             (ManifestKind::Deletes, FormatVersion::V1) => {

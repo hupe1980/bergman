@@ -1,6 +1,6 @@
 [package]
 name = "bergman"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 authors = ["hupe1980"]
 description = "A Rust-native maintenance engine for Apache Iceberg — policy-driven compaction, snapshot expiration, and orphan cleanup with no JVM"
@@ -10,45 +10,21 @@ categories = ["database", "command-line-utilities"]
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/hupe1980/bergman"
 homepage = "https://hupe1980.github.io/bergman/"
-# The floor the dependency tree imposes, not an aspiration: `iceberg` 0.10.1
-# declares 1.94. `just msrv` checks this against a real toolchain rather than
-# trusting the number.
-rust-version = "1.94"
 
+# The floor `iceberg` 0.11.0 declares; `just msrv` checks it.
+rust-version = "1.95"
+
+# Optional dependencies are `dep:` so the feature surface is exactly this list.
+# Embedders take `default-features = false` and add what they use.
 [features]
-# Optional dependencies are referenced as `dep:name`. Without the prefix Cargo
-# implicitly exposes each optional dependency as a public feature of the same
-# name, so `--features clap` would be a supported knob we never intended and
-# could not later rename. `dep:` keeps the feature surface exactly this list.
-#
-# Embedders take `default-features = false` and add only the backends they use;
-# the library core has no CLI, no catalog client and no cloud object store.
 default = ["cli", "catalog-rest", "compaction", "storage-all"]
 
-# Compaction: rewriting data files with their delete files applied.
-#
-# This is the one operation that reads and writes *data*, and it is the only
-# one that needs a query engine. The reason is equality deletes: applying them
-# is an anti-join, and upstream's reader does it by building one predicate term
-# per delete row and evaluating that tree against every record batch — work
-# proportional to `data rows × delete rows`. DataFusion does it as a hash
-# anti-join, which is proportional to their sum, and spills.
-#
-# The feature gates the *operation*, never a second implementation of it: a
-# build without it has no compaction rather than a slower compaction, so there
-# is only ever one executor to keep correct.
-#
-# Metadata-only maintenance — expiration, manifest rewriting, orphan removal —
-# needs none of this. An embedder that wants only those takes
-# `default-features = false` and carries no query engine at all.
+# The only operation that reads and writes data. DataFusion applies equality
+# deletes as a hash anti-join; without the feature there is no compaction.
 compaction = ["dep:datafusion"]
 
-# Command-line interface. Gates the binary (see `[[bin]]`), the terminal
-# rendering, and process-level concerns the library deliberately does not own:
-# logging initialization, config file discovery, exit codes.
-# `tokio/signal` belongs here rather than in the base dependency: only the
-# daemon listens for SIGTERM, and a library that installed a signal handler
-# would be taking over its host's process.
+# The binary, terminal output and process concerns (logging, signals) the
+# library leaves to its host.
 cli = [
     "dep:clap",
     "dep:tracing-subscriber",
@@ -57,24 +33,17 @@ cli = [
     "tokio/signal",
 ]
 
-# Iceberg REST catalog client. The only catalog protocol that reaches every
-# implementation Bergman targets (Rustberg, Polaris, Lakekeeper, Nessie, Unity).
+# The Iceberg REST catalog client.
 catalog-rest = ["dep:iceberg-catalog-rest"]
 
-# Cloud object stores for table data and metadata. The local filesystem and
-# in-memory backends are always available, which is what keeps the test suite
-# free of containers.
-#
-# Each switches the backend on in both clients: `iceberg-storage-opendal` for
-# the reads and writes the catalog drives, and `opendal` directly for the
-# listing orphan removal needs. Enabling only one of the pair would produce a
-# build that can read a table it cannot scan for orphans.
+# Each backend switches on in both clients: `iceberg-storage-opendal` for reads
+# and writes, `opendal` for the listing orphan removal needs.
 storage-s3 = ["iceberg-storage-opendal/opendal-s3", "opendal/services-s3"]
 storage-gcs = ["iceberg-storage-opendal/opendal-gcs", "opendal/services-gcs"]
 storage-azure = ["iceberg-storage-opendal/opendal-azdls", "opendal/services-azdls"]
 storage-all = ["storage-s3", "storage-gcs", "storage-azure"]
 
-# Prometheus metrics, and the endpoint that serves them in daemon mode.
+# Prometheus metrics, and the `/metrics`, `/health` and `/events` endpoint.
 metrics = ["dep:prometheus-client", "dep:axum"]
 
 [[bin]]
@@ -87,162 +56,100 @@ name = "bergman"
 path = "src/lib.rs"
 
 [dependencies]
-# Core async runtime. The library takes the caller's runtime and spawns onto
-# it; only the binary constructs one.
+
+# The library runs on the caller's runtime; only the binary builds one.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 async-trait = "0.1"
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 
-# Iceberg. 0.10 split storage backends out of the core crate: `iceberg` itself
-# ships only the local-filesystem and in-memory backends, and cloud object
-# stores come from `iceberg-storage-opendal`. That split is what lets this
-# build stay rustls-only.
-iceberg = "0.10"
-iceberg-catalog-rest = { version = "0.10", optional = true }
-iceberg-storage-opendal = { version = "0.10", default-features = false, features = [
+# Iceberg. Cloud object stores come from `iceberg-storage-opendal`, which keeps
+# the build rustls-only.
+iceberg = "0.11"
+iceberg-catalog-rest = { version = "0.11", optional = true }
+iceberg-storage-opendal = { version = "0.11", default-features = false, features = [
     "opendal-memory",
     "opendal-fs",
 ] }
 
-# Object listing, which `iceberg::io::FileIO` does not offer: its `Storage`
-# trait has read, write, delete and delete_prefix, but no `list`. Orphan-file
-# removal is *defined* by listing storage and subtracting what metadata
-# reaches, so Bergman owns that layer until upstream grows one. Pinned to the
-# same version `iceberg-storage-opendal` uses so the tree holds one copy and
-# the credentials Iceberg properties describe reach the same client.
-opendal = { version = "0.57", default-features = false, features = [
+# Object listing, which `FileIO` lacks. The same version `iceberg-storage-opendal`
+# uses, so the tree holds one copy.
+opendal = { version = "0.58", default-features = false, features = [
     "services-memory",
     "services-fs",
 ] }
 
-# The commit layer talks the Iceberg REST protocol directly (see `src/commit`),
-# so it needs its own HTTP client rather than reaching through a catalog client
-# that cannot express the commit. rustls only: a native-tls dependency would
-# make the static musl build stop being static.
-#
-# `form` is for the OAuth2 client-credentials exchange, which the specification
-# defines as a form post — the same exchange `iceberg-catalog-rest` performs, so
-# that both clients authenticate from one configuration.
+# Bergman's own REST client for commits and the OAuth2 exchange. rustls only, so
+# the musl build stays static.
 reqwest = { version = "0.13", default-features = false, features = [
     "rustls",
     "json",
     "form",
 ] }
 
-# Arrow, for the sort stage of compaction: `lexsort_to_indices` plus `take`
-# over the concatenated batches of one file group. Version-matched to what
-# iceberg 0.10 pins, so the tree holds one arrow.
+# Version-matched to `iceberg` so the tree holds one arrow and one parquet.
 arrow = { version = "58", default-features = false }
 
-# Parquet writer properties. Bergman does not encode Parquet itself — the
-# iceberg writer does — but it must express the table's own compression codec,
-# and that vocabulary is parquet's. Version-matched to what iceberg 0.10 uses.
 parquet = "58"
 
-# The compaction executor (optional; see the `compaction` feature).
-#
-# Used for exactly one thing: the merge-on-read anti-join that applies equality
-# deletes, plus the spilling sort that clustering needs. Everything else in the
-# pipeline is still upstream's — `ArrowReader` for the scan (its positional
-# deletes become a Parquet `RowSelection`, so deleted rows are never decoded,
-# which beats a join) and `RollingFileWriter` for the output.
-#
-# DataFusion 54 resolves to the same arrow 58 that `iceberg` 0.10 pins, so
-# record batches pass between them with no conversion and the tree holds one
-# arrow. Its MSRV (1.88) is below the floor `iceberg` already imposes.
+# Equality-delete anti-join and spilling sort (feature `compaction`).
 datafusion = { version = "54", optional = true }
 
-# Serialization. Configuration is TOML, matching the sister project Rustberg;
-# audit records and `--format json` are JSON.
+# TOML configuration; JSON for audit records and `--format json`.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1"
 
-# Table matching. `globset` compiles a pattern once into a matcher rather than
-# re-walking a glob per table, which matters when a rule set meets a catalog of
-# thousands of tables.
+# Table patterns, compiled once.
 globset = "0.4"
 
-# Utilities
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 humantime-serde = "1"
 
-# IANA timezones, for maintenance windows. A window is written in the zone the
-# operator thinks in ("22:00-06:00 Europe/Berlin"), and evaluating it in UTC or
-# in the host's local time would move it when a replica is scheduled elsewhere.
+# Maintenance windows in the operator's time zone.
 chrono-tz = "0.10"
 
-# Cron expressions. Used today to validate a rule's `schedule` at startup, so a
-# malformed expression fails before a cycle runs rather than during one.
+# Validates a rule's `schedule` at startup.
 cron = "0.15"
 
-# Observability. The library emits `tracing` spans and never installs a
-# subscriber; the binary does that.
+# The library emits spans and never installs a subscriber.
 tracing = "0.1"
 
-# Metrics (optional)
 prometheus-client = { version = "0.24", optional = true }
-# Serves `/metrics` and `/health` in daemon mode. `http1` and `tokio` only —
-# no routing extras, no JSON, no tracing layer, because two handlers need none
-# of it.
+
+# The daemon's HTTP endpoints.
 axum = { version = "0.8", default-features = false, features = [
     "http1",
     "tokio",
     "json",
 ], optional = true }
 
-# CLI (optional)
 clap = { version = "4", features = ["derive", "env"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
 comfy-table = { version = "7", optional = true }
-# Parses `--interval 15m`. The policy file already speaks this vocabulary
-# through `humantime-serde`, so the CLI should too.
+
+# Parses `--interval 15m`, the vocabulary the policy file uses.
 humantime = { version = "2", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
-# Drives the metrics router in-process, so the endpoint tests need no socket.
+
+# Drives the HTTP router in-process.
 tower = { version = "0.5", default-features = false, features = ["util"] }
 tempfile = "3"
-# The end-to-end tests build a real Iceberg table on the local filesystem and
-# read it back, which needs the same writer and Arrow stack the library uses.
 async-trait = "0.1"
 futures = { version = "0.3", default-features = false, features = ["std"] }
 uuid = { version = "1", features = ["v4"] }
 
-# Building a format v3 deletion vector by hand, which the fixture does because
-# no released `iceberg-rust` can write one (its `deletion-vector-v1` serializer
-# is still an open PR upstream). Both are already in the tree as transitive
-# dependencies of `iceberg`, so naming them here adds no crate to the build —
-# it only makes them nameable from a test.
-#
-# `roaring`'s `RoaringTreemap::serialize_into` is exactly the "portable" layout
-# the Puffin spec requires: a u64 little-endian bitmap count, then each bitmap
-# keyed by a little-endian u32, ordered by unsigned key because the map behind
-# it is a `BTreeMap`.
+# The test fixture writes v3 deletion vectors by hand, because `iceberg` 0.11.0
+# has no writer for them. Both crates are already in the tree through `iceberg`.
 roaring = "0.11"
-# CRC-32 **IEEE**, which is what the spec's bare "CRC-32" means here — settled
-# against the decoder that will eventually read these blobs, which computes
-# `crc32fast::hash` over the magic and the vector.
 crc32fast = "1"
 
-# Debug info dominates a debug build of this tree, and not by a little: with
-# full `-g`, `cargo test --all-features` writes about 12 GB. The cause is the
-# shape of the crate rather than its size — DataFusion, Arrow, Parquet and
-# aws-lc are all statically linked into the library, the binary, and *each* of
-# the dozen integration-test binaries.
-#
-# That exceeds the free disk on a hosted CI runner, where the failure is
-# genuinely nasty to read: the linker mmaps its output, the filesystem cannot
-# back the pages, and `rust-lld` dies with SIGBUS and an LLVM stack dump that
-# looks like a compiler bug.
-#
-# Line tables keep what a failing test actually needs — file and line in a
-# backtrace — and drop the type and variable information that is the bulk of
-# it. `[profile.test]` inherits this, which is where it matters most. Stepping
-# through in a debugger wants the rest: `CARGO_PROFILE_DEV_DEBUG=full cargo test`.
+# Line tables only: full debug info across DataFusion, Arrow and aws-lc in every
+# test binary outgrows a hosted runner's disk. `CARGO_PROFILE_DEV_DEBUG=full`
+# for a debugger.
 [profile.dev]
 debug = "line-tables-only"
 

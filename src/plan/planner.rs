@@ -95,7 +95,7 @@ pub fn plan_table(
         if let Some(op) = plan_compaction(health, policy, now, &mut notes) {
             operations.push(op);
         }
-        if let Some(op) = plan_manifest_rewrite(health, policy, &mut notes) {
+        if let Some(op) = plan_manifest_rewrite(health, policy) {
             operations.push(op);
         }
         if let Some(op) = plan_expiration(health, policy) {
@@ -133,31 +133,6 @@ fn plan_compaction(
     if !settings.enabled.value {
         return None;
     }
-
-    // A table whose snapshots Bergman cannot author is one compaction can never
-    // run against, however fragmented it is. Saying so once per plan is the
-    // difference between an operator seeing "healthy" forever and seeing the
-    // reason.
-    if let Some(reason) = crate::commit::authoring_refusal(health.format_version) {
-        notes.push(format!("compaction is enabled but cannot run: {reason}"));
-        return None;
-    }
-
-    // The table asked for hashed file paths and a rewrite will not produce them.
-    // Not a refusal — every output path is recorded in the metadata and the
-    // table reads correctly — but not silent either: repeated compaction moves
-    // a hot table's objects into one S3 prefix, which is the throttling the
-    // property exists to avoid. Stated once per plan rather than per file.
-    if health.object_storage_layout {
-        notes.push(
-            "the table sets write.object-storage.enabled, and Bergman's writer does not \
-             produce the hashed layout: rewritten files land under the plain data path. \
-             The table stays correct — every path is in the metadata — but repeated \
-             compaction concentrates its objects in one prefix"
-                .to_string(),
-        );
-    }
-
     // Bergman reads and writes only Parquet, so a table asking for anything
     // else would have its format silently changed by a rewrite. The executor
     // refuses it too — and checks the files themselves, which this cannot see;
@@ -350,22 +325,9 @@ fn plan_compaction(
     })
 }
 
-fn plan_manifest_rewrite(
-    health: &TableHealth,
-    policy: &EffectivePolicy,
-    notes: &mut Vec<String>,
-) -> Option<Operation> {
+fn plan_manifest_rewrite(health: &TableHealth, policy: &EffectivePolicy) -> Option<Operation> {
     let settings = &policy.manifests;
     if !settings.rewrite.value {
-        return None;
-    }
-
-    // Re-packing entries produces a snapshot like any other, so the same format
-    // limit applies — see `plan_compaction`.
-    if let Some(reason) = crate::commit::authoring_refusal(health.format_version) {
-        notes.push(format!(
-            "manifest rewriting is enabled but cannot run: {reason}"
-        ));
         return None;
     }
 
@@ -528,7 +490,6 @@ mod tests {
             manifests: ManifestHealth::default(),
             files,
             partitions,
-            object_storage_layout: false,
             unreadable: None,
         }
     }
@@ -998,34 +959,6 @@ mod tests {
     }
 
     #[test]
-    fn a_v3_table_says_why_compaction_will_never_run() {
-        // Bergman cannot author a v3 snapshot without destroying row lineage,
-        // and `TableMetadataBuilder` rejects one that tries. Planning the
-        // rewrite anyway would report a refusal every cycle forever; planning
-        // nothing and saying nothing would look exactly like a healthy table.
-        let mut health = health_with(
-            vec![partition("d=1", &[10; 10], 100, 0, 0)],
-            snapshots(1, Duration::from_secs(60)),
-        );
-        health.format_version = iceberg::spec::FormatVersion::V3;
-
-        let plan = plan_table(
-            &health,
-            &effective(COMPACT_ON),
-            PlanContext::default(),
-            Utc::now(),
-        )
-        .expect("a table whose policy cannot apply is not silence");
-
-        assert!(!plan.has_work());
-        assert!(
-            plan.notes[0].contains("format v3"),
-            "got: {}",
-            plan.notes[0]
-        );
-    }
-
-    #[test]
     fn an_unreadable_table_keeps_only_the_operation_that_needs_no_manifest() {
         // The guarded half of the pair. An encrypted table's manifests cannot
         // be read, so compaction, manifest rewriting and orphan removal are all
@@ -1095,62 +1028,10 @@ mod tests {
         "#;
 
     #[test]
-    fn a_hashed_layout_the_rewrite_will_not_reproduce_is_reported() {
-        // Not a refusal — the table stays correct and every path is in its
-        // metadata — but not silent either, which is the whole of principle 6.
-        let policy = effective(COMPACT_ON);
-        let mut health = health_with(
-            vec![partition("d=1", &[10, 10, 10, 10, 10, 10], 100, 0, 0)],
-            snapshots(1, Duration::from_secs(60)),
-        );
-        health.object_storage_layout = true;
-
-        let plan = plan_table(&health, &policy, PlanContext::default(), Utc::now()).unwrap();
-        assert!(
-            plan.notes
-                .iter()
-                .any(|n| n.contains("write.object-storage.enabled")),
-            "the deviation must be named: {:?}",
-            plan.notes
-        );
-        // And compaction still runs: a prefix layout is not worth declining to
-        // maintain a table over.
-        assert!(
-            plan.operations
-                .iter()
-                .any(|op| op.kind == OperationKind::Compact)
-        );
-    }
-
-    #[test]
-    fn a_table_that_asked_for_no_hashed_layout_gets_no_note() {
-        // The control. Without it the test above passes against a planner that
-        // emits the note unconditionally, which would put a paragraph on every
-        // plan of every table and train operators to skip the notes.
-        let policy = effective(COMPACT_ON);
-        let health = health_with(
-            vec![partition("d=1", &[10, 10, 10, 10, 10, 10], 100, 0, 0)],
-            snapshots(1, Duration::from_secs(60)),
-        );
-        assert!(!health.object_storage_layout);
-
-        let plan = plan_table(&health, &policy, PlanContext::default(), Utc::now()).unwrap();
-        assert!(
-            !plan
-                .notes
-                .iter()
-                .any(|n| n.contains("write.object-storage.enabled")),
-            "got: {:?}",
-            plan.notes
-        );
-    }
-
-    #[test]
-    fn a_v3_table_still_gets_its_snapshots_expired() {
-        // The refusal is scoped to what Bergman authors itself. Expiration is
-        // upstream's own action and orphan removal commits nothing, so both
-        // remain available — refusing the whole table would leave every v3
-        // table's history growing without bound.
+    fn a_v3_table_is_planned_like_any_other() {
+        // Row lineage survives a rewrite now (every row keeps its `_row_id`
+        // physically), so a v3 table earns compaction for the same reasons a
+        // v2 table does and the plan carries no refusal to explain.
         let policy = effective(
             r#"
             [[rules]]
@@ -1169,11 +1050,15 @@ mod tests {
         health.format_version = iceberg::spec::FormatVersion::V3;
 
         let plan = plan_table(&health, &policy, PlanContext::default(), Utc::now()).unwrap();
+        let mut kinds: Vec<_> = plan.operations.iter().map(|op| op.kind).collect();
+        kinds.sort_by_key(|k| format!("{k:?}"));
         assert_eq!(
-            plan.operations.iter().map(|op| op.kind).collect::<Vec<_>>(),
-            vec![OperationKind::ExpireSnapshots]
+            kinds,
+            vec![OperationKind::Compact, OperationKind::ExpireSnapshots],
+            "{:?}",
+            plan.notes
         );
-        assert_eq!(plan.notes.len(), 1);
+        assert!(plan.notes.is_empty(), "{:?}", plan.notes);
     }
 
     #[test]

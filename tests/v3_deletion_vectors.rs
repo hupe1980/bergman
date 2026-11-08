@@ -1,29 +1,17 @@
 //! A format v3 table carrying real deletion vectors.
 //!
-//! Every claim Bergman makes about v3 — that health analysis reads such a
-//! table, that expiration bounds its history, that orphan removal is the only
-//! thing reclaiming superseded vector space, that a dangling vector is
-//! answerable from manifest metadata alone — was reasoned from the spec and the
-//! crate's accessors rather than demonstrated, because no test built one.
+//! The fixture writes vectors exactly as the spec defines them — Puffin blobs
+//! of type `deletion-vector-v1`, magic, length, portable Roaring, CRC-32 — two
+//! of them in one container, which is the shape every identity rule here is
+//! about.
 //!
-//! # What this fixture does and does not prove
-//!
-//! Worth stating precisely, because the gap between the two is where a fixture
-//! starts being misleading.
-//!
-//! **It proves the metadata plane.** Health analysis, reachability, expiration
-//! and dangling-delete detection all read *manifest entries* — content type,
-//! `referenced_data_file`, `content_offset`, `content_size_in_bytes`, and the
-//! Puffin container's path. Every one of those is exercised here against
-//! entries a v3 writer would produce.
-//!
-//! **It does not prove that anything decodes a vector**, and nothing under test
-//! tries: not one of the operations above opens the Puffin file. The blob bytes
-//! are still written to the spec — magic, length, portable Roaring, CRC-32 —
-//! for two reasons. A container whose bytes are garbage is not the file whose
-//! *behaviour* these tests describe; and when upstream's decoder releases and
-//! the deletion-vector half of the v3 refusal lifts, the fixture is already the
-//! input that half needs, rather than something to rewrite first.
+//! Two planes are exercised against it. **The metadata plane**: health
+//! analysis, reachability and dangling-delete detection read the manifest
+//! entries — content type, `referenced_data_file`, `content_offset`,
+//! `content_size_in_bytes` and the container's path. **The data plane**:
+//! compaction decodes the vectors through upstream's reader, applies them, and
+//! retires them by `(path, offset)`, which is what shows the bytes are what a
+//! v3 writer produces.
 
 mod common;
 
@@ -89,12 +77,10 @@ async fn v3_with_vectors() -> (TestTable, Vec<iceberg::spec::DataFile>) {
 
 #[tokio::test]
 async fn the_fixture_writes_a_spec_shaped_deletion_vector() {
-    // The fixture is hand-written because no released `iceberg-rust` can write
-    // a `deletion-vector-v1` blob, so nothing upstream validates these bytes
-    // today. Until that decoder releases, the spec's own field list is the
-    // check — and each field is asserted separately, because a blob that is
-    // wrong in one of them is a blob the future decoder rejects for a reason
-    // this test can name now.
+    // The fixture is hand-written because `iceberg` 0.11.0 has no writer for a
+    // `deletion-vector-v1` blob. Each field the spec defines is asserted
+    // separately, so a wrong one is named here rather than surfacing as a
+    // decode failure in the compaction test.
     let (fixture, deletes) = v3_with_vectors().await;
 
     let entry = &deletes[0];
@@ -155,8 +141,7 @@ async fn the_fixture_writes_a_spec_shaped_deletion_vector() {
 
 #[tokio::test]
 async fn health_analysis_reads_a_table_carrying_deletion_vectors() {
-    // Previously reasoned from "DV entries parse". Now demonstrated: the
-    // analyzer walks a delete manifest whose entries are Puffin blobs and
+    // The analyzer walks a delete manifest whose entries are Puffin blobs and
     // reports them, rather than failing or counting them as data.
     let (fixture, _) = v3_with_vectors().await;
 
@@ -207,7 +192,7 @@ async fn the_puffin_container_is_reachable_so_orphan_removal_spares_it() {
         "the fixture must put both vectors in one container, or this proves nothing"
     );
 
-    let reachable = reachability::compute(&table_ref(), &fixture.table(), 8)
+    let reachable = reachability::compute(&fixture.table(), 8)
         .await
         .expect("reachable set");
 
@@ -219,21 +204,10 @@ async fn the_puffin_container_is_reachable_so_orphan_removal_spares_it() {
 
 #[tokio::test]
 async fn live_vectors_are_never_reported_dangling() {
-    // The half of the dangling question that exists today, and the control the
-    // other half will need.
-    //
-    // **Dangling detection is not vector-aware yet**: `referenced_data_file`
-    // appears nowhere in `dangling_delete_files`, which answers the question the
-    // v2 way — the scan's association, plus the sequence-number argument. On a
-    // vector that is a *conservative* answer rather than a wrong one: the scan
-    // reports delete files by path, so a container holding any live vector keeps
-    // every vector in it off the list, and a delete committed after the data it
-    // covers is never below it in sequence.
-    //
-    // Making it vector-aware — one lookup, since the spec requires a vector to
-    // name exactly one data file — is the next roadmap item. This test is what
-    // that item has to keep true: whatever gets sharper, a vector whose data
-    // file is live must never be proposed for removal.
+    // Dangling detection never proposes a deletion vector at all (see
+    // `a_dangling_vector_is_never_retired`), so this holds by construction now.
+    // It stays as the property that must survive any change to that rule: a
+    // vector whose data file is live is never proposed for removal.
     let (fixture, deletes) = v3_with_vectors().await;
     let table = fixture.table();
     let producer = SnapshotProducer::new(&table, BranchRetention::load(&table).await.unwrap());
@@ -263,11 +237,10 @@ async fn live_vectors_are_never_reported_dangling() {
         "a vector whose data file is live must never be retired"
     );
 
-    // And the same with the scan reporting nothing at all, which is the input a
-    // vector-aware implementation will actually see once it stops matching by
-    // container path. The sequence-number argument alone still has to hold the
-    // line: these vectors were committed *after* the data they cover, so none of
-    // them is below every live data file.
+    // And the same with the scan reporting nothing at all, so neither the scan's
+    // association nor the vector exclusion is what keeps these off the list on
+    // its own: they were committed *after* the data they cover, so none of them
+    // is below every live data file either.
     assert!(
         producer
             .dangling_delete_files(&std::collections::HashSet::new())
@@ -299,28 +272,6 @@ async fn retiring_one_vector_must_not_take_its_container() {
         deletes[0].content_offset(),
         deletes[1].content_offset(),
         "and are told apart only by offset — which is why identity is (path, offset)"
-    );
-}
-
-#[tokio::test]
-async fn expiration_still_runs_on_a_table_bergman_will_not_rewrite() {
-    // The refusal is per operation, not per table: Bergman will not author a v3
-    // snapshot, but expiration is upstream's own action over `metadata.json`.
-    // Demonstrated here rather than argued, because "expiration still runs" is
-    // load-bearing for every v3 table in the field.
-    let (fixture, _) = v3_with_vectors().await;
-    let table = fixture.table();
-
-    assert!(
-        bergman::commit::authoring_refusal(table.metadata().format_version()).is_some(),
-        "the v3 refusal must still be in force, or this test proves nothing"
-    );
-
-    // Two snapshots exist: the append and the delete commit.
-    assert_eq!(
-        table.metadata().snapshots().count(),
-        2,
-        "the fixture must have a history to expire"
     );
 }
 
@@ -412,19 +363,13 @@ async fn a_v2_table_retires_its_dangling_delete() {
 }
 
 #[tokio::test]
-async fn nothing_retires_a_dangling_delete_on_a_v3_table() {
-    // The finding. Dangling-delete removal is the last step of `compact::run`,
-    // and `compact::run` refuses a v3 table at its first — so the detection
-    // above is never reached on v3, and a dangling delete sits there forever.
-    //
-    // **This is not a deletion-vector problem**, which is why it outlived the
-    // roadmap item that was supposed to cover it. A deletion vector applies to
-    // exactly one data file and the spec requires a writer removing that file to
-    // drop the vector's entry in the same commit, so a dangling *vector* is a
-    // spec violation rather than an accumulation. A v3 table upgraded from v2
-    // still legally carries equality and position delete *files*, and those
-    // dangle for the ordinary reason — which nothing on v3 cleans up.
+async fn a_v3_table_retires_its_dangling_delete_file() {
+    // Dangling-delete removal is the last step of `compact::run`. While v3 was
+    // refused at the first step it was never reached, and a v3 table upgraded
+    // from v2 — which legally keeps its equality and position delete *files* —
+    // accumulated dangling ones forever. The v2 test above is the control.
     let v3 = table_with_a_dead_delete(FormatVersion::V3).await;
+    assert_eq!(detects_a_dead_delete(&v3).await, 1, "the fixture has one");
 
     let table = v3.table();
     let ident = v3.ident.clone();
@@ -438,24 +383,109 @@ async fn nothing_retires_a_dangling_delete_on_a_v3_table() {
     };
     let env = common::op_env(&table, &ident, &loader, v3.committer.as_ref(), ctx);
 
-    let before = v3.committer.commit_count();
-    let err = bergman::ops::compact::run(
+    bergman::ops::compact::run(
         &env,
         &compaction_enabled(),
         &[bergman::health::PartitionKey::unpartitioned(0)],
     )
     .await
-    .expect_err("a v3 table is refused");
+    .expect("a v3 table is maintained");
 
-    assert!(err.to_string().contains("format v3"), "got: {err}");
-    assert_eq!(
-        v3.committer.commit_count(),
-        before,
-        "the refusal arrives before anything commits"
-    );
     assert_eq!(
         detects_a_dead_delete(&v3).await,
+        0,
+        "the dangling delete must be gone"
+    );
+}
+
+#[tokio::test]
+async fn compaction_applies_deletion_vectors_and_retires_them() {
+    // The read half of v3, end to end. Rows 1 and 3 are hidden by one vector,
+    // row 5 by another in the same Puffin file. A rewrite that could not read
+    // vectors would write all five rows back and resurrect three; one that
+    // read them but kept the vectors would leave every scan opening a
+    // container that hides nothing.
+    let (fixture, _) = v3_with_vectors().await;
+    let mut before = common::read_all(&fixture.table()).await.unwrap();
+    before.sort();
+    assert_eq!(
+        before,
+        vec![(2, "b".to_string()), (4, "d".to_string())],
+        "the fixture's vectors hide rows 1, 3 and 5"
+    );
+    let lineage_before = common::read_lineage(&fixture.table()).await.unwrap();
+
+    let table = fixture.table();
+    let ident = fixture.ident.clone();
+    let loader = fixture.loader();
+    let ctx = bergman::obs::OperationContext {
+        run_id: "test",
+        table: &table_ref(),
+        kind: bergman::plan::OperationKind::Compact,
+        matched_rule: "prod.db.events",
+        reason: "test",
+    };
+    let env = common::op_env(&table, &ident, &loader, fixture.committer.as_ref(), ctx);
+    bergman::ops::compact::run(
+        &env,
+        &compaction_enabled(),
+        &[bergman::health::PartitionKey::unpartitioned(0)],
+    )
+    .await
+    .expect("a v3 table carrying deletion vectors is compacted");
+
+    let mut after = common::read_all(&fixture.table()).await.unwrap();
+    after.sort();
+    assert_eq!(after, before, "deleted rows stayed deleted");
+    assert_eq!(
+        common::live_data_files(&fixture.table())
+            .await
+            .unwrap()
+            .len(),
         1,
-        "and the dangling delete is still there afterwards"
+        "two files became one"
+    );
+    assert!(
+        common::live_delete_files(&fixture.table())
+            .await
+            .unwrap()
+            .is_empty(),
+        "both vectors were applied, so both are retired"
+    );
+    assert_eq!(
+        common::read_lineage(&fixture.table()).await.unwrap(),
+        lineage_before,
+        "the surviving rows kept their identity"
+    );
+}
+
+#[tokio::test]
+async fn a_dangling_vector_is_never_retired() {
+    // A vector applies to exactly one data file, and the spec requires the
+    // writer that removes that file to drop the vector in the same commit — so
+    // a dangling vector is another writer's spec violation, not an
+    // accumulation, and retiring one speculatively is the most dangerous
+    // metadata operation there is for a state the format says cannot occur.
+    // The orphan scanner reclaims its container once nothing names it.
+    //
+    // Built to be dead by every measure the dangling rule uses: committed
+    // before any live data file, naming a file that was never in the table.
+    // The control is `table_with_a_dead_delete`, whose equality delete *file*
+    // in exactly this position is retired.
+    let fixture = TestTable::with_format(FormatVersion::V3).unwrap();
+    let never_appended = fixture.write_data_file(&[(9, "z")]).await.unwrap();
+    let vectors = fixture
+        .write_deletion_vectors(&[(&never_appended, &[0][..])])
+        .await
+        .unwrap();
+    fixture.append_deletes(vectors).await.unwrap();
+    let a = fixture.write_data_file(&[(1, "a")]).await.unwrap();
+    fixture.append(vec![a]).await.unwrap();
+
+    assert_eq!(detects_a_dead_delete(&fixture).await, 0);
+    assert_eq!(
+        detects_a_dead_delete(&table_with_a_dead_delete(FormatVersion::V3).await).await,
+        1,
+        "the control: a dead delete *file* in the same position is found"
     );
 }

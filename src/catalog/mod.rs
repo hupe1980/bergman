@@ -5,7 +5,11 @@
 //! with any catalog implementation — the contract is the wire, so a catalog
 //! that speaks the spec works without Bergman knowing which one it is.
 
+#[cfg(feature = "catalog-rest")]
+mod auth;
 mod discovery;
+pub mod polaris;
+pub(crate) mod read;
 mod storage;
 
 pub use discovery::{DiscoveredTable, NamespaceSource, discover};
@@ -77,6 +81,23 @@ pub struct CatalogConfig {
     /// known subtree.
     #[serde(default)]
     pub namespaces: Option<Vec<String>>,
+
+    /// Read maintenance policy the catalog itself holds, as a resolution layer
+    /// below `bergman.toml` (see [`crate::policy::catalog`]).
+    ///
+    /// Off unless named. A table whose catalog policy cannot be read is not
+    /// maintained that cycle, and says why: maintaining it under the remaining
+    /// layers could do exactly what the unread policy forbids.
+    #[serde(default)]
+    pub policy_source: Option<PolicySource>,
+}
+
+/// Where a catalog keeps maintenance policy Bergman can read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PolicySource {
+    /// Apache Polaris: `GET /polaris/v1/{prefix}/applicable-policies`.
+    Polaris,
 }
 
 /// The catalog protocol.
@@ -132,63 +153,39 @@ impl std::fmt::Debug for CatalogConfig {
             // field — so it is safe to show and useful to see.
             .field("token_env", &self.token_env)
             .field("namespaces", &self.namespaces)
+            .field("policy_source", &self.policy_source)
             .field("properties", &properties)
             .finish()
     }
 }
 
-/// Renews a catalog client's own bearer token.
+/// A connected catalog: the client every read goes through, and Bergman's own
+/// commit path for what `iceberg::Catalog` cannot express.
 ///
-/// `iceberg-catalog-rest` exchanges an `OAuth2` credential once, at
-/// construction, and never again — its source carries a `TODO: Support
-/// automatic token refreshing`. Bergman's commit client renews its own (see
-/// [`crate::commit::TokenSource`]); the *read* path is this one, and reads are
-/// everything else: table loads, discovery, and snapshot expiration's commit. A
-/// daemon holding a one-hour token keeps its cadence perfectly and stops
-/// reading a single table.
+/// Built together because they must authenticate as one. Both send the bearer
+/// token from a single [`crate::commit::TokenSource`] — the read client through
+/// an `AuthManager` Bergman injects, the commit client directly — so there is
+/// one cache, one renewal and one credential in use. Two clients that each
+/// exchanged their own token would drift: reads succeeding, the plan looking
+/// perfect, and every commit returning 401.
 ///
-/// Renewed before each cycle rather than in response to a 401, because
-/// recognising one is not available: upstream maps it onto
-/// `ErrorKind::Unexpected` with the status buried in an error context, and
-/// classifying by message text is what [`crate::ops::expire`] refuses to do.
-#[async_trait::async_trait]
-pub trait CredentialRefresh: Send + Sync + std::fmt::Debug {
-    /// Exchange the configured credential for a fresh token.
-    async fn refresh(&self) -> Result<()>;
-}
-
-#[cfg(feature = "catalog-rest")]
-#[async_trait::async_trait]
-impl CredentialRefresh for iceberg_catalog_rest::RestCatalog {
-    async fn refresh(&self) -> Result<()> {
-        // `regenerate_token` fetches the new token *before* invalidating the
-        // old one, so a failed exchange leaves the working token in place
-        // rather than a client that can no longer authenticate at all.
-        self.regenerate_token()
-            .await
-            .map_err(|e| Error::Catalog(Box::new(e)))
-    }
-}
-
-/// A connected catalog client, and the handle that renews its credential.
-///
-/// One type rather than two calls, because the refresher has to be the *same*
-/// client: a second one built from the same configuration would have its own
-/// token cache, and renewing that would leave the client actually in use
-/// holding the token that expired.
+/// Renewal is on demand. Every request asks the source for its token, and the
+/// source exchanges the credential again when the one in hand is within a
+/// minute of expiry — so a daemon holding a one-hour token neither stops
+/// reading at the hour nor needs a timer to prevent it.
 #[derive(Debug, Clone)]
 pub struct CatalogConnection {
     /// The client every read goes through.
     pub client: Arc<dyn iceberg::Catalog>,
-    /// How to renew its token, when it has one that expires.
-    ///
-    /// `None` for a static `token`, which has no exchange to repeat, and for a
-    /// catalog with no credential at all.
-    pub refresh: Option<Arc<dyn CredentialRefresh>>,
+    /// Bergman's own commit path (see [`crate::commit`]).
+    pub committer: Arc<dyn crate::commit::TableCommitter>,
+    /// The catalog's own maintenance policy, when it is configured as a
+    /// policy source.
+    pub policy: Option<Arc<polaris::PolarisPolicies>>,
 }
 
 impl CatalogConfig {
-    /// Build the catalog client.
+    /// Connect both clients.
     ///
     /// Credentials are read from the environment here rather than at parse
     /// time, so a configuration can be linted (`bergman policy lint`) on a
@@ -199,20 +196,20 @@ impl CatalogConfig {
         }
     }
 
-    /// Whether this catalog's credential is one that expires and can be renewed.
-    ///
-    /// Only the `OAuth2` client-credentials exchange is: a `token` — however it
-    /// was supplied — is a value whose lifetime belongs to whatever produced
-    /// it, and there is no exchange to repeat. An explicit `token_env` wins
-    /// over `credential` in the client, so it counts here too.
-    ///
-    /// Gated with the only protocol that has an exchange to repeat, so that a
-    /// build without it carries no dead code.
+    /// The token `token_env` names, when it names one.
     #[cfg(feature = "catalog-rest")]
-    fn has_renewable_credential(&self) -> bool {
-        self.token_env.is_none()
-            && !self.properties.contains_key("token")
-            && self.properties.contains_key("credential")
+    fn explicit_token(&self) -> Result<Option<String>> {
+        self.token_env
+            .as_ref()
+            .map(|var| {
+                std::env::var(var).map_err(|_| {
+                    Error::config(format!(
+                        "catalog \"{}\": token_env names ${var}, which is not set",
+                        self.name
+                    ))
+                })
+            })
+            .transpose()
     }
 
     #[cfg(feature = "catalog-rest")]
@@ -222,37 +219,64 @@ impl CatalogConfig {
             REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalogBuilder,
         };
 
+        let tokens = Arc::new(crate::commit::TokenSource::new(
+            crate::commit::Credential::from_properties(
+                &self.properties,
+                self.explicit_token()?,
+                &self.uri,
+            )?,
+            crate::commit::http_client()?,
+        ));
+
+        // The commit client first: it reads `/v1/config` and refuses a catalog
+        // that does not advertise table commits, which is the better failure to
+        // meet before any read is attempted.
+        let committer = Arc::new(
+            crate::commit::RestCommitter::connect(
+                &self.uri,
+                self.warehouse.as_deref(),
+                Arc::clone(&tokens),
+            )
+            .await?,
+        );
+
         let mut props = self.properties.clone();
         props.insert(REST_CATALOG_PROP_URI.to_string(), self.uri.clone());
         if let Some(warehouse) = &self.warehouse {
             props.insert(REST_CATALOG_PROP_WAREHOUSE.to_string(), warehouse.clone());
         }
+        // The credential is Bergman's to present, through the injected manager.
+        // Left in the properties, upstream would read it too — a second
+        // exchange and a second cache, the drift this type exists to prevent.
+        props.remove("token");
+        props.remove("credential");
 
-        if let Some(var) = &self.token_env {
-            let token = std::env::var(var).map_err(|_| {
-                Error::config(format!(
-                    "catalog \"{}\": token_env names ${var}, which is not set",
-                    self.name
-                ))
-            })?;
-            props.insert("token".to_string(), token);
-        }
+        let client = RestCatalogBuilder::default()
+            .with_storage_factory(storage::resolving_factory())
+            .with_auth_manager(auth::SharedTokenAuth::new(Arc::clone(&tokens)))
+            .load(self.name.clone(), props)
+            .await
+            .map_err(|e| Error::Catalog(Box::new(e)))?;
 
-        let builder =
-            RestCatalogBuilder::default().with_storage_factory(storage::resolving_factory());
-
-        let catalog = Arc::new(
-            builder
-                .load(self.name.clone(), props)
-                .await
-                .map_err(|e| Error::Catalog(Box::new(e)))?,
-        );
+        let policy = match self.policy_source {
+            None => None,
+            Some(PolicySource::Polaris) => Some(Arc::new(polaris::PolarisPolicies::new(
+                &self.uri,
+                committer.prefix().ok_or_else(|| {
+                    Error::config(format!(
+                        "catalog \"{}\" is a Polaris policy source, but its /v1/config named \
+                         no prefix — Polaris always does, so this is not a Polaris catalog",
+                        self.name
+                    ))
+                })?,
+                Arc::clone(&tokens),
+            )?)),
+        };
 
         Ok(CatalogConnection {
-            client: catalog.clone(),
-            refresh: self
-                .has_renewable_credential()
-                .then_some(catalog as Arc<dyn CredentialRefresh>),
+            client: Arc::new(client),
+            committer,
+            policy,
         })
     }
 
@@ -262,43 +286,6 @@ impl CatalogConfig {
             "catalog \"{}\" is a REST catalog, but this build has no `catalog-rest` feature",
             self.name
         )))
-    }
-
-    /// Build Bergman's commit path for this catalog.
-    ///
-    /// Separate from [`CatalogConfig::connect`] because it answers a different
-    /// question: `connect` gives a client for everything `iceberg::Catalog` can
-    /// already do, and this gives one for the commits it cannot express — see
-    /// [`crate::commit`] for why that is a whole module rather than a method.
-    pub async fn committer(&self) -> Result<Arc<dyn crate::commit::TableCommitter>> {
-        match self.kind {
-            CatalogKind::Rest => {
-                let token = match &self.token_env {
-                    Some(var) => Some(std::env::var(var).map_err(|_| {
-                        Error::config(format!(
-                            "catalog \"{}\": token_env names ${var}, which is not set",
-                            self.name
-                        ))
-                    })?),
-                    None => None,
-                };
-
-                // The same properties the catalog client reads, so one
-                // configuration authenticates both. A commit path that
-                // authenticated differently would let reads succeed and every
-                // write return 401 — the tool would appear to work and quietly
-                // change nothing.
-                Ok(Arc::new(
-                    crate::commit::RestCommitter::connect(
-                        &self.uri,
-                        self.warehouse.as_deref(),
-                        &self.properties,
-                        token,
-                    )
-                    .await?,
-                ))
-            }
-        }
     }
 
     /// Check that this build carries the object store this catalog will need.
@@ -385,6 +372,7 @@ mod tests {
             properties: HashMap::new(),
             token_env: None,
             namespaces: None,
+            policy_source: None,
         }
     }
 
@@ -433,35 +421,6 @@ mod tests {
         for key in ["s3.endpoint", "s3.region", "gcs.project-id"] {
             assert!(!is_secret_property(key), "{key} is not a secret");
         }
-    }
-
-    #[test]
-    #[cfg(feature = "catalog-rest")]
-    fn only_an_exchangeable_credential_is_renewable() {
-        // A token is a value whose lifetime belongs to whatever produced it —
-        // there is no exchange to repeat, and asking upstream to regenerate one
-        // errors rather than helping. Only the OAuth2 client-credentials flow
-        // has something to renew.
-        let mut plain = config("prod", Some("s3://b/wh"));
-        assert!(!plain.has_renewable_credential(), "no credential at all");
-
-        plain
-            .properties
-            .insert("credential".to_string(), "svc-bergman:hunter2".to_string());
-        assert!(plain.has_renewable_credential());
-
-        // A `token` wins over a `credential` in the client, so it wins here
-        // too: renewing a credential whose token the client never uses would
-        // be an exchange per cycle that changes nothing.
-        let mut with_token = plain.clone();
-        with_token
-            .properties
-            .insert("token".to_string(), "static".to_string());
-        assert!(!with_token.has_renewable_credential());
-
-        let mut with_token_env = plain.clone();
-        with_token_env.token_env = Some("BERGMAN_CATALOG_TOKEN".to_string());
-        assert!(!with_token_env.has_renewable_credential());
     }
 
     #[test]

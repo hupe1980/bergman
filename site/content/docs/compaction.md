@@ -4,24 +4,16 @@ description = "What triggers a rewrite, how file groups are bounded, how delete 
 weight = 8
 +++
 Compaction rewrites a partition's small files into larger ones, with its delete
-files applied — so the rows that survive are written back plainly and the delete
-files that hid the rest are retired.
-
-Committing that means committing a snapshot which *removes* data files, and
-`iceberg-rust` has no transaction action for it. Bergman
-[owns that layer](@/docs/status.md#why-bergman-owns-its-commit-layer) rather
-than forking, which is what the rest of the market did.
+files applied — so the surviving rows are written back plainly and the delete
+files that hid the rest are retired. The commit removes data files, which
+`iceberg-rust` has no transaction action for; Bergman builds it in its
+[own commit layer](@/docs/architecture.md#commit-layer).
 
 ## Triggers, not schedules {#triggers}
 
-Rewriting data you did not need to rewrite is the main failure mode of naive
-compaction: write amplification can easily exceed the scan savings it buys. So
-compaction is triggered by measurement, not by a clock.
-
-A `schedule` decides when a table is **evaluated**. Whether anything runs is
-decided by comparing that table against your thresholds. A table already at
-target file size costs a handful of metadata reads and no data I/O at all —
-which is what makes it safe to evaluate thousands of tables often.
+A `schedule` decides when a table is **evaluated**; whether anything runs is
+decided by comparing the table against your thresholds. A table already at
+target file size costs a few metadata reads and no data I/O.
 
 ```toml
 [[rules]]
@@ -43,95 +35,59 @@ min_file_age        = "1h"
 
 ## The four triggers
 
-Evaluation is **partition-grained**, because that is the granularity a rewrite
-commits at — and because a table can look perfectly healthy on average while one
-partition is a thousand tiny files.
+Evaluation is **per partition**, the granularity a rewrite commits at.
 
 ### Small files
 
-Fires when the fraction of a partition's files below the small-file threshold
-(`min_file_size_ratio` × `target_file_size`) reaches `small_file_ratio`, **and**
-at least `min_input_files` files are [eligible](#eligible).
-
-`min_input_files` defaults to 5, matching Spark's `rewrite_data_files`, so
-behaviour is unsurprising to anyone already running Iceberg maintenance. Four
-tiny files are not worth a commit.
+Fires when the fraction of a partition's files below `min_file_size_ratio` ×
+`target_file_size` reaches `small_file_ratio`, **and** at least
+`min_input_files` (default 5, as in Spark's `rewrite_data_files`) files are
+[eligible](#eligible).
 
 ```text
 why: partition day=2026-08-20: 412 of 480 files below 384 MiB (86% ≥ 30%)
 ```
 
-A rewrite that would produce as many files as it consumes is skipped. Without
-that check, a table sitting just below target would be rewritten every cycle,
-forever, achieving nothing.
+A rewrite that would produce as many files as it consumes is skipped, so a
+table just below target is not rewritten every cycle.
 
 ### Oversized files
 
-Fires when any file exceeds `max_file_size_ratio` × `target_file_size` — 1.8×
-by default, which is Spark's own.
-
-This is the half a small-file-only compactor forgets, and it fails in the
-opposite direction. One file too large to split is a task no reader can divide,
-so a single query pays for all of it on one thread. Nothing but a rewrite ever
-splits it, and a rewrite does so for free: the rolling writer rolls at the
-target size however large the input was.
+Fires when any file exceeds `max_file_size_ratio` × `target_file_size` (1.8×,
+Spark's default). A file too large to split is a task no reader can divide; the
+rolling writer splits it at the target size. One such file is enough, and the
+"as many files out as in" check does not apply.
 
 ```text
 why: partition day=2026-08-20: 1 of 40 files above 900 MiB, which no reader can split
 ```
 
-One such file is enough — there is no minimum count to reach — and the "as many
-files out as in" check above does not apply to it, because producing more files
-than it consumed is the entire point.
-
 ### Delete files
 
 Fires when delete records applicable to a partition exceed `delete_ratio` of its
-rows — **even when file sizes are fine**.
+rows — **even when file sizes are fine**. This is the trigger for streaming and
+CDC targets, which write well-sized files plus a stream of equality deletes.
 
 ```text
 why: partition day=2026-08-20: 1204 of 5230 rows deleted (23% ≥ 10%) across 12 delete files
 ```
 
-This is the trigger that matters for streaming and CDC targets. A Flink or
-Kafka-Connect sink writes correctly-sized files and a stream of equality deletes;
-every read then pays to apply them. File-size metrics say the table is healthy.
-It is not.
-
-Any maintenance tool without this trigger is only solving half the problem, and
-the half it is not solving is the one that makes Spark run out of memory.
-
-Applying them is an anti-join, and Bergman does it as one — see
-[Where the query engine earns its place](#query-engine).
-
 ### Settle time
 
-`min_file_age` (default one hour) is the trigger that works *backwards*: a
-partition is left alone until its newest file has stopped being new.
-
-This is the guard against fighting your own writer. A streaming target commits
-to one partition continuously. A rewrite of that partition reads it, writes it,
-and then loses its compare-and-swap to the micro-batch that landed in the
-meantime — repeatedly, every cycle, having each time spent the full cost of the
-rewrite. Waiting is strictly cheaper than competing.
+`min_file_age` (default one hour) leaves a partition alone until its newest file
+is that old, so a rewrite does not lose its commit race to the next micro-batch
+of a streaming writer.
 
 ```toml
 [rules.compaction.trigger]
 min_file_age = "2h"   # a busy streamer needs longer than the default
 ```
 
-A partition whose files carry no timestamp counts as settled. Failing the other
-way would leave a table Bergman cannot date un-maintained forever, which is
-worse than one lost commit race.
+A partition whose files carry no timestamp counts as settled.
 
-## What a rewrite actually reads {#eligible}
+## What a rewrite reads {#eligible}
 
-A partition is what *triggers* a rewrite. It is not what the rewrite reads.
-
-Take a partition of a hundred half-gigabyte files plus forty tiny ones: it
-crosses `small_file_ratio`, but reading all hundred and forty to merge the forty
-would spend fifty gigabytes of I/O to reclaim a few hundred megabytes. So a file
-is **eligible** only when a rewrite would improve it:
+A partition *triggers* a rewrite; only its **eligible** files are read:
 
 | Eligible because | Rule |
 |---|---|
@@ -139,78 +95,46 @@ is **eligible** only when a rewrite would improve it:
 | It is too large to split | `size > max_file_size_ratio × target` |
 | A delete file applies to it | whatever its size — the rewrite is what retires the delete |
 
-Everything between the two thresholds is left alone. This is Spark's
-`SizeBasedFileRewriter.filterFiles` rule, so a table maintained by both tools is
-judged the same way.
-
-`bergman plan` reports the eligible figures rather than the partition's totals,
-because that is what the cycle's `max_rewrite_bytes_per_run` budget is charged.
+Files between the two thresholds are left alone — Spark's
+`SizeBasedFileRewriter.filterFiles` rule. `bergman plan` reports eligible
+figures, which is what the `max_rewrite_bytes_per_run` budget is charged.
 
 ## File groups {#file-groups}
 
-**A partition is not a unit of work either.** Its eligible files are bin-packed —
-smallest first — into groups bounded by two ceilings, and each group commits on
-its own:
+Eligible files are bin-packed, smallest first, into groups, and **each group
+commits on its own**:
 
 | Setting | Default | Bounds |
 |---|---|---|
 | `max_group_bytes` | 8 GiB | A few enormous files |
 | `max_input_files` | 10 000 | A hundred thousand tiny ones |
 
-This is the equivalent of Spark's `max-file-group-size-bytes`, sized for one
-process rather than a cluster, and it exists for the same reasons. Reading an
-arbitrarily large partition in a single pass is how a compactor runs out of
-memory. And without it, one lost commit throws away the whole partition's
-rewriting rather than one group's.
-
-Partial progress is real progress. It is what makes compacting an
-actively-written table tractable at all.
+So a partition larger than memory is still compactable, and a lost commit costs
+one group, not the partition.
 
 ```text
   [ok] compact: 92 files (8.11 GiB) rewritten into 17 (7.94 GiB) across 4 groups
        in 3 partitions, 12 delete files retired
 ```
 
-Smallest-first packing means a group fills with the files that most need
-merging, and a run cut short leaves the largest files alone — they were closest
-to target anyway.
+A group commits when it holds more than one file, an oversized one, or any
+delete file. `min_input_files` is a trigger and is evaluated only by the
+planner.
 
-A group earns its commit when it holds more than one file, or an oversized one,
-or any delete file. `min_input_files` is deliberately not re-applied here: it is
-a trigger, and triggers are the planner's. A threshold evaluated in two places is
-one that can drift, and the half that drifted would make `bergman plan` a promise
-`bergman run` quietly broke.
+### Order and failure bound
 
-### How groups are ordered and bounded
-
-Groups run **best value per byte first**, so a cycle that ends early — a window
-closing, a byte budget running out, a process killed — has done its most
-worthwhile work.
+Groups run **best value per byte first**, so a cycle cut short — window closing,
+byte budget exhausted, process killed — has done its most worthwhile work.
 
 | Term | Is |
 |---|---|
 | **Cost** | The bytes the group reads and writes, exact from the manifests |
 | **Benefit** | `\|inputs − outputs\|`, plus the delete files applying to the group |
 
-Benefit covers both directions: merging small files reduces the object count,
-and splitting an oversized one increases it — which is equally the point, since
-a file too large to divide is a task no reader can parallelise. Retiring a delete
-file counts too, because every scan of the partition currently opens it.
-
-Ranking on file count alone would make cost irrelevant: merging a hundred 100 MB
-files costs 10 GB of I/O for roughly what merging ninety-nine 1 KB files buys.
-Ties break to the partition key and index, so two runs of an unchanged table do
-the same work in the same order. Spark exposes a coarser version of this as
-`rewrite-job-order`.
-
-Each group commits against the snapshot the previous one produced, so no group
-loses its compare-and-swap to its own predecessor and rewrites itself twice.
-
-After **three groups fail in a row**, the table is left for the next cycle. A
-failing group has already read and written its files by the time it fails, and
-three in a row means the reason is the table rather than the group — a busy
-writer, a credential that stopped working, a catalog refusing commits. Spark
-bounds the same thing with `partial-progress.max-failed-commits`.
+Ties break to partition key and index, so an unchanged table is worked in the
+same order every run. Each group commits against the snapshot the previous one
+produced. After **three groups fail in a row** the table is left for the next
+cycle.
 
 ## What a plan tells you
 
@@ -223,292 +147,166 @@ prod.streaming.events_raw
 ```
 
 The plan carries the exact partitions it will rewrite, so `run` acts on what
-`plan` displayed rather than re-deciding against a table that has moved since.
+`plan` showed. The output-file count is an estimate that accounts for the delete
+ratio.
 
-The output-file estimate accounts for the delete ratio — rows removed by deletes
-do not appear in the output — and is labelled an estimate, because the exact
-figure is not knowable without reading the data.
-
-Partition names are Iceberg's own: `region=eu/day=2026-08-20`, with a `day`
-transform rendered as a date rather than as the integer actually stored.
-
-The rendering is **injective**, and that is the point: this string is compared
-for equality to decide which files are rewritten together, so two partitions that
-rendered alike would have their files merged and written out under one of the two
-partition values — filing every row of the other where it does not belong.
-Nothing fails; queries just start missing rows. Two collisions are closed for it:
-
-- Values containing `/` or `%` are percent-encoded, `%` first, so a value holding
-  a separator cannot impersonate two fields.
-- A NULL value renders as `null` — and a *string value* of `"null"` would render
-  identically, so that one is escaped to `%6Eull`. No real value can reach that
-  spelling, because a genuine `%` has already become `%25`.
+Partition names are Iceberg's own (`region=eu/day=2026-08-20`, a `day` transform
+rendered as a date). The rendering is **injective**, because it decides which
+files are rewritten together: `/` and `%` in values are percent-encoded (`%`
+first), and a string value `"null"` renders as `%6Eull` so it cannot collide
+with a NULL.
 
 ## The delete-file rule
 
-This is the part that loses data when it is wrong, and nothing fails visibly
-when it is.
-
-A rewrite may retire a delete file **only if every data file that delete file
-applies to is inside the group being rewritten**. One shared with a file outside
-the group is still hiding rows there, and dropping it brings them back.
-
-Bergman therefore plans the *whole table* before rewriting anything: the
-question "does this delete file apply anywhere else?" cannot be answered from
-inside the group. A delete file exclusive to the group is retired; a shared one
-stays, and the data files it applies to inside the group remain correct because
-it stayed.
+A rewrite retires a delete file **only if every data file it applies to is
+inside the group**. A shared one is still hiding rows elsewhere, so it stays.
+This is why the whole table is planned before anything is rewritten.
 
 ### Dangling delete files
 
-The rule above has a consequence: a shared delete file survives the rewrite —
-and then the *other* files it covered get rewritten too, leaving it applying to
-nothing at all. It is now pure read overhead. Every scan still opens it and it
-hides nothing, and nothing else ever cleans it up.
-
-So after compacting, Bergman reloads the table and removes them. Java's
-`RewriteDataFiles` does the same thing under `remove-dangling-deletes`. It is a
-metadata-only commit and close to free.
-
-Removing a delete file that is *not* dangling resurrects every row it was hiding,
-so the question is answered **two independent ways, and both must agree**:
+A delete file left applying to no live data file is removed after compaction, in
+a metadata-only commit (Java's `remove-dangling-deletes`). Removing one that is
+*not* dangling resurrects rows, so two independent derivations must agree:
 
 | Derivation | What it says |
 |---|---|
 | The scan | No live data file is associated with it |
 | Its sequence number | It is below every live data file's number in its partition, so it cannot apply to one |
 
-A delete file with no sequence number is kept — an unknown number cannot argue
-that a file is dead. An equality delete stored under an unpartitioned spec is a
-*global* delete, so it is measured against the whole table's lowest sequence
-number rather than one partition's.
-
-None of this runs when the manifest list shows no delete manifest, which is the
-ordinary table.
+A delete file with no sequence number is kept. An equality delete under an
+unpartitioned spec is global and is measured against the whole table's lowest
+sequence number. Nothing runs when the manifest list has no delete manifest.
 
 ```text
   [ok] compact: 92 files (8.11 GiB) rewritten into 17 (7.94 GiB) across 4 groups
        in 3 partitions, 12 delete files retired, 5 dangling delete files removed
 ```
 
-## Where the query engine earns its place {#query-engine}
-
-Bergman uses DataFusion only for the stages that need it:
+## The query engine {#query-engine}
 
 | Stage | Who | Why |
 |---|---|---|
-| Scan | upstream `ArrowReader` | Already vectorized and Iceberg-correct |
-| **Positional** deletes | upstream `ArrowReader` | They become a Parquet row selection, so deleted rows are never decoded — *better* than a join |
-| **Equality** deletes | DataFusion hash anti-join | See below |
+| Scan | upstream `ArrowReader` | Vectorized and Iceberg-correct |
+| **Positional** deletes | upstream `ArrowReader` | A Parquet row selection: deleted rows are never decoded |
+| **Equality** deletes | DataFusion hash anti-join | Upstream evaluates one predicate term per delete row against every batch — `data rows × delete rows`; a hash join is their sum, and spills |
 | Sort | DataFusion | Spills |
 | Write | upstream `RollingFileWriter` | Real `DataFile`s with full column metrics |
 
-Equality deletes are why the dependency exists. Upstream applies them by
-building one predicate term *per delete row* and evaluating that tree against
-every record batch: `data rows × delete rows`, a nested-loop anti-join. At a
-hundred thousand delete rows a partition takes hours. A hash anti-join is
-proportional to their sum, and spills — and the tables that need compaction
-most are exactly the delete-heavy ones.
-
-**The plan shape is asserted, not assumed.** `IS NOT DISTINCT FROM` only becomes
-a hash join because an optimizer rule rewrites it, and that rule is deliberately
-conservative — a plan that grew an ordinary `=` alongside would fall back to a
-nested loop and restore the quadratic behaviour silently. The test suite builds
-the physical plan and checks for `HashJoinExec` with nulls-equal on.
-
-**Delete files may match on different columns**, which is legal and happens when
-a schema change moves a sink's primary key. Anti-joins compose — a row survives
-when it matches none of them — so a group carrying several key sets gets one
-join per set.
+- **The plan shape is asserted.** The join uses `IS NOT DISTINCT FROM`, which
+  becomes a hash join only through a conservative optimizer rule; the test suite
+  checks the physical plan for `HashJoinExec` with nulls-equal on.
+- **Nulls match**, as Iceberg's equality deletes require — SQL `=` would keep
+  every row whose key is null.
+- **Files are bucketed by which deletes apply to them**, taken from upstream's
+  scan, so a file is never anti-joined against a delete that does not apply to it.
+- **Delete files keyed on different columns** each get their own anti-join; a
+  row survives when it matches none.
 
 ```toml
 [rules.compaction]
 max_sort_memory = 2147483648   # 2 GiB; defaults to 1 GiB
 ```
 
-`max_sort_memory` is the executor's memory pool. The sort and the join's build
-side spill to disk when they reach it, so no group is too large to sort.
+`max_sort_memory` is the executor's memory pool; the sort and the join's build
+side spill to disk when they reach it. The plan runs at
+`limits.compaction_parallelism` threads (default: the machine's available
+parallelism). The pool is shared across those threads, so widening the plan
+spills sooner rather than using more memory.
 
-The plan runs at `limits.compaction_parallelism` threads, defaulting to the
-machine's available parallelism. That is a separate knob from the memory pool on
-purpose: the pool is per *session* and shared across threads, so widening the
-plan makes it spill sooner rather than hold more. Groups within a table commit
-sequentially by construction — each is offered against the snapshot the last one
-produced — so without this a single table's rewrite would use one core however
-large the host, and a table with one hot partition is exactly the table that
-needs compacting.
-
-DataFusion sits behind the default-on `compaction` feature and adds ~70 crates
-to a tree that already carries Arrow, Parquet and tokio — it resolves to the
-same `arrow` 58 that `iceberg` 0.10 pins, so batches pass with no conversion.
-An embedder wanting only metadata maintenance carries no query engine:
+DataFusion is behind the default-on `compaction` feature and resolves to the
+same `arrow` 58 that `iceberg` 0.11 pins. A build without it has no compaction:
 
 ```bash
 cargo add bergman --no-default-features --features catalog-rest,storage-s3
 # -> expire, manifests, orphans. No DataFusion.
 ```
 
-The feature gates the **operation**, never a second implementation of it: a
-build without it has no compaction rather than a slower compaction.
-
-### Two rules that are silent when broken
-
-**Files are bucketed by which deletes apply to them.** An equality delete
-applies to a data file only when its sequence number is greater, and upstream's
-scan has already worked that out. So one group can hold files with different
-delete sets — the ordinary CDC shape — and anti-joining a file against a delete
-that does not apply to it would remove live rows.
-
-**Nulls match.** Iceberg's equality deletes match nulls; SQL `=` does not. The
-join uses `IS NOT DISTINCT FROM`, because `=` would keep every row whose delete
-key is null — forever, with nothing failing.
-
 ## The row count must land in a known interval
 
-Every group checks its row count on **both sides**, and refuses to commit when
-either disagrees. The outputs are abandoned; the orphan scanner reclaims them
-after the grace period.
+Every group checks its row count on both sides and refuses to commit when
+either disagrees; the outputs are abandoned and the orphan scanner reclaims them.
 
-| Side | Compares | Catches |
-|---|---|---|
-| Read | What the pipeline streamed against what the input manifests promised | A read that lost rows |
-| Write | What the output files hold against what reached the writer | A write that lost rows |
+| Side | Compares |
+|---|---|
+| Read | Rows streamed against what the input manifests promised |
+| Write | Rows in the output files against rows that reached the writer |
 
-Every number involved is metadata, so both checks are free. A rewrite that
-silently lost rows is indistinguishable from one that worked, and the table it
-produces is wrong forever.
-
-The manifests define a **closed interval** the output must land in:
+The output must land between two bounds taken from metadata:
 
 | Bound | Is | Breached when |
 |---|---|---|
-| **Ceiling** | Every row read | More rows came out than went in — the output duplicated data |
-| **Floor** | The rows of inputs that **no delete file applies to** | Rows that nothing could legitimately delete went missing |
+| **Ceiling** | Every row read | The output duplicated data |
+| **Floor** | The rows of inputs that **no delete file applies to** | Rows nothing could delete went missing |
 
-With no delete file applying, floor and ceiling coincide and the contract is an
-equality: rows in equal rows out.
-
-The floor is what makes the check mean anything on a delete-heavy table: a
-ceiling alone stops detecting row *loss* as soon as one delete file applies.
-
-The exact output count is not knowable from metadata — a delete file's
-`record_count` is an upper bound, since the same row may be named twice and a
-positional delete may name a row already gone. Bergman does not need it: a scan
-task names exactly which delete files apply to its data file, so the inputs that
-**no** delete touches are known precisely, and none of their rows may disappear.
+With no delete applying, the two coincide and the check is an equality.
 
 ## Sequence numbers
 
-A data file carried through a rewritten manifest untouched keeps **its own**
-sequence number. Stamping the new snapshot's number on it would make it look
-*newer* than the delete files that should remove its rows — which resurrects
-deleted rows.
-
-Newly written files are the opposite case: they genuinely belong to the new
-snapshot and take its number, which is higher than every delete file already
-applied to their contents. That is exactly what retires those deletes.
-
-This is why the commit layer uses `add_existing_file` for survivors and
+A data file carried through a rewritten manifest keeps **its own** sequence
+number, so later delete files still apply to it. Newly written files take the
+new snapshot's number, which is what retires the deletes applied to their
+contents. The commit layer uses `add_existing_file` for survivors and
 `add_file` for replacements.
 
 ## What is refused
 
-Bergman declines rather than guessing, and every refusal names its reason:
+Every refusal names its reason:
 
-- **A partition written under a superseded partition spec.** Output goes out
-  under the table's *current* spec, so a commit claiming it replaces files
-  partitioned differently mis-files every row in it. The planner does not plan
-  these and the executor refuses them.
-
-  The plan carries a note when one of them would otherwise have been rewritten,
-  and only then — a spec-evolved table keeps every old partition it ever had,
-  and a warning that fires when nothing is wrong is one nobody reads when
-  something is. Moving them to the current spec is a migration, which is
+- **A partition written under a superseded partition spec**, and **a group
+  spanning two specs**. Output is written under the current spec, so the commit
+  would mis-file every row. The plan notes such a partition only when it would
+  otherwise have been rewritten. Moving data to the current spec is a migration,
   [not maintenance](@/docs/status.md).
-- **A group spanning two partition specs**, for the same reason.
-- **Anything but Parquet, read or written.** Bergman handles Parquet in both
-  directions and only Parquet: upstream's `ArrowReader` opens a Parquet stream
-  whatever a scan task's format field says, and the writer is
-  `ParquetWriterBuilder`. So a table declaring `write.format.default = "orc"` is
-  refused rather than converted behind its owner's back — and every file a group
-  would read is checked too, because that property describes the *next* file a
-  writer produces, not the ones already there. A migrated table can hold Avro
-  data files while declaring Parquet, and reading one as Parquet fails with a
-  missing footer where a named refusal belongs. Delete files are checked the same
-  way, from the manifests, because an equality delete that fails to parse is one
-  whose rows would quietly not be removed.
-- **An Iceberg format v3 table.** Its row lineage cannot survive a rewrite
-  Bergman performs, and a v3 snapshot Bergman could author would be rejected by
-  a field the spec requires — see [below](#format-v3).
+- **Anything but Parquet**, read or written. A table whose
+  `write.format.default` is not Parquet is refused, and so is any group holding
+  a non-Parquet data or delete file, checked from the manifests.
+- **An encrypted table** (`encryption.key-id`). Its manifests and manifest lists
+  are encrypted and Bergman does not decrypt them. Snapshot expiration still
+  runs, because it needs no manifest.
+- **A v3 data file without its rows' lineage** — see [below](#format-v3).
 - **A rewrite whose row count is wrong**, as above.
 
-Each is reported per group, and the rest of the table is still compacted — every
-group commits on its own. The two that apply to a whole table — a v3 table, and
-a non-Parquet one — appear as a **note** on the plan rather than as a per-cycle
-failure, so `bergman plan` says why nothing will happen instead of reporting a
-fragmented table as healthy.
+Group-level refusals leave the rest of the table compacted. The two that apply
+to a whole table — encrypted and non-Parquet — appear as a **note** on the plan.
 
 ## Format v3 {#format-v3}
 
-Bergman rewrites v1 and v2 tables. A **v3** table's rewrite is refused, with the
-reason in the plan. Two things block it independently, and both must close:
+v1, v2 and v3 tables are maintained alike: compaction, manifest rewriting and
+dangling-delete removal all run on v3.
 
-- **Row lineage.** A rewrite must copy each row's existing `_row_id` into the file
-  replacing it. Bin-packing moves rows between files, so the new file's positional
-  inheritance would give them different ids — preserving them means writing a
-  physical column, which no released writer supports.
-- **Deletion vectors.** v3 encodes position deletes as `deletion-vector-v1` Puffin
-  blobs, and the released reader has no decoder for them, so a rewrite could not
-  see the deletes it must apply.
+### Row lineage
 
-### Why refusing beats trying
+A v3 row has a `_row_id` and a `_last_updated_sequence_number`; a reader that
+finds no physical value inherits them from the file's `first_row_id` and
+position. Bin-packing moves rows, so a rewrite writes lineage **physically**:
 
-Because the alternative fails silently. Without a physical `_row_id`, readers
-fall back to inheritance and **every row the rewrite touched is renumbered** — a
-`MERGE` or a CDC consumer joining on row id starts matching the wrong rows, and
-nothing fails. A rewrite that could not see a table's deletion vectors would
-write the rows they hide straight back in, and they would stay.
+- Each row's `_row_id` and `_last_updated_sequence_number` are read and written
+  into the new file as columns. A rewrite is not a change.
+- A row with no lineage yet (a null `_row_id`, in a table upgraded from v2) is
+  written null and inherits an id from the new file's range.
+- New manifest entries leave `first_row_id` null. The manifest list is seeded
+  from the table's `next-row-id`, and the snapshot records the range it assigned
+  (`first-row-id`, `added-rows`), so the catalog advances `next-row-id` by
+  exactly that range.
+- Manifest rewriting keeps every entry's `first_row_id`.
+- The snapshot producer refuses, with the file named, an added v3 data file that
+  lacks the two columns. Bergman's writer always writes them; the check guards
+  library callers.
 
-So the refusal sits above the commit layer rather than relying on a catalog to
-reject the result.
+### Deletion vectors
 
-### What still runs
+Deletion vectors (`deletion-vector-v1` blobs in Puffin files) are read and
+applied like position deletes, and retired under the same
+[delete-file rule](#the-delete-file-rule). One Puffin file holds many vectors,
+so retiring one removes a manifest entry, never a file, and files are identified
+by `(path, offset)`.
 
-The refusal covers what Bergman authors itself: compaction, dangling-delete
-removal and manifest rewriting. **Snapshot expiration and orphan removal still
-run** — the first is upstream's own action, the second commits nothing — so a v3
-table's history stays bounded and its storage still gets reclaimed.
-
-```text
-prod.streaming.events
-  rule: prod.streaming.*
-  note: compaction is enabled but cannot run: the table is Iceberg format v3, and
-        Bergman cannot yet rewrite one for two independent reasons: its row lineage
-        cannot be preserved through a rewrite (the `_row_id` of every moved row must
-        be written back as a physical column, which no released writer supports), and
-        its deletion vectors cannot be read at all (the released crate has no
-        `deletion-vector-v1` decoder), so a rewrite would resurrect every row they
-        hide. Snapshot expiration and orphan removal still run
-  -> expire-snapshots
-     why: oldest snapshot is 30d old (> 7d), 41 snapshots retained (keeping at least 3)
-```
-
-### A deletion vector is not a file
-
-One Puffin file holds the vectors of many data files, and the spec requires a
-writer removing a data file to drop that file's vector **from the delete
-manifest** — not to rewrite the Puffin file. So retiring a vector removes a
-manifest entry, never a file: Bergman identifies files by `(path, offset)` so that
-removing one vector cannot match a live sibling sharing its container.
-
-This is why **orphan removal matters more on v3, not less**. Superseded vectors
-accumulate inside live Puffin files that nobody rewrites, and an orphan scan is
-the only thing that ever reclaims that space.
+A dangling deletion vector is never retired by dangling-delete removal; its
+space is reclaimed by orphan removal once nothing references its Puffin file.
 
 ## Sort-based clustering
 
-Output is sorted when the rule asks, when `[defaults]` asks, or — and this is
-the case that matters most — **when the table itself asks**:
+Output is sorted when the rule, `[defaults]`, or the table itself asks:
 
 ```toml
 [rules.compaction]
@@ -517,13 +315,9 @@ sort = ["event_date", "customer_id"]
 
 ### The table's own sort order {#the-tables-own-sort-order}
 
-A table that declares an Iceberg `sort-order` has writers that honour it.
-Bin-packing those files back together *unsorted* would leave the table claiming
-a clustering its files no longer have, and every query with a predicate on the
-sort columns would start reading every file — maintenance making the table
-slower, silently.
-
-So the sort resolves through the usual layers, with the table as layer 3:
+A table that declares an Iceberg `sort-order` has it reproduced — direction and
+null placement included — so a rewrite does not leave the table claiming a
+clustering its files lack.
 
 | Layer | Source |
 |---|---|
@@ -537,19 +331,11 @@ So the sort resolves through the usual layers, with the table as layer 3:
  compaction.sort     event_date, customer_id desc the table's sort order
 ```
 
-Direction and null placement are reproduced exactly: writing the rows back
-ascending when the table asked for descending would be a different clustering
-wearing the table's name.
+A rule's `sort` takes column names only; direction belongs on the table's
+`sort-order`.
 
-A rule's `sort` is only column names, on purpose. Direction belongs on the
-table's `sort-order`, where every other Iceberg tool reads it; a rule is the
-escape hatch for a table that declares no order at all.
-
-**Transforms Bergman cannot reproduce.** A field sorted by `bucket(id, 16)`
-orders rows by a value that is not in the file. Sort order is lexicographic, so
-such a field does not simply drop out — everything after it becomes meaningless
-too. Bergman keeps the leading run of identity-transform fields, which is a
-coarser version of exactly the table's ordering, and warns about the rest:
+A non-identity transform such as `bucket(id, 16)` cannot be reproduced. Bergman
+sorts by the leading identity fields and warns:
 
 ```text
 warning: the table's sort order includes bucket[16](customer_id), which Bergman
@@ -559,31 +345,16 @@ at all
 
 ### How the sort runs
 
-Rows are sorted **globally within each file group**, so every output file ends
-up with a tight min/max range for the sort columns and a query with a predicate
-on them can skip whole files. Sorting each batch independently would leave every
-file spanning the whole key range and buy nothing.
+Rows are sorted **globally within each file group**, so each output file has a
+tight min/max range on the sort columns. The sort spills at `max_sort_memory`.
+Sort columns are validated against the schema before anything is read.
 
-The sort spills to disk when it reaches `max_sort_memory`, so a large group is
-sorted rather than refused. Sort columns are checked against the schema before
-anything is read, so a typo costs a metadata lookup rather than a full partition
-read.
-
-Z-ordering is not implemented: it is an optimization rather than table health,
-and it comes after bin-packing and sorting are proven.
-
-> [!NOTE]
-> Rewritten files do not carry a `sort_order_id`. Upstream's `DataFile` keeps
-> the field crate-private with no setter, so Bergman cannot stamp it — the rows
-> are clustered and their bounds are tight, but a reader has to discover that
-> from the statistics rather than being told. It is the natural thing to
-> contribute upstream.
+Bergman does not Z-order. Rewritten files carry no `sort_order_id`: upstream's
+`DataFile` keeps the field crate-private with no setter.
 
 ## Output files
 
-Rewritten files honour the table's own Parquet settings rather than Bergman's
-opinion, so a rewrite does not silently re-encode a table differently from every
-other writer:
+Rewritten files honour the table's own settings:
 
 | Property | Used for |
 |---|---|
@@ -597,13 +368,8 @@ other writer:
 | `write.parquet.bloom-filter-fpp.column.<col>` | Their false-positive probability |
 | `write.target-file-size-bytes` | The size output files roll at |
 | `write.data.path` | Where data files go |
+| `write.object-storage.enabled` | The hashed object-storage layout, under `write.data.path` when set — upstream's `ObjectStorageLocationGenerator` |
 | `write.metadata.path` | Where manifests and manifest lists go |
 | *its `sort-order`* | The clustering a rewrite reproduces — see [Sort-based clustering](#sort-based-clustering) |
 
-A malformed value falls back to the default rather than failing the rewrite: a
-table property somebody typed wrong should not take a table out of maintenance.
-
-**The one opinion a rewrite cannot reproduce is the hashed object-storage
-layout** (`write.object-storage.enabled`): rewritten files land under the plain
-data path, and `bergman plan` says so once per table rather than leaving it
-silent — see [Status](@/docs/status.md#limits).
+A malformed value falls back to the default rather than failing the rewrite.

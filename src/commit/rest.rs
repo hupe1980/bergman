@@ -12,6 +12,7 @@
 //! busy.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -20,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use iceberg::{TableIdent, TableRequirement, TableUpdate};
 
-use crate::commit::auth::{Credential, TokenSource};
+use crate::commit::auth::TokenSource;
 use crate::error::{Error, Result};
 
 /// How long one request may take.
@@ -33,6 +34,17 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long the whole client will spend establishing a connection.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The HTTP client Bergman's own requests go through: commits, and the `OAuth2`
+/// exchange both clients' tokens come from.
+pub fn http_client() -> Result<Client> {
+    Client::builder()
+        .user_agent(concat!("bergman/", env!("CARGO_PKG_VERSION")))
+        .timeout(REQUEST_TIMEOUT)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .build()
+        .map_err(|e| Error::config(format!("could not build an HTTP client: {e}")))
+}
 
 /// How many times a *throttled* request is re-sent.
 ///
@@ -102,7 +114,9 @@ pub struct RestCommitter {
     /// discovered once from `/v1/config` rather than configured, because the
     /// catalog is the authority on its own routing.
     prefix: Option<String>,
-    tokens: TokenSource,
+    /// Shared with the catalog client's read path, so both present the same
+    /// token from one cache (see [`crate::catalog::CatalogConnection`]).
+    tokens: Arc<TokenSource>,
     /// Whether the catalog said it serves table commits.
     ///
     /// `None` when it advertised no endpoint list at all, which most
@@ -120,19 +134,10 @@ impl RestCommitter {
     pub async fn connect(
         uri: &str,
         warehouse: Option<&str>,
-        properties: &HashMap<String, String>,
-        explicit_token: Option<String>,
+        tokens: Arc<TokenSource>,
     ) -> Result<Self> {
-        let client = Client::builder()
-            .user_agent(concat!("bergman/", env!("CARGO_PKG_VERSION")))
-            .timeout(REQUEST_TIMEOUT)
-            .connect_timeout(CONNECT_TIMEOUT)
-            .build()
-            .map_err(|e| Error::config(format!("could not build an HTTP client: {e}")))?;
-
+        let client = http_client()?;
         let uri = uri.trim_end_matches('/').to_string();
-        let credential = Credential::from_properties(properties, explicit_token, &uri)?;
-        let tokens = TokenSource::new(credential, client.clone());
 
         // The warehouse is appended by hand rather than through `query`, which
         // lives behind a reqwest feature this build does not carry — one
@@ -201,6 +206,11 @@ impl RestCommitter {
             tokens,
             commits_supported,
         })
+    }
+
+    /// The routing prefix the catalog's `/v1/config` named, if it named one.
+    pub fn prefix(&self) -> Option<&str> {
+        self.prefix.as_deref()
     }
 
     /// Whether the catalog advertised support for table commits.
@@ -404,7 +414,7 @@ fn io_error(message: String) -> iceberg::Error {
 /// and the set of characters that must survive is exact: a namespace separator
 /// (`\u{1f}`) has to become `%1F`, and a table name may contain anything
 /// Iceberg permits.
-fn encode_path_segment(segment: &str) -> String {
+pub(crate) fn encode_path_segment(segment: &str) -> String {
     let mut out = String::with_capacity(segment.len());
     for byte in segment.as_bytes() {
         match byte {
@@ -429,7 +439,10 @@ mod tests {
             client: Client::new(),
             uri: "https://catalog.example.com".into(),
             prefix: prefix.map(Into::into),
-            tokens: TokenSource::new(Credential::None, Client::new()),
+            tokens: Arc::new(TokenSource::new(
+                crate::commit::auth::Credential::None,
+                Client::new(),
+            )),
             commits_supported: None,
         }
     }

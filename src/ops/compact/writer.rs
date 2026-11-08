@@ -13,7 +13,8 @@ use iceberg::writer::IcebergWriterBuilder;
 use iceberg::writer::base_writer::data_file_writer::{DataFileWriter, DataFileWriterBuilder};
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
-    DefaultFileNameGenerator, DefaultLocationGenerator,
+    DefaultFileNameGenerator, DefaultLocationGenerator, LocationGenerator,
+    ObjectStorageLocationGenerator,
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 
@@ -21,7 +22,46 @@ use crate::error::{Error, Result};
 
 /// The writer a rewritten group is streamed into.
 pub(super) type GroupWriter =
-    DataFileWriter<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
+    DataFileWriter<ParquetWriterBuilder, TableLocations, DefaultFileNameGenerator>;
+
+/// Where the table says its data files go.
+///
+/// `write.object-storage.enabled` asks for a hashed directory tree in front of
+/// each file so a hot table's objects spread across object-store prefixes; a
+/// rewrite writing the plain layout instead would concentrate a compacted
+/// table's objects in the one prefix the property exists to avoid. Both
+/// generators are upstream's, and honour `write.data.path`.
+#[derive(Clone, Debug)]
+pub(super) enum TableLocations {
+    Plain(DefaultLocationGenerator),
+    Hashed(ObjectStorageLocationGenerator),
+}
+
+impl TableLocations {
+    fn of(metadata: &iceberg::spec::TableMetadata) -> Result<Self> {
+        // Java reads the property with `Boolean.parseBoolean`: `true` in any
+        // case is on, and everything else — including a typo — is off.
+        let hashed = metadata
+            .properties()
+            .get("write.object-storage.enabled")
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
+        let generator = if hashed {
+            ObjectStorageLocationGenerator::new(metadata).map(Self::Hashed)
+        } else {
+            DefaultLocationGenerator::new(metadata).map(Self::Plain)
+        };
+        generator.map_err(|e| Error::Storage(Box::new(e)))
+    }
+}
+
+impl LocationGenerator for TableLocations {
+    fn generate_location(&self, partition_key: Option<&PartitionKey>, file_name: &str) -> String {
+        match self {
+            Self::Plain(g) => g.generate_location(partition_key, file_name),
+            Self::Hashed(g) => g.generate_location(partition_key, file_name),
+        }
+    }
+}
 
 /// Open a writer for one file group.
 pub(super) async fn open(
@@ -32,18 +72,15 @@ pub(super) async fn open(
     let metadata = table.metadata();
     let file_io = table.file_io().clone();
 
-    let location_generator =
-        DefaultLocationGenerator::new(metadata).map_err(|e| Error::Storage(Box::new(e)))?;
+    let location_generator = TableLocations::of(metadata)?;
     let file_name_generator = DefaultFileNameGenerator::new(
         "bergman".to_string(),
         Some(uuid::Uuid::new_v4().to_string()),
         DataFileFormat::Parquet,
     );
 
-    let parquet_writer_builder = ParquetWriterBuilder::new(
-        writer_properties(metadata),
-        metadata.current_schema().clone(),
-    );
+    let parquet_writer_builder =
+        ParquetWriterBuilder::new(writer_properties(metadata), write_schema(metadata)?);
 
     // The rolling writer is what makes the target file size real: it closes a
     // file and opens the next when the current one reaches the target, rather
@@ -59,6 +96,47 @@ pub(super) async fn open(
     DataFileWriterBuilder::new(rolling)
         .build(partition_key_for(table, group)?)
         .await
+        .map_err(|e| Error::Storage(Box::new(e)))
+}
+
+/// The reserved row-lineage field ids a rewrite of this table reads and writes.
+///
+/// Empty below format v3, which has no row lineage.
+pub(super) fn lineage_field_ids(metadata: &iceberg::spec::TableMetadata) -> Vec<i32> {
+    use iceberg::metadata_columns::{
+        RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_FIELD_ID_ROW_ID,
+    };
+    if metadata.format_version() < iceberg::spec::FormatVersion::V3 {
+        return Vec::new();
+    }
+    vec![
+        RESERVED_FIELD_ID_ROW_ID,
+        RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+    ]
+}
+
+/// The schema a rewritten file is written under: the table's current schema,
+/// plus — on v3 — the two row-lineage columns as physical fields.
+///
+/// A rewrite moves rows to new positions in a new file, and a reader derives a
+/// row's lineage from its file's position whenever the file does not carry it.
+/// Written physically, every row keeps the `_row_id` and
+/// `_last_updated_sequence_number` it had; a row whose value is null still
+/// inherits, which is the spec's rule for rows that never had one.
+fn write_schema(metadata: &iceberg::spec::TableMetadata) -> Result<iceberg::spec::SchemaRef> {
+    let current = metadata.current_schema();
+    if lineage_field_ids(metadata).is_empty() {
+        return Ok(current.clone());
+    }
+    let mut fields: Vec<_> = current.as_struct().fields().to_vec();
+    fields.push(iceberg::metadata_columns::row_id_field().clone());
+    fields.push(iceberg::metadata_columns::last_updated_sequence_number_field().clone());
+    iceberg::spec::Schema::builder()
+        .with_schema_id(current.schema_id())
+        .with_identifier_field_ids(current.identifier_field_ids())
+        .with_fields(fields)
+        .build()
+        .map(std::sync::Arc::new)
         .map_err(|e| Error::Storage(Box::new(e)))
 }
 
@@ -88,7 +166,7 @@ fn partition_key_for(table: &Table, group: &[&FileScanTask]) -> Result<Option<Pa
 
     let refuse = |reason: String| Error::refused("compact", table.identifier().to_string(), reason);
 
-    let mut tuples = group.iter().map(|task| task.partition.as_ref());
+    let mut tuples = group.iter().map(|task| task.partition());
 
     let Some(Some(value)) = tuples.next() else {
         return Err(refuse(

@@ -15,7 +15,6 @@ use iceberg::spec::ManifestList;
 use iceberg::table::Table;
 
 use crate::error::{Error, Result};
-use crate::policy::TableRef;
 
 /// Every file a table's retained metadata refers to.
 #[derive(Debug, Default, Clone)]
@@ -117,11 +116,7 @@ fn collapse_slashes(path: &str) -> String {
 ///
 /// Walks **all** retained snapshots, not only the current one: a snapshot kept
 /// for time travel needs its data files as much as the current one does.
-pub async fn compute(
-    table_ref: &TableRef,
-    table: &Table,
-    concurrency: usize,
-) -> Result<ReachableSet> {
+pub async fn compute(table: &Table, concurrency: usize) -> Result<ReachableSet> {
     let metadata = table.metadata();
     let mut reachable = ReachableSet::default();
     let concurrency = concurrency.max(1);
@@ -161,9 +156,6 @@ pub async fn compute(
         metadata.location().trim_end_matches('/')
     )));
 
-    let file_io = table.file_io();
-    let format_version = metadata.format_version();
-
     // **Two flat phases rather than a nested fan-out**, and that is the whole
     // shape of this function.
     //
@@ -179,23 +171,10 @@ pub async fn compute(
     // time travel needs its data files as much as the current one does, so this
     // is all of them, not just the head.
     let manifest_lists: Vec<(String, ManifestList)> = stream::iter(metadata.snapshots())
-        .map(|snapshot| {
-            let file_io = file_io.clone();
-            let table_ref = table_ref.clone();
-            async move {
-                let path = snapshot.manifest_list().to_string();
-                let bytes = file_io
-                    .new_input(&path)
-                    .map_err(|e| Error::Storage(Box::new(e)))?
-                    .read()
-                    .await
-                    .map_err(|e| Error::Storage(Box::new(e)))?;
-                let list =
-                    ManifestList::parse_with_version(&bytes, format_version).map_err(|e| {
-                        Error::metadata(&table_ref, format!("unreadable manifest list: {e}"))
-                    })?;
-                Ok::<_, Error>((path, list))
-            }
+        .map(|snapshot| async move {
+            let path = snapshot.manifest_list().to_string();
+            let list = crate::catalog::read::manifest_list(table, snapshot).await?;
+            Ok::<_, Error>((path, list))
         })
         .buffer_unordered(concurrency)
         // `try_collect` aborts on the first error, which is the property this
@@ -238,12 +217,8 @@ pub async fn compute(
             .filter_map(|p| by_path.get(&normalize(p))),
     )
     .map(|manifest_file| {
-        let file_io = file_io.clone();
         async move {
-            let manifest = manifest_file
-                .load_manifest(&file_io)
-                .await
-                .map_err(|e| Error::Storage(Box::new(e)))?;
+            let manifest = crate::catalog::read::manifest(table, manifest_file).await?;
 
             // Every entry, including `Deleted` ones. A deleted entry names
             // a file this snapshot removed — but an *older* retained

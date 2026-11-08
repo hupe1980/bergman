@@ -33,8 +33,7 @@
  prod.finance.ledger          12      6.02 GiB   402 MiB / 2.90 GiB   —</code></pre>
       </div>
       <p class="hero__note">
-        Reads only, changes nothing. The first command answers what is wrong
-        before Bergman is trusted to write anything.
+        Reads only, changes nothing.
       </p>
     </div>
   </div>
@@ -53,20 +52,18 @@
   <div class="wrap">
     <h2 class="section__title">Maintenance is a background tenant.</h2>
     <p class="section__lede">
-      It must never win against a foreground writer, and never corrupt one. Every
-      design decision below follows from that — triggers instead of schedules,
-      replan instead of retry, and a deletion path with eight independent checks
-      standing in front of it.
+      It never wins against a foreground writer and never corrupts one: triggers
+      instead of schedules, replan instead of retry, and eight independent checks
+      in front of every delete.
     </p>
 
     <div class="pillars">
       <article class="pillar">
         <h3>Policies declare intent</h3>
         <p>
-          Every setting resolves through four layers: the matching rule, your
-          defaults, <em>the table's own Iceberg properties</em>, then the
-          specification default. A table already carries its owner's intent, and
-          Bergman reads it rather than competing with it.
+          Every setting resolves through five layers: the matching rule, your
+          defaults, the catalog's policy (Apache Polaris, opt-in), <em>the table's own
+          Iceberg properties</em>, then the specification default.
         </p>
         <a class="pillar__link" href="{{ get_url(path='@/docs/policies.md') }}">How layering works →</a>
       </article>
@@ -75,9 +72,8 @@
         <h3>Triggered, not scheduled</h3>
         <p>
           A schedule decides when a table is <em>evaluated</em>; measurements decide
-          whether anything runs. A table already at target file size costs a handful
-          of metadata reads and no data I/O — which is what makes it safe to evaluate
-          thousands of tables often.
+          whether anything runs. A healthy table costs a few metadata reads and no
+          data I/O.
         </p>
         <a class="pillar__link" href="{{ get_url(path='@/docs/compaction.md') }}">What triggers a rewrite →</a>
       </article>
@@ -87,8 +83,7 @@
         <p>
           Each planned operation carries the measurement that crossed a threshold and
           the threshold it crossed. <code>policy explain</code> prints every effective
-          value together with the layer it came from. An operation you cannot
-          interrogate is one you cannot trust with your data.
+          value with the layer it came from.
         </p>
         <a class="pillar__link" href="{{ get_url(path='@/docs/policies.md') }}#provenance">See provenance →</a>
       </article>
@@ -96,11 +91,10 @@
       <article class="pillar">
         <h3>Deletion is the hard part</h3>
         <p>
-          Dry run by default. A grace period with a hard 24-hour floor that cannot be
-          configured away. Unknown file age means too young. Segment-wise containment,
-          and a refusal to scan a location another table lives inside. Re-verification
-          against freshly loaded metadata, a ceiling on the blast radius, and a refusal
-          when the listing and the table's metadata share no file at all.
+          Dry run by default, a hard 24-hour grace floor, unknown age treated as
+          young, segment-wise containment, no scanning around a nested table,
+          re-verification before deleting, a blast-radius ceiling, and a refusal when
+          listing and metadata share no file.
         </p>
         <a class="pillar__link" href="{{ get_url(path='@/docs/orphans.md') }}">The safety model →</a>
       </article>
@@ -109,9 +103,8 @@
         <h3>Replan, never re-commit</h3>
         <p>
           Losing a compare-and-swap to a foreground writer is reported as
-          <em>conflicted</em>, not failed — it is the design working. Each retry
-          reloads the table, because re-submitting a commit computed against a table
-          that has since moved is how deleted rows come back.
+          <em>conflicted</em>, not failed. Each retry reloads the table rather than
+          re-submitting a commit computed against one that has moved.
         </p>
         <a class="pillar__link" href="{{ get_url(path='@/docs/architecture.md') }}#commits">The commit model →</a>
       </article>
@@ -119,10 +112,9 @@
       <article class="pillar">
         <h3>A library first</h3>
         <p>
-          The binary is a thin consumer of the same public API you get. No global
-          state, no logger it installs, no runtime it creates. Planning is pure, so
-          dry-run is not a mode to remember — it is what happens when you stop before
-          <code>run()</code>.
+          The binary is a thin consumer of the same public API. No global state, no
+          logger installed, no runtime created. Planning is pure: dry-run is stopping
+          before <code>run()</code>.
         </p>
         <a class="pillar__link" href="{{ get_url(path='@/docs/library.md') }}">Embed it →</a>
       </article>
@@ -134,9 +126,8 @@
   <div class="wrap">
     <h2 class="section__title">What <code>plan</code> shows is what <code>run</code> does</h2>
     <p class="section__lede">
-      Both build the same plan through the same code, so a preview cannot disagree
-      with the thing it previews. Every operation carries the measurement that
-      triggered it and the threshold it crossed.
+      Both build the plan through the same code. Every operation carries the
+      measurement that triggered it and the threshold it crossed.
     </p>
 
 <pre class="code-showcase"><code class="language-text">$ bergman plan
@@ -153,8 +144,7 @@ prod.analytics.events
 1 tables, 2 operations, 1.83 GiB to read</code></pre>
 
     <p class="section__foot">
-      It reads 412 files, not 480: a partition triggers a rewrite, but only the files
-      a rewrite would improve are read.
+      It reads 412 files, not 480: only the files a rewrite would improve are read.
       <a href="{{ get_url(path='@/docs/compaction.md') }}#eligible">Which files those are →</a>
     </p>
   </div>
@@ -200,14 +190,14 @@ skip  = true              # explicit exclusion beats implicit</code></pre>
     <div class="shapes">
       <article class="shape">
         <h3>Cron job</h3>
-        <p>One cycle, then exit. A Kubernetes <code>CronJob</code>, an ECS scheduled task, or a line in a crontab. Exits <code>2</code> when something needs attention, so a broken job cannot look healthy.</p>
+        <p>One cycle, then exit. A Kubernetes <code>CronJob</code>, an ECS scheduled task, or a line in a crontab. Exits <code>2</code> when an operation failed or was refused.</p>
 <pre><code class="language-bash">bergman run \
   --config /etc/bergman.toml \
   --audit-log /var/log/bergman.jsonl</code></pre>
       </article>
       <article class="shape">
         <h3>Read-only first</h3>
-        <p>Report health and plan work without writing anything, until the plans look right. The same code path <code>run</code> uses — what you were shown is what happens.</p>
+        <p>Report health and plan work without writing anything — through the same code path <code>run</code> uses.</p>
 <pre><code class="language-bash">bergman inspect
 bergman plan --format json \
   | jq '.tables[].operations[]'</code></pre>

@@ -3,16 +3,12 @@ title = "Library"
 description = "Embedding Bergman: the API contract, the observer hook, and what the library deliberately refuses to do."
 weight = 9
 +++
-Bergman is a library first. The `bergman` binary is a thin consumer of the same
-public API you get, which is how that API stays sufficient — anything the CLI can
-do, an embedder can do.
+The `bergman` binary is a thin consumer of the same public API — anything the
+CLI can do, an embedder can do.
 
 ```bash
 cargo add bergman --no-default-features --features catalog-rest,storage-s3
 ```
-
-`--no-default-features` drops the CLI, the terminal renderer, the logging setup,
-the cloud backends you are not using — and the query engine.
 
 ## What each feature costs you
 
@@ -24,26 +20,12 @@ the cloud backends you are not using — and the query engine.
 | `storage-s3` / `-gcs` / `-azure` | ✅ via `storage-all` | Cloud object stores |
 | `metrics` | — | Prometheus metrics and the `/metrics` endpoint |
 
-`compaction` is the one worth a decision. It is the only operation that reads
-and writes *data*, and therefore the only one that needs a query engine — see
-[Compaction](@/docs/compaction.md#query-engine) for why equality deletes make
-that unavoidable. It adds ~70 crates and a noticeable amount of compile time.
-
-If you are embedding Bergman for **metadata maintenance** — the Lakekeeper
-shape: expire snapshots, re-pack manifests, remove orphans — leave it off and
-carry no query engine at all:
-
-```bash
-cargo add bergman --no-default-features --features catalog-rest,storage-s3
-# -> expire, manifests, orphans. No DataFusion.
-```
-
-The feature gates the **operation**, never a second implementation of it. A
-build without it has no compaction rather than a slower compaction, so there is
-only ever one executor to keep correct. Planning stays feature-independent —
-`plan()` still reports that a table needs compacting, and `run()` reports the
-operation as `refused` naming the feature to rebuild with, rather than silently
-omitting it.
+`compaction` is the only operation that reads and writes *data*, and the only
+one needing a query engine ([why](@/docs/compaction.md#query-engine)). For
+metadata maintenance only — expire, manifests, orphans — leave it off, as in the
+`cargo add` above, and carry no DataFusion. Planning is feature-independent: a
+build without it still plans compaction, and `run()` reports the operation as
+`refused`, naming the feature to rebuild with.
 
 ## The shape
 
@@ -61,15 +43,10 @@ let plan   = bergman.plan().await?;
 let report = bergman.run(&plan).await?;
 ```
 
-Every one of these has a scoped sibling — `inspect_matching(pattern)`,
-`plan_matching(pattern)`, `plan_tables(&[table])` — and they scope the
-*examination*, not the output. A table the pattern excludes is never read, which
-is what makes "what is wrong with this one namespace" cost a namespace's
-metadata rather than the warehouse's.
-
-A plan is a plain value, so scoping *which operations* run is a filter on it
-rather than another entry point — `MaintenancePlan::retain_operations`, which is
-what `bergman run --only` calls:
+Scoped siblings — `inspect_matching(pattern)`, `plan_matching(pattern)`,
+`plan_tables(&[table])` — scope the *examination*: an excluded table is never
+read. To scope *which operations* run, filter the plan with
+`MaintenancePlan::retain_operations` (what `bergman run --only` calls):
 
 ```rust
 let mut plan = bergman.plan().await?;
@@ -77,13 +54,11 @@ plan.retain_operations(&[OperationKind::RemoveOrphans]);
 let report = bergman.run(&plan).await?;
 ```
 
-Any subset is safe: filtering preserves the per-table order, and dropping an
-operation only ever makes the others do less.
+Any subset is safe; per-table order is preserved.
 
 A plan may carry **notes**: work the policy asked for that a table cannot
-receive, with the reason — a [format v3 table](@/docs/compaction.md#format-v3),
-a non-Parquet one, a partition under a superseded spec. Surface them, or those
-tables read as healthy:
+receive, with the reason — an [encrypted table](@/docs/compaction.md#what-is-refused),
+a non-Parquet one, a partition under a superseded spec. Surface them:
 
 ```rust
 for (table, note) in plan.notes() {
@@ -91,7 +66,7 @@ for (table, note) in plan.notes() {
 }
 ```
 
-`Config` is an ordinary Rust value. Nothing forces you to have a file at all:
+`Config` is an ordinary Rust value; no file is needed:
 
 ```rust
 use bergman::policy::{Config, Rule, TableSettings, SnapshotSettings};
@@ -115,44 +90,31 @@ let config = Config {
 
 ## The contract
 
-These are guarantees, not implementation details. The CLI is where each one's
-opposite lives.
+**No global state.** No logger, tracing subscriber or signal handler is
+installed, and no configuration file is read unasked. The library emits
+[`tracing`](https://docs.rs/tracing) spans and events.
 
-**No global state.** The library installs no logger, no tracing subscriber and no
-signal handler, and reads no configuration file on its own initiative. It emits
-[`tracing`](https://docs.rs/tracing) spans and events; what listens is yours.
+**Bring your own runtime.** Every entry point is a plain `async fn`. Every
+concurrency limit is a parameter: `limits.max_parallel_tables` (tables in
+flight), `limits.io_concurrency` (object-store requests per operation) and
+`limits.compaction_parallelism` (CPU width of a rewrite).
 
-**Bring your own runtime.** Every entry point is a plain `async fn` on the
-caller's runtime. Every concurrency limit is a parameter, never a constant
-compiled in: `limits.max_parallel_tables` bounds tables in flight,
-`limits.io_concurrency` bounds object-store requests per operation (manifest
-reads and deletions), and `limits.compaction_parallelism` bounds the CPU width of
-a rewrite. An embedder sharing an HTTP connection pool with the rest of a service
-has to be able to say how much of it maintenance may take.
+**No background threads**, including for credentials — a token is renewed by
+the request that finds it due ([Long-lived processes](#long-lived)).
 
-**No background threads, including for credentials.** Nothing is renewed on a
-timer Bergman owns. `refresh_credentials()` is a method you call — see
-[Long-lived processes](#long-lived) — which is what lets a library that installs
-no signal handler still keep a long-running host authenticated.
+**Planning is pure.** `plan()` writes and deletes nothing; dry-run is stopping
+before `run()`, which executes exactly the plan it is given.
 
-**Planning is pure.** `plan()` performs no writes and no deletions, so dry-run is
-not a mode to remember — it is what happens when you stop before `run()`. The
-same `MaintenancePlan` that `plan()` returns is what `run()` executes.
+**Types are serializable.** `TableHealth`, `MaintenancePlan`, `EffectivePolicy`
+and `RunReport` implement `Serialize`.
 
-**Types are plain and serializable.** `TableHealth`, `MaintenancePlan`,
-`EffectivePolicy` and `RunReport` all implement `Serialize`, so an embedder can
-store a plan, diff two of them, or ship one over a wire without reaching into
-Bergman's internals.
-
-**Semver honesty.** Pre-1.0, breaking changes land in minor versions with a
-migration note in the changelog. The CLI surface stabilizes before the library
-API does, and this sentence exists so nobody has to guess.
+**Semver.** Pre-1.0, breaking changes land in minor versions with a migration
+note in the changelog.
 
 ## Observers {#observers}
 
-The extension point, in place of a plugin system. Every method has a default
-no-op body, so you override only what you care about and a new callback is not a
-breaking change.
+The extension point. Every method has a default no-op body; override only what
+you need.
 
 ```rust
 use bergman::obs::{MaintenanceObserver, OperationContext};
@@ -169,9 +131,8 @@ impl MaintenanceObserver for Metrics {
 }
 ```
 
-`OperationContext` carries the run id, the table, the operation, **the policy
-rule that matched**, and the reason the trigger fired — everything an audit
-record or a metric label needs.
+`OperationContext` carries the run id, the table, the operation, the matched
+rule, and the trigger's reason.
 
 ```rust
 let bergman = Bergman::builder(config)
@@ -182,8 +143,8 @@ let bergman = Bergman::builder(config)
 
 ### Approval gates
 
-`operation_starting` returning `false` **vetoes** the operation, which is then
-reported as `Refused` — an outcome that needs attention, not a silent skip:
+`operation_starting` returning `false` **vetoes** the operation, reported as
+`Refused`:
 
 ```rust
 async fn operation_starting(&self, ctx: OperationContext<'_>) -> bool {
@@ -191,14 +152,10 @@ async fn operation_starting(&self, ctx: OperationContext<'_>) -> bool {
 }
 ```
 
-This is how you require a human, a ticket, or a policy service to sign off on
-deletions without Bergman knowing anything about how that decision is made.
-
 ### Deletion manifests
 
-`deleting_files` is called with the **complete list before the first deletion**,
-which is what makes an audit trail survive a crash halfway through. Use it to
-mirror deletions into your own system of record.
+`deleting_files` receives the **complete list before the first deletion**, so a
+record survives a crash mid-deletion.
 
 ### Combining observers
 
@@ -211,30 +168,12 @@ let observers = Observers::new()
     .with(Arc::new(approval_gate));
 ```
 
-Every observer is consulted on `operation_starting` and any one may veto —
-deliberately without short-circuiting, so an approval gate's behaviour does not
-depend on the order it was registered in.
-
-## Who this is for
-
-**Rust catalogs.** [Lakekeeper](https://docs.lakekeeper.io/docs/latest/table-maintenance/)
-ships expire-snapshots and orphan removal but deliberately does not compact,
-emitting CloudEvents so an external engine can. [Rustberg](@/docs/rustberg.md)
-draws the same boundary. Bergman is the engine both leave room for.
-
-**Streaming writers and CDC sinks.** RisingWave proved the embedded-compactor
-pattern by building one into their engine. Anyone writing Iceberg from Rust
-should not have to.
-
-**Lakehouse platforms and control planes.** A service that already knows which
-tables exist and when they changed can drive maintenance directly, with an
-observer for its own metrics and approval gates.
+Every observer is consulted on `operation_starting`, without short-circuiting,
+and any one may veto.
 
 ## Running on a schedule
 
-`Daemon` wraps the same engine and calls back after each cycle. It has no
-opinion about output — returning the report rather than logging it is what keeps
-that true.
+`Daemon` wraps the same engine and calls back with each cycle's report.
 
 ```rust
 use bergman::sched::{Daemon, DaemonConfig};
@@ -252,15 +191,14 @@ daemon
     .await?;
 ```
 
-`shutdown` is any future; the loop checks it before each sleep and prefers it
-over a ready timer, so a stop is noticed promptly rather than after several
-cycles.
+`shutdown` is any future; it is checked before each sleep and wins over a ready
+timer.
 
 ### Reacting to changes
 
-Bergman owns the trigger and the debounce; the transport stays yours. Whatever
-already receives events in your deployment — a NATS subscriber, a Kafka
-consumer, a webhook — calls `notify`:
+Bergman owns the trigger and the debounce; the transport is yours. Whatever
+receives events — a NATS subscriber, a Kafka consumer, a webhook — calls
+`notify`:
 
 ```rust
 use bergman::sched::channel;
@@ -276,44 +214,37 @@ tokio::spawn(async move {
 daemon.run_with_events(on_cycle, Some(stream), shutdown_signal()).await?;
 ```
 
-`notify` returns whether the notification was queued. A full queue drops rather
-than blocking: a maintenance engine must never be able to stall the thing
-notifying it, and the *n*-th notification for one table says nothing the first
-did not.
-
-`Bergman::plan_tables` is the same thing without a daemon — plan a named subset
-and run it.
+`notify` returns whether the notification was queued; a full queue drops rather
+than blocks. Without a daemon, `Bergman::plan_tables` plans a named subset.
 
 ### Long-lived processes {#long-lived}
 
-If your process outlives its catalog token, call `refresh_credentials()` before
-each cycle. `Daemon` already does; a hand-rolled loop has to.
+A process that outlives its catalog token needs nothing extra. Each catalog has
+one token source shared by both clients — the read client
+(`iceberg-catalog-rest`, through its `AuthManager` hook) and Bergman's commit
+client. It renews **on demand**: the first request finding the token within a
+minute of expiry exchanges the credential again, and concurrent requests wait
+for that one exchange.
 
 ```rust
 loop {
-    // One OAuth2 exchange per catalog configured with a `credential`.
-    // Catalogs using a static token, or none, are skipped.
-    bergman.refresh_credentials().await;
-
+    // No credential step: a due token is renewed by whichever request needs it.
     let plan = bergman.plan().await?;
     let report = bergman.run(&plan).await?;
     // ...
 }
 ```
 
-`iceberg-catalog-rest` exchanges its credential once, at construction, and never
-again, and the read path is everything but the commits Bergman authors itself:
-table loads, discovery, and snapshot expiration's commit. Without this, a
-process holding a one-hour token keeps its cadence perfectly and stops reading a
-single table.
+A failed renewal fails the request that needed it, carrying the token
+endpoint's answer; the next request retries. A static `token_env` token is
+presented as given.
 
-A renewal that fails is logged and skipped rather than fatal — upstream fetches
-the replacement before discarding the old token, so the one in hand still works.
-The return value is how many catalogs were renewed.
+`CatalogConfig::connect()` returns both clients together as
+`CatalogConnection { client, committer, policy }`.
 
 ## Errors
 
-One error type, and the most useful thing on it is what to *do*:
+One error type, which says what to *do*:
 
 ```rust
 match bergman.run(&plan).await {
@@ -327,6 +258,6 @@ match bergman.run(&plan).await {
 }
 ```
 
-A conflict is `Replan`, never `Retry`. Re-submitting a commit computed against a
-table that has since moved is how deleted rows come back — see
+A conflict is `Replan`, never `Retry`: re-submitting a commit computed against a
+moved table can resurrect deleted rows — see
 [Architecture](@/docs/architecture.md#commits).

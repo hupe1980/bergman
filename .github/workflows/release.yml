@@ -66,23 +66,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Linux only, and both on a runner of their own architecture — so
-        # nothing is cross-compiled and nothing is emulated. GitHub's arm64
-        # Linux runners are what make that possible; before them this needed
-        # `cross`, whose last release still ships an Ubuntu 18.04 image too old
-        # to run the host binaries a current Rust emits.
-        #
-        # `musl`, so the binaries are statically linked: no glibc version on the
-        # host to match, and one artifact runs on anything.
-        #
-        # There is no macOS or Windows binary, and no gap where one would go.
-        # Bergman is a server-side maintenance engine — its deployments are
-        # cron, Kubernetes CronJobs, ECS and a daemon — and the two ways onto a
-        # laptop are the container image below and `cargo install bergman`,
-        # which works on every platform Rust does.
+        # Each on a runner of its own architecture, so nothing is
+        # cross-compiled or emulated. Linux is `musl`, statically linked, so one
+        # artifact runs on any distribution; macOS arm64 exists for Homebrew.
+        # No Windows binary (`cargo install bergman` covers it).
         include:
           - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
           - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+          - { target: aarch64-apple-darwin, os: macos-latest }
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -97,6 +88,7 @@ jobs:
       # they are preinstalled on the x86_64 runner images and named here anyway,
       # because the arm64 ones are slimmer.
       - name: Install musl toolchain
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq musl-tools musl-dev cmake pkg-config
@@ -114,11 +106,9 @@ jobs:
           cp "target/${{ matrix.target }}/release/bergman" "$name/"
           cp README.md LICENSE-APACHE LICENSE-MIT bergman.example.toml "$name/"
           tar czf "$name.tar.gz" "$name"
-          # A checksum beside each archive, so a download can be verified
-          # without trusting the transport. `sha256sum` because this matrix is
-          # Linux; macOS ships `shasum` and no `sha256sum`, which is what broke
-          # this the last time the matrix was wider.
-          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          # A checksum beside each archive. macOS has `shasum`, not `sha256sum`;
+          # both print the same `<hash>  <file>` line.
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -237,3 +227,60 @@ jobs:
             artifacts/*.tar.gz
             artifacts/*.tar.gz.sha256
           generate_release_notes: true
+
+  # Homebrew: Formula/bergman.rb in hupe1980/homebrew-tap. Needs the `release`
+  # environment with HOMEBREW_APP_ID and HOMEBREW_APP_PRIVATE_KEY: a GitHub App
+  # installed on the tap only, with contents: write. Actions are pinned by
+  # commit because this job holds that token.
+  tap:
+    name: Homebrew tap
+    runs-on: ubuntu-latest
+    needs: [release]
+    if: github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
+    environment: release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: bergman-*
+          path: artifacts
+          merge-multiple: true
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        id: app-token
+        with:
+          app-id: ${{ secrets.HOMEBREW_APP_ID }}
+          private-key: ${{ secrets.HOMEBREW_APP_PRIVATE_KEY }}
+          owner: hupe1980
+          repositories: homebrew-tap
+          permission-contents: write
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: hupe1980/homebrew-tap
+          token: ${{ steps.app-token.outputs.token }}
+          path: tap
+          persist-credentials: true
+      - name: Update the formula
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p tap/Formula
+          cat artifacts/*.tar.gz.sha256 > checksums.txt
+          packaging/homebrew/formula.sh "$version" checksums.txt > tap/Formula/bergman.rb
+          cd tap
+          if [ -n "$(git status --porcelain)" ]; then
+            git config user.name "bergman release"
+            git config user.email "bergman-release@users.noreply.github.com"
+            git add Formula/bergman.rb
+            git commit -m "bergman $version"
+            git push
+          fi
+
+  # The published formula installs and passes its own test.
+  brew:
+    name: Homebrew install
+    runs-on: macos-latest
+    needs: [tap]
+    steps:
+      - run: |
+          brew install hupe1980/tap/bergman
+          brew test bergman
+          [ "$(bergman --version)" = "bergman ${GITHUB_REF_NAME#v}" ]

@@ -1,11 +1,10 @@
 +++
 title = "Policies"
-description = "How a rule matches a table, how four layers resolve a setting, and how to find out why a value is what it is."
+description = "How a rule matches a table, how five layers resolve a setting, and how to find out why a value is what it is."
 weight = 3
 +++
-A policy declares *intent*. It does not declare a schedule of rewrites — whether
-anything actually runs is decided by measuring the table (see
-[Compaction](@/docs/compaction.md#triggers)).
+A policy declares *intent*; whether anything runs is decided by measuring the
+table ([Compaction](@/docs/compaction.md#triggers)).
 
 ## Rules
 
@@ -23,12 +22,8 @@ match = "prod.analytics.*"          # general rules after
 max_age = "30d"
 ```
 
-`events` gets 3 days. Ordering is the whole disambiguation rule — there is no
-specificity scoring, because a scoring function is a thing you have to simulate
-in your head to predict.
-
-Because the first match wins, a catch-all written **before** a specific rule
-makes that rule dead. Bergman refuses to start rather than let it be silent:
+`events` gets 3 days. There is no specificity scoring. A catch-all written
+**before** a specific rule makes it dead, and Bergman refuses to start:
 
 ```toml
 [[rules]]
@@ -46,16 +41,14 @@ does. Rules are evaluated in order and the first match wins, so put the
 specific rule first
 ```
 
-The check is **sound rather than complete**: it reports a repeated pattern and a
-literal prefix followed by `**`, and stays quiet about anything it cannot decide
-by inspection. `bergman policy match` is still the way to see what a rule set
-actually selects.
+The check is sound, not complete: it catches a repeated pattern and a literal
+prefix followed by `**`. `bergman policy match` shows what a rule set actually
+selects.
 
 ### Patterns
 
 Globs over `catalog.namespace….table`, with `.` as the separator. `*` stops at a
-namespace boundary and `**` crosses it — the same distinction `/` has in a
-filesystem glob:
+namespace boundary and `**` crosses it:
 
 | Pattern | `prod.analytics.events` | `prod.analytics.web.events` |
 |---|:--:|:--:|
@@ -65,27 +58,19 @@ filesystem glob:
 | `prod.streaming.events_*` | ❌ | ❌ |
 
 > [!NOTE]
-> This is the rule most likely to surprise, because Iceberg namespaces are
-> dotted and a nested namespace reads exactly like a table name. If a rule
-> matches less than you expected, you probably want `**`.
+> A nested namespace reads exactly like a table name. If a rule matches less
+> than expected, you probably want `**`.
 
-A table name may itself contain a dot. Bergman treats it as one segment, so
-`prod.analytics.*` matches the table named `a.b`, while `prod.analytics.a.b`
-matches the table `b` in namespace `a` — and not the other way round. Write
-`\.` to mean a dot that is part of a name rather than a separator:
+A dot inside a name is one segment; write `\.` to match it literally:
 
 | Pattern | Matches |
 |---|---|
 | `prod.analytics.a.b` | table `b` in namespace `analytics.a` |
 | `prod.analytics.a\.b` | table `a.b` in namespace `analytics` |
 
-Without the escape such a table could only be reached by a wildcard, so it could
-not be `skip`ped.
-
-A name may also contain `/`. It and `%` are percent-encoded per segment before
-matching, so the rendering is **injective**: the table `b/c` in namespace `a`
-and the table `c` in namespace `a.b` are different tables and no pattern reaches
-both. Write the name as it is — `prod.a.b/c`.
+`/` and `%` in a name are percent-encoded per segment before matching, so the
+table `b/c` in namespace `a` and the table `c` in namespace `a.b` are never
+confused. Write the name as it is — `prod.a.b/c`.
 
 ### Skipping
 
@@ -95,27 +80,22 @@ match = "prod.tmp.**"
 skip  = true
 ```
 
-A skipped table is reported as **skipped**; a table no rule matches is reported
-as **unmatched**. The distinction matters: one means "I excluded this", the other
-means "my pattern is not doing what I thought".
-
-`skip` alongside settings is a configuration error rather than a silent
-preference for one over the other.
+A skipped table is reported as **skipped**; a table no rule matches as
+**unmatched**. `skip` alongside settings is a configuration error.
 
 ## Layering
 
-Every setting resolves through four layers, most specific first:
+Every setting resolves through five layers, most specific first:
 
 1. the matching **rule**
 2. the config's **`[defaults]`**
-3. the **table's own metadata** — its Iceberg properties, and its `sort-order`
-4. the **Iceberg specification default**
+3. the **catalog's policy**, when the catalog is configured as a
+   [policy source](#catalog-policy)
+4. the **table's own metadata** — its Iceberg properties, and its `sort-order`
+5. the **Iceberg specification default**, or Bergman's own for knobs Iceberg
+   does not define
 
-Layer 3 is what makes this more than a config file. A table already carries its
-owner's intent, and every other Iceberg tool reads it; a maintenance engine that
-ignored it would be a second, competing source of truth.
-
-Properties consulted:
+Layer 4 means a table's own configuration is honoured. Properties consulted:
 
 | Setting | Table property | Spec default |
 |---|---|---|
@@ -131,32 +111,80 @@ And one thing that is not a property:
 |---|---|---|
 | `compaction.sort` | the table's `sort-order` | unsorted |
 
-That one is the sharpest case for the whole layer. A table declaring a sort
-order has writers that honour it, so a rewrite that bin-packed those files back
-together unsorted would leave the table claiming a clustering its files no
-longer have — and every query with a predicate on the sort columns would start
-reading every file. Preserving it is not an optimization; it is not breaking
-something the table configured. See
+A rewrite keeps the table's declared clustering — see
 [Compaction](@/docs/compaction.md#the-tables-own-sort-order).
 
-A property that is present but unusable falls through to the default rather than
-failing the run — it is one table's typo, and refusing to maintain a table over
-it would be a worse outcome. It is reported as a warning rather than ignored,
-because a property that silently does nothing looks exactly like one that works.
+A property that is present but unusable falls through to the default and is
+reported as a warning. **Zero is unusable** for every size and count (a zero
+target file size would make every file oversized). An age keeps its zero:
+`history.expire.max-snapshot-age-ms = 0` means no snapshot is too young, and
+`min_to_keep` still bounds what goes.
 
-**Unusable includes zero**, for every size and count, because each is a divisor
-or a threshold that becomes its own opposite there.
-`write.target-file-size-bytes = 0` puts the oversized threshold at zero, making
-every file in the table oversized and rewriting the whole thing every cycle;
-`commit.manifest.target-size-bytes = 0` makes no manifest undersized, so
-manifest rewriting silently never runs.
+## Catalog policy {#catalog-policy}
 
-An *age* keeps its zero: `history.expire.max-snapshot-age-ms = 0` means "no
-snapshot is too young to expire", and `min_to_keep` still bounds what goes.
+Apache Polaris stores maintenance policies on the catalog, a namespace or a
+table, inherited down the tree. With `policy_source = "polaris"` Bergman reads
+them as layer 3:
+
+```toml
+[[catalogs]]
+name = "prod"
+uri = "https://polaris.example.com/api/catalog"
+warehouse = "prod"
+policy_source = "polaris"
+```
+
+Per planned table Bergman calls
+`GET {uri}/polaris/v1/{prefix}/applicable-policies?namespace=…&target-name=…`
+(prefix from `/v1/config`, every page followed); Polaris applies inheritance.
+
+**It fills only what `bergman.toml` leaves unset.** A matching rule and
+`[defaults]` win, and it never recruits a table no rule matches. To let Polaris
+drive every table, add a catch-all rule with no settings:
+
+```toml
+[[rules]]
+match = "prod.**"
+```
+
+What is read, and where it lands:
+
+| Policy type | Field | Setting |
+|---|---|---|
+| `system.data-compaction` | `enable` | `compaction.enabled` |
+| | `config.target_file_size_bytes` | `compaction.target_file_size` |
+| `system.metadata-compaction` | `enable` | `manifests.rewrite` |
+| `system.snapshot-expiry` | `enable` | `snapshots.enabled` |
+| | `config.max_snapshot_age_days` | `snapshots.max_age` |
+| | `config.min_snapshot_to_keep` | `snapshots.min_to_keep` |
+| `system.orphan-file-removal` | `enable` | `orphans.enabled` |
+| | `max_orphan_file_age_in_days` | `orphans.older_than` |
+
+Only content of schema version `2025-02-03` is read. Everything else is
+**reported as a plan warning**, not silently dropped:
+
+- an orphan-file-removal policy's `locations` — Bergman scans only the table's
+  own location;
+- any other `config` key;
+- **two policies of one type** on one table — neither is applied;
+- content that does not parse, or names another schema version.
+
+A catalog policy **never sets orphan `mode`**: enabling orphan removal through
+Polaris enables the scan, which stays `dry-run` unless `bergman.toml` says
+otherwise.
+
+**A policy that cannot be read skips that table, not the run**, with the reason
+in the plan.
+
+`bergman policy explain` names the policy, its type, and where it was inherited
+from:
+
+```text
+ compaction.target_file_size   256 MiB   catalog policy "compaction-policy" (system.data-compaction, inherited from finance)
+```
 
 ## Provenance
 
-The question is never "what is the target file size". It is "why is it *that*".
 
 ```bash
 bergman policy explain prod.analytics.events
@@ -192,10 +220,7 @@ prod.analytics.events
  orphans.min_interval                    24h                      Bergman default
 ```
 
-**Every** resolved setting, not a selection — a knob missing from the table is a
-knob whose answer you have to go and guess. Every row names the layer that
-answered, including the ones where the answer was "nobody asked": a setting
-whose origin cannot be shown is a setting nobody can debug.
+Every resolved setting is listed, each with the layer that answered.
 
 ## Which tables a policy covers
 
@@ -210,8 +235,8 @@ bergman policy match
  prod.tmp.scratch             skipped      prod.tmp.**
 ```
 
-`unmatched` on a table you expected to cover is the `*` versus `**` distinction
-above, nine times out of ten.
+`unmatched` on a table you expected to cover is usually `*` where `**` was
+meant.
 
 ## Defaults
 
@@ -238,13 +263,11 @@ snapshot expiration is the single exception.
 
 ## Validation
 
-Unknown keys are errors, not ignored — a typo that parses is a setting that
-silently does nothing. `bergman policy lint` runs offline, contacting no catalog,
-so it belongs in CI:
+Unknown keys are errors. `bergman policy lint` runs offline, so it belongs in
+CI:
 
 ```yaml
 - run: bergman policy lint --config bergman.toml
 ```
 
-Schedules accept the five-field crontab form everyone writes (`0 */2 * * *`) as
-well as the six-field form with seconds.
+Schedules accept five-field crontab (`0 */2 * * *`) and six-field with seconds.

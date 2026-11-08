@@ -61,6 +61,14 @@ Run `just msrv` and `just deny` by hand whenever the lock file moves. `deny`
 checks advisories on the clock rather than on a push, so it turns red on a tree
 nobody touched — that is how the rustls TLS 1.3 advisory was found.
 
+`just cross-engine` is in neither: it needs `uv` and fetches PyIceberg 0.12.0,
+which writes v2 tables, lets Bergman compact them and rewrite their manifests,
+and reads them back — plus a v3 table Bergman compacted. It is the only check
+whose reader shares no code with Bergman's writer, so run it whenever the
+writer, the snapshot producer or the `iceberg` version moves. PyIceberg 0.12.0
+cannot read `_row_id`; lineage is checked with `iceberg-rust`'s reader in the
+regular suite.
+
 Read the gate's verdict from a log, never from a pipe:
 
 ```bash
@@ -101,6 +109,14 @@ forever and looks fine.
   that owns its file; data loss for a v3 deletion vector, which is a blob at an
   offset inside a Puffin container that may hold many others. Removing one dead
   vector by path takes its live siblings.
+- **A v3 rewrite writes row lineage physically.** A moved row keeps its
+  `_row_id` and `_last_updated_sequence_number` as columns in the new file, and
+  the new entries leave `first_row_id` null. Left to inheritance, the new file's
+  positions would renumber every row it holds, and a `MERGE` or CDC consumer
+  joining on row id would match the wrong rows. The snapshot claims exactly the
+  row range its manifest list assigned, seeded from the table's `next-row-id` —
+  claim more or less and the catalog's `next-row-id` hands an id out twice or
+  skips a range.
 - **Nothing deletes a file because a delete it contains became dead.** Files are
   deleted for exactly one reason — nothing in the reachable set names them — and
   that reason is computed in one place.
@@ -111,7 +127,7 @@ forever and looks fine.
 - **A rewrite inherits every opinion the table has about how its files are
   written** — compression, row-group and page sizing, dictionary size, bloom
   filters, data and metadata paths, and the sort order. That list is longer than
-  it looks: Iceberg defines around eighty `write.*` properties, and the checklist
+  it looks — Iceberg defines dozens of `write.*` properties — and the checklist
   when adding a writer knob is Iceberg's own `TableProperties`, read against
   `src/ops/compact/writer.rs` and the commit layer.
 
@@ -121,11 +137,15 @@ Bergman refuses rather than guessing, and each refusal names its reason in
 `bergman plan` as well as in the run report — a table whose configured
 maintenance can never apply must not read as a healthy one.
 
-Currently refused: **format v3 rewrites** (row lineage cannot be preserved, and
-deletion vectors cannot be read), **encrypted tables** (manifests and manifest
-lists are encrypted and unreadable — though snapshot expiration still runs,
-because it needs no manifest), **anything but Parquet**, **cross-spec rewrites**,
-and **any branch but `main`**.
+Currently refused: **encrypted tables** (manifests and manifest lists are
+encrypted and unreadable — though snapshot expiration still runs, because it
+needs no manifest; decrypting needs a key-management client, and choosing one is
+a key-custody decision that has not been made), **anything but Parquet**,
+**cross-spec rewrites**, and **any branch but `main`**. Format v3 is maintained,
+and its one refusal is precise rather than blanket: the snapshot producer
+refuses, by name, an added data file in a v3 rewrite that lacks the `_row_id`
+and `_last_updated_sequence_number` columns, so a library caller cannot commit a
+file that would renumber rows.
 
 **A refusal discharges a question as fully as an implementation.** When adding
 one, put it in all the places the existing ones are: the planner, the operation,

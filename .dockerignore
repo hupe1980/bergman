@@ -1,0 +1,5 @@
+# The image copies one prebuilt binary out of `dist/` (see the Dockerfile), so the
+# build context needs nothing else — and must not carry the source tree, `target/`
+# or any local credential file into a layer cache.
+*
+!dist/

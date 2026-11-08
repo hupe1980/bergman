@@ -107,6 +107,26 @@ site:
 deny:
     cargo deny check
 
+# The cross-engine round trip (requires uv): PyIceberg writes tables, Bergman
+# compacts and rewrites their manifests, PyIceberg reads them back.
+#
+# Every other suite writes with `iceberg-rust` and reads with `iceberg-rust`,
+# which catches spec errors but not disagreements between implementations —
+# so this is the one check whose reader shares no code with Bergman's writer.
+# Opt-in and outside `ci`: it needs Python and fetches PyIceberg, whose
+# version is pinned here so a run is reproducible.
+cross-engine:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir=$(mktemp -d)
+    trap 'rm -rf "$dir"' EXIT
+    py() { uv run --isolated --no-project --python 3.12 \
+        --with 'pyiceberg[sql-sqlite,pyarrow,pyiceberg-core]==0.12.0' \
+        python -I tests/cross_engine/pyiceberg_roundtrip.py "$@"; }
+    py write "$dir"
+    BERGMAN_CROSS_ENGINE_DIR="$dir" cargo test --all-features --test cross_engine -- --ignored
+    py verify "$dir"
+
 # Verify the declared MSRV against a real toolchain rather than trusting the
 # number in Cargo.toml.
 msrv:
@@ -124,7 +144,7 @@ msrv:
 image tag="bergman:dev":
     mkdir -p dist
     docker run --rm -v "$PWD":/src:ro -v "$PWD/dist":/out -w /src \
-        -e CARGO_TARGET_DIR=/tmp/target rust:1.94-alpine sh -c '\
+        -e CARGO_TARGET_DIR=/tmp/target rust:1.95-alpine sh -c '\
             apk add --no-cache musl-dev >/dev/null && \
             cargo build --release --locked --all-features && \
             cp /tmp/target/release/bergman \

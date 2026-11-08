@@ -64,15 +64,19 @@
 //!
 //! Z-order and other space-filling clustering — a global sort within a file
 //! group works, and it spills, so a group is never too large to sort;
-//! **rewriting an Iceberg format v3 table**, whose row lineage a rewrite cannot
-//! preserve (expiration and orphan removal still run — see
-//! [`commit::authoring_refusal`]); rewriting across a partition-spec change;
-//! writing anything but Parquet; `OpenTelemetry` export (the library emits
+//! **rewriting or scanning an encrypted table**, whose manifests Bergman does
+//! not decrypt (snapshot expiration still runs, since it needs no manifest);
+//! rewriting across a partition-spec change; writing anything but Parquet;
+//! any branch but `main`; `OpenTelemetry` export (the library emits
 //! [`tracing`], which an embedder's subscriber can export); and catalog
 //! protocols other than REST.
 //!
 //! Each of these is *refused with a named reason* rather than attempted, and
 //! the refusal reaches [`MaintenancePlan`] rather than only a log line.
+//!
+//! Format v3 tables are maintained in full: a rewrite carries every row's
+//! `_row_id` and `_last_updated_sequence_number` into the new file as physical
+//! columns, and applies the table's deletion vectors.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

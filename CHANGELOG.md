@@ -5,6 +5,45 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 Bergman is pre-1.0: **breaking changes land in minor versions**, each with a migration note.
 
+## [0.4.0] — 2026-11-08
+
+**Breaking:** MSRV **1.95**. `Bergman::refresh_credentials()` is removed — tokens renew on their
+own; delete the call. `CatalogConfig::connect()` returns both clients and `committer()` is gone.
+`RestCommitter::connect` takes an `Arc<TokenSource>`; `reachability::compute` drops its `TableRef`;
+`health::file_index`, `FileIndex` and `commit::authoring_refusal` are removed;
+`TableHealth::object_storage_layout` is gone and `TableFacts` gains `catalog`. A 0.3.0
+`bergman.toml` parses unchanged.
+
+### Added
+
+- **Format v3 tables are maintained** — compaction, manifest rewriting and dangling-delete removal.
+  Every row keeps its `_row_id` and `_last_updated_sequence_number`; deletion vectors are applied
+  and retired per vector.
+- **Polaris policy as a resolution layer** (`policy_source = "polaris"`), below `bergman.toml`.
+- **Lakekeeper CloudEvents** on `/events?catalog=<name>`, structured and binary mode.
+- **Homebrew**: `brew install hupe1980/tap/bergman` (macOS on Apple Silicon, Linux). Releases include
+  a macOS arm64 binary.
+- **`just cross-engine`**: PyIceberg 0.12.0 writes tables, Bergman maintains them, PyIceberg reads
+  them back.
+
+### Changed
+
+- **`iceberg` 0.11.0** and `opendal` 0.58.
+- **One token source for both catalog clients**, renewed on demand.
+- **`write.object-storage.enabled` is honoured.**
+
+### Fixed
+
+- **A dangling deletion vector could have been retired.** Vectors are now excluded explicitly.
+- **The snapshot producer did not refuse encrypted tables by name** when driven directly.
+
+### Security
+
+- rustls 0.23.46, rustls-webpki 0.103.16, webpki-root-certs 1.0.11 (RUSTSEC-2026-0346, -0347,
+  -0348, -0349, -0382, -0383); tokio 1.54.1 (RUSTSEC-2026-0386); zstd 0.13.4, zstd-safe 7.4.0,
+  zstd-sys 2.1.2 (RUSTSEC-2026-0391, -0398, -0403, -0410); ctutils 0.4.8 (RUSTSEC-2026-0385);
+  parquet 58.4.1 with thrift 0.23.0 (RUSTSEC-2026-0435).
+
 ## [0.3.0] — 2026-09-18
 
 **Breaking:** `[limits]` gained two optional keys, `TableHealth` gained a field, and

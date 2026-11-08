@@ -5,12 +5,9 @@
 Bergman keeps Iceberg tables healthy — compacting small files, applying and
 retiring delete files, expiring snapshots, re-packing manifests and removing
 orphans — driven by declarative policies and built on
-[`iceberg-rust`](https://github.com/apache/iceberg-rust). No Spark, no Trino,
-no cluster.
-
-It is **library-first**: the `bergman` binary is a thin consumer of the same
-public API an embedder gets, so a catalog, a streaming writer, or a lakehouse
-control plane can hold the whole engine in-process.
+[`iceberg-rust`](https://github.com/apache/iceberg-rust) 0.11.0. No Spark, no
+Trino, no cluster. It is **library-first**: the `bergman` binary is a thin
+consumer of the same public API an embedder gets.
 
 ```bash
 bergman inspect        # what is wrong with my tables?   (reads only)
@@ -20,69 +17,19 @@ bergman run            # do it
 
 - **Documentation:** <https://hupe1980.github.io/bergman/>
 - **Sister project:** [Rustberg](https://github.com/hupe1980/rustberg), an
-  authenticated, policy-controlled Iceberg REST catalog. The two are designed
-  to pair, and each works fully without the other.
-
----
-
-## Status
-
-Bergman is pre-release. All four maintenance operations execute.
-
-| Operation | Executes | Built on |
-|---|:--:|---|
-| Table health analysis | ✅ | Manifest metadata only; no data file is opened |
-| Snapshot expiration | ✅ | Upstream `ExpireSnapshotsAction` |
-| Expiration file cleanup | ✅ | Bergman — upstream documents this as a higher-level responsibility |
-| Orphan-file removal | ✅ | Bergman's object-store layer — `FileIO` has no `list` |
-| Manifest rewrite | ✅ | Bergman's commit layer — no upstream action exists |
-| Compaction | ✅ | Upstream's scan + writers, Bergman's commit layer |
-| Dangling delete-file removal | ✅ | Bergman's commit layer — nothing else ever cleans these up |
-
-Two kinds of table are **refused by name** rather than half-maintained. In both
-cases the refusal appears in `bergman plan`, not only in a log line.
-
-**Format v3** rewrites are blocked by two independent gaps, both upstream-shaped:
-its **row lineage** cannot be preserved — a rewrite must copy each row's `_row_id`
-into the file replacing it, which means a physical column no released writer
-supports, so Bergman would renumber every row it touched — and its **deletion
-vectors** cannot be read, so a rewrite could not see the deletes it must apply.
-
-**Encrypted tables** (`encryption.key-id`) have their manifests *and* manifest
-lists encrypted, which Bergman does not decrypt, so compaction, manifest
-rewriting and orphan removal are refused.
-
-**Snapshot expiration still runs on both**, because it works from `metadata.json`
-alone — unbounded snapshot growth should not be the price of encrypting a table or
-upgrading it to v3. On a v3 table orphan removal runs too, and that matters more
-than it sounds: a deletion vector is a blob inside a Puffin file, writers are not
-required to rewrite those files when a vector is superseded, and **orphan removal
-is the only thing that ever reclaims the space**.
-
-### Why bergman owns its commit layer
-
-`iceberg::Transaction` has no action that removes a data file, and both
-`TransactionAction` and `TableCommit`'s builder are `pub(crate)` — so
-compaction and manifest rewriting cannot be expressed through it at all. The
-common answer is to fork upstream, which costs a rebase forever and a crate that
-cannot be published — Cargo rejects git dependencies on crates.io.
-
-Bergman owns just that layer instead. Every piece of a commit is already public,
-so it builds one with upstream's own writers and `POST`s it to the table
-endpoint. Operations commit through a `TableCommitter` trait rather than a
-transport, so an upstream action that can express a rewrite becomes a second
-implementation and nothing above `src/commit` changes.
-[Detail →](https://hupe1980.github.io/bergman/docs/status/)
+  authenticated, policy-controlled Iceberg REST catalog. Each works fully
+  without the other.
 
 ---
 
 ## Install
 
 ```bash
-cargo install bergman
+brew install hupe1980/tap/bergman   # macOS (Apple Silicon) and Linux
+cargo install bergman               # anywhere Rust builds
 ```
 
-Or as a container — distroless, non-root, statically linked:
+As a container — distroless, non-root, statically linked:
 
 ```bash
 docker run --rm \
@@ -90,23 +37,48 @@ docker run --rm \
   ghcr.io/hupe1980/bergman:latest plan
 ```
 
-Or a static Linux binary from the
-[releases page](https://github.com/hupe1980/bergman/releases) — `x86_64` and
-`aarch64`, musl-linked, so there is no glibc version to match. Each archive
-ships a `.sha256` beside it.
-
-Or from source (requires Rust 1.94+):
-
-```bash
-git clone https://github.com/hupe1980/bergman && cd bergman
-cargo build --release
-```
+Or a binary from the [releases page](https://github.com/hupe1980/bergman/releases):
+static musl Linux for `x86_64` and `aarch64`, and macOS on Apple Silicon, each with
+a `.sha256` beside it. From source, Bergman requires Rust 1.95+.
 
 ---
 
-## Configure
+## What it does
 
-`bergman.toml`. Every setting is optional — see [Layering](#layering).
+| Operation | Built on |
+|---|---|
+| Table health analysis | Manifest metadata only; no data file is opened |
+| Snapshot expiration | Upstream `ExpireSnapshotsAction` |
+| Expiration file cleanup | Bergman — upstream leaves it to the caller |
+| Orphan-file removal | Bergman's object-store layer — `FileIO` has no `list` |
+| Manifest rewrite | Bergman's commit layer |
+| Compaction | Upstream's scan and writers, Bergman's commit layer |
+| Dangling delete-file removal | Bergman's commit layer |
+
+Compaction is **triggered**, not scheduled — by small files, oversized files,
+delete ratio, and a settle time that leaves a partition being written alone. It
+honours the table's `sort-order` and `write.*` properties, and applies equality
+deletes with a DataFusion hash anti-join.
+[Compaction →](https://hupe1980.github.io/bergman/docs/compaction/)
+
+**Format v3** tables are maintained in full: a rewrite writes each row's
+`_row_id` and `_last_updated_sequence_number` physically and the snapshot claims
+its row range; deletion vectors are applied and retired by `(path, offset)`.
+
+**Refused, by name, in `bergman plan`:** encrypted tables (snapshot expiration
+still runs), anything but Parquet, cross-spec rewrites, and any branch but
+`main`. [Status →](https://hupe1980.github.io/bergman/docs/status/)
+
+Bergman owns its commit layer because `iceberg::Transaction` cannot express a
+rewrite: it builds the commit from upstream's public writers and `POST`s it to
+the table endpoint, behind a `TableCommitter` trait.
+[Architecture →](https://hupe1980.github.io/bergman/docs/architecture/)
+
+---
+
+## Quickstart
+
+`bergman.toml` — every setting is optional:
 
 ```toml
 [[catalogs]]
@@ -131,254 +103,68 @@ match = "prod.tmp.*"
 skip  = true
 ```
 
-Validate it offline — no catalog, no credentials, suitable for CI:
-
 ```bash
-bergman policy lint
+bergman policy lint                              # validate offline, for CI
+bergman policy explain prod.analytics.events     # each setting and where it came from
+bergman plan
 ```
 
-### Layering
-
-Every setting resolves through four layers, most specific first:
-
-1. the matching **rule**
-2. the config's **`[defaults]`**
-3. the **table's own metadata** — its Iceberg properties
-   (`write.target-file-size-bytes`, `history.expire.max-snapshot-age-ms`, …)
-   *and its `sort-order`*
-4. the **Iceberg specification default**
-
-Layer 3 is what makes Bergman a participant rather than a competing source of
-truth: a table already carries its owner's intent, and every other Iceberg tool
-reads it. A property that is present but unusable — unparseable, or a zero where
-a size or a count is needed — falls through to the default and is reported as a
-warning rather than failing the table.
-
-`bergman policy explain` shows every resolved setting *and the layer that
-answered*, because the question is never "what is the target file size" — it is
-"why is it *that*":
-
-```
-$ bergman policy explain prod.analytics.events
-
-prod.analytics.events
-  matched rule: prod.analytics.*
-
- SETTING                       VALUE                        FROM
- compaction.target_file_size   128 MiB                      table property write.target-file-size-bytes
- compaction.sort               event_date, customer_id desc the table's sort order
- snapshots.max_age             7d                           [defaults]
- snapshots.min_to_keep         3                            [defaults]
- snapshots.delete_files        false                        Bergman default
- orphans.mode                  dry-run                      Bergman default
- …
-```
-
-### Rule patterns
-
-Globs over `catalog.namespace…​.table`, with `.` as the separator. `*` stops at
-a namespace boundary and `**` crosses it — the same distinction `/` has in a
-filesystem glob:
-
-| Pattern | Matches `prod.analytics.events` | Matches `prod.analytics.web.events` |
-|---|:--:|:--:|
-| `prod.analytics.*` | ✅ | ❌ |
-| `prod.analytics.**` | ✅ | ✅ |
-| `prod.**` | ✅ | ✅ |
-
-A dot that belongs to a *name* rather than being a separator is written `\.`, so
-`prod.analytics.a\.b` addresses the table literally called `a.b`. The rendering
-used for matching is injective — `/` and `%` are percent-encoded per segment —
-so no pattern can reach two different tables by accident.
-
-Rules are evaluated in order; the first match wins. A table no rule matches is
-reported as `unmatched` — distinct from one a rule deliberately `skip`s, so you
-can tell "my pattern is wrong" from "I excluded this". A rule that an earlier one
-already covers is refused at startup rather than left as a line that does
-nothing.
+Settings resolve, most specific first, through the matching **rule**,
+**`[defaults]`**, the **catalog's own policy** (`policy_source = "polaris"`),
+the **table's properties and `sort-order`**, and the **Iceberg default**.
+[Configuration →](https://hupe1980.github.io/bergman/docs/configuration/) ·
+[Policies →](https://hupe1980.github.io/bergman/docs/policies/)
 
 ---
 
-## Compaction
+## Commands
 
-Compaction is *triggered*, not scheduled. A table already at target file size
-costs one metadata read per cycle and no data I/O.
+| Command | Writes? | What it does |
+|---|:--:|---|
+| `bergman inspect` | no | Table health: file counts, sizes, delete ratios, snapshots, manifests |
+| `bergman plan` | no | The operations maintenance would perform, and why |
+| `bergman run` | **yes** | Executes the plan |
+| `bergman run --dry-run` | no | Identical to `plan` |
+| `… --table <glob>` | — | Scopes `inspect`, `plan` and `run`; an excluded table is never read |
+| `… --only <op>[,<op>]` | — | Scopes `plan` and `run` to `compact`, `rewrite-manifests`, `expire-snapshots`, `remove-orphans` |
+| `bergman daemon` | **yes** | Runs cycles on schedules, or when told a table changed (`POST /events`, including Lakekeeper CloudEvents) |
+| `bergman policy lint` | no | Validates config offline |
+| `bergman policy explain <table>` | no | Effective policy with per-value provenance |
+| `bergman policy match` | no | Which tables each rule matches |
 
-| Trigger | Default | What it catches |
-|---|---|---|
-| `small_file_ratio` | 30% of files below 75% of target, and ≥ 5 eligible | The classic small-file problem |
-| `max_file_size_ratio` | any file above 1.8× target | Its opposite: one file no reader can split, which nothing but a rewrite divides |
-| `delete_ratio` | 10% of rows named by delete files | Streaming and CDC targets, where read amplification comes from deletes rather than file sizes |
-| `min_file_age` | partition quiet for 1h | The *inverse* of all three: a partition still being written is left alone rather than losing a commit race to the next micro-batch |
-
-```toml
-[[rules]]
-match = "prod.streaming.events_*"
-
-[rules.compaction]
-enabled = true
-sort    = ["event_date", "customer_id"]   # optional — see below
-
-[rules.compaction.trigger]
-delete_ratio = 0.05    # aggressive: this is a CDC target
-min_file_age = "2h"    # but leave the partition it is writing alone
-```
-
-**A table's own sort order is honoured without being asked.** A table that
-declares `sort-order` has writers that respect it, so a rewrite that bin-packed
-those files back together *unsorted* would leave the table claiming a clustering
-its files no longer have — and every query with a predicate on the sort columns
-would start reading every file. Direction and null placement are reproduced
-exactly. A rule's `sort` overrides it; where neither says anything, output is
-unsorted.
-
-**A partition triggers a rewrite; it is not what the rewrite reads.** Only the
-files a rewrite would improve are read — the too-small, the too-large-to-split,
-and any file a delete applies to — so a partition of a hundred at-target files
-plus forty tiny ones reads forty, not a hundred and forty. That is Spark's
-`SizeBasedFileRewriter.filterFiles` rule, and the plan's byte estimate counts
-those files and no others.
-
-**A partition is not a unit of work either.** Its eligible files are bin-packed
-into groups bounded by `max_group_bytes` (8 GiB) and `max_input_files` (10 000),
-and each group commits on its own — so one lost commit costs one group, and a
-partition larger than memory is still compactable.
-
-Groups run **best-value-per-byte first**, so a cycle that ends early — a window
-closing, a byte budget running out, a `kill -9` — has done its most valuable work.
-Benefit is the change in file count plus the delete files retired; cost is the
-bytes read. Ranking on file count alone would make cost decorative and spend a
-bounded cycle on the most expensive work first. Each group commits against the
-snapshot the previous one produced. After three groups fail in a row the table is
-left for the next cycle, since a failing group has already paid for a full rewrite
-before it fails.
-
-Each group is read with its delete files applied, optionally sorted, and written
-back at the target size honouring the table's own settings — `write.parquet.*`
-(compression, row-group and page sizing, dictionary size, per-column bloom
-filters), `write.data.path`, `write.metadata.path`, and its `sort-order`. A
-delete file is retired only when every data file it applies to is inside the
-group; ones left applying to nothing are removed separately, since nothing else
-ever cleans them up.
-
-Equality deletes go through a DataFusion hash anti-join, which is why the
-default build carries a query engine — upstream applies them as a nested-loop
-join over `data rows × delete rows`. The test suite asserts the *physical plan*
-is a hash join, since the rewrite that makes it one is a conservative optimizer
-rule. It sits behind the default-on `compaction` feature, so an embedder wanting
-only metadata maintenance builds `--no-default-features` and carries none.
-[Detail →](https://hupe1980.github.io/bergman/docs/compaction/)
+Global flags: `--config`, `--format text|json`, `--audit-log <path>`, `--log <level>`.
+`bergman run` exits `2` when any operation failed or was refused.
+[Operating →](https://hupe1980.github.io/bergman/docs/operating/)
 
 ---
 
 ## Safety
 
-Maintenance is a background tenant: it must never win against a foreground
-writer, and never corrupt one.
-
-**Nothing destructive is on by default.** Compaction, orphan deletion, and
-expiration's file cleanup all default off. Metadata-only snapshot expiration is
-the single exception, because unbounded snapshot growth is the most common
-Iceberg health problem.
-
-**A table Bergman cannot fully read is refused, not guessed at.** Every manifest
-walk is all-or-nothing — one unreadable manifest aborts the whole computation
-rather than returning a short set — so nothing is ever deleted on the strength of
-a partial reading. What the refusal adds is the *reason*, once, in the plan,
-instead of an opaque parse failure retried every cycle forever.
-
-**Orphan removal has eight independent checks**, because it is the one
-operation that can destroy a healthy table: dry run by default; a grace period
-with a hard 24-hour floor that cannot be configured away; unknown file age
-counts as too young; segment-wise containment, so `…/events` can never reach
-`…/events_archive`; a refusal to scan a location another table lives inside —
-detected from the listing itself, so a table deliberately excluded from
-maintenance is still protected; re-verification against freshly-loaded metadata
-before deleting; a ceiling on how many files one operation may remove; and a
-refusal when the listing and the table's metadata **share no file at all**,
-which is what a changed `location`, a bucket alias or a scoped credential looks
-like — every object is then old, unreferenced and contained, and every one of
-them is live. Each check is pinned by a pair of tests: one proving deletion was
-reachable, one proving the check is what prevented it.
-[Detail →](https://hupe1980.github.io/bergman/docs/orphans/)
-
-**One deleter, one safety model.** Orphan removal and expiration's file cleanup
-decide *what* to delete by different reasoning, then share one deletion path:
-blast-radius ceiling, audit record, bounded-concurrency deletion. What the
-ceiling withholds is reported and reclaimed by the next pass.
-
-Path comparison is normalized throughout (`s3://` vs `s3a://`, doubled slashes,
-trailing slashes), because a live file spelled differently from its metadata
-would otherwise look exactly like garbage.
-
-**A rewrite never drops a delete file another file still needs.** Compaction
-retires a delete file only when *every* data file it applies to is inside the
-group being rewritten. One shared with a file outside the group is still hiding
-rows there, and dropping it would bring them back — so the whole table is
-planned before anything is rewritten, because that question cannot be answered
-from inside the group.
-
-**The row count must land in a known interval.** Every file group compares what it
-wrote against a ceiling — every row read, so a rewrite that *added* rows is
-refused — and a floor: the rows of inputs that **no delete file applies to**,
-which nothing may drop. With no delete applying the two coincide and the contract
-is an equality. The floor is what makes the check mean anything on a delete-heavy
-table, where a ceiling alone would let a rewrite lose every row and still pass.
-The outputs are abandoned and the orphan scanner reclaims them. A rewrite that
-silently lost rows is indistinguishable from one that worked, and the table it
-produces is wrong forever.
-
-**A carried-forward file keeps its sequence number.** A data file carried
-through a rewritten manifest keeps its own number, so delete files written
-*later* still apply to it. Stamping the new snapshot's number on it would make
-it look newer than the deletes that should remove its rows. Files the rewrite
-genuinely *adds* are the opposite case and take the new number — which is what
-retires the deletes already applied to their contents.
-
-**Manifests are never re-interpreted under the wrong partition spec.** A
-manifest carries exactly one `partition_spec_id`, and an entry's partition
-tuple means nothing against any other. Bergman rewrites each manifest under the
-spec it was written under, and refuses to compact a partition written under a
-spec other than the table's current one — mixing them mis-prunes files at query
-time, and nothing fails while it does.
-
-**Commits are compare-and-swap, and a lost one is rebuilt, never re-offered.**
-On conflict Bergman reloads the table, re-plans the group against the files that
-are still live, and rewrites. Re-submitting outputs computed against a table
-that has since moved is how a concurrent delete gets discarded and its rows
-come back. After three attempts it reports `conflicted` and comes back next
-cycle — a table being written hard keeps winning, and that is the design
-working.
-
-**A busy catalog and a moved table are told apart.** A 429 or 503 means "come
-back later" and the identical request is re-sent; a 409 or 412 means the table
-moved and the plan is rebuilt. Confusing the two would either throw away good
-work or re-submit a stale commit.
-
-**Nothing is silent.** A truncated plan, a withheld deletion, a partition under
-a superseded spec, an operation the policy enabled that this table's format
-cannot receive — each appears in `bergman plan` and in the run report with its
-reason, because otherwise those tables read as healthy.
-
-**Every operation is auditable.** `--audit-log` appends a JSON Lines record per
-operation, and a deletion manifest is written *before* the first delete — so a
-crash halfway through still leaves evidence of what was about to go.
-
-**Secrets never reach a log.** `Credential`, the cached bearer token and
-`CatalogConfig` redact in `Debug` — all three are reachable from `Bergman`
-itself, so a derived impl would put the client secret and the warehouse's
-storage keys into any `tracing::debug!(?bergman)` an embedder writes.
-
-**`POST /events` can require a token.** Unlike `/metrics` and `/health` it
-*causes work* — listing object storage, rewriting data. `--events-token-env`
-names the variable holding a bearer token, compared in constant time; the daemon
-warns when the endpoint is open on a routable address.
+- **Nothing destructive is on by default.** Compaction, orphan deletion and
+  expiration's file cleanup default off; metadata-only snapshot expiration is on.
+- **A table Bergman cannot fully read is refused**, and every manifest walk is
+  all-or-nothing, so nothing is deleted on a partial reading.
+- **Orphan removal has eight independent checks**, including a 24-hour grace
+  floor, segment-wise containment, re-verification before deleting, a deletion
+  ceiling, and a refusal when the listing and the metadata share no file.
+  [Orphans →](https://hupe1980.github.io/bergman/docs/orphans/)
+- **One deleter**: orphan removal and expiration cleanup share one blast-radius
+  ceiling, audit record and bounded deletion path.
+- **A rewrite never drops a delete file another file still needs**, and every
+  file group's row count must land between a floor and a ceiling taken from
+  metadata.
+- **Carried-forward files keep their sequence numbers; manifests keep their
+  partition spec; a moved branch keeps its retention.**
+- **Commits are compare-and-swap; a lost one is rebuilt, never re-offered.** A
+  429/503 is retried; a 409/412 replans.
+- **Every operation is auditable**: `--audit-log` writes JSON Lines, and a
+  deletion manifest is written before the first delete.
+- **Secrets never reach a log**: credentials and catalog config redact in
+  `Debug`. `POST /events` can require a bearer token (`--events-token-env`).
 
 ---
 
-## Embedding
-
-Bergman is a library first. The CLI drives exactly this API.
+## Library
 
 ```rust
 use bergman::{Bergman, policy::Config};
@@ -398,24 +184,10 @@ let report = bergman.run(&plan).await?;
 cargo add bergman --no-default-features --features catalog-rest,storage-s3
 ```
 
-The contract:
-
-- **No global state.** No logger, no tracing subscriber, no signal handler, no
-  config file read on its own initiative. The library emits `tracing` events;
-  what listens is yours.
-- **Bring your own runtime.** Plain `async fn` on the caller's runtime.
-  Concurrency limits are parameters, never process-wide statics.
-- **No background threads, including for credentials.** Nothing is renewed on a
-  timer Bergman owns: a long-lived host calls `refresh_credentials()` before
-  each cycle, which is what `bergman daemon` does. Upstream's catalog client
-  exchanges its OAuth2 credential once and never again, and a process holding a
-  one-hour token does not crash after an hour — it keeps its cadence perfectly
-  and stops reading a single table.
-- **Planning is pure.** `plan()` writes nothing and deletes nothing, so dry-run
-  is not a mode to remember — it is what happens when you stop before `run()`.
-- **Observation is a hook.** Implement `MaintenanceObserver` for metrics, an
-  event bus, or an approval gate — `operation_starting` returning `false` vetoes
-  the operation, which is then reported as refused.
+No global state, no background threads, the caller's async runtime, and
+concurrency limits as parameters. Both catalog clients share one token source,
+renewed on demand. `MaintenanceObserver` hooks metrics, events or an approval
+gate — `operation_starting` returning `false` vetoes an operation:
 
 ```rust
 #[async_trait::async_trait]
@@ -426,41 +198,6 @@ impl MaintenanceObserver for RequireSignoff {
 }
 ```
 
----
-
-## Commands
-
-| Command | Writes? | What it does |
-|---|:--:|---|
-| `bergman inspect` | no | Table health: file counts, sizes, delete ratios, snapshots, manifests |
-| `bergman plan` | no | The operations maintenance would perform, and why |
-| `bergman run` | **yes** | Executes the plan |
-| `bergman run --dry-run` | no | Identical to `plan` |
-| `… --table <glob>` | — | Scopes `inspect`, `plan` and `run` — the *examination*, not just the output: an excluded table is never read |
-| `… --only <op>[,<op>]` | — | Scopes `plan` and `run` to named operations: `compact`, `rewrite-manifests`, `expire-snapshots`, `remove-orphans` |
-| `bergman daemon` | **yes** | Runs cycles on schedules, or when told a table changed |
-| `bergman daemon --events --events-token-env VAR` | **yes** | …and requires a bearer token on `POST /events` |
-| `bergman policy lint` | no | Validates config offline — for CI |
-| `bergman policy explain <table>` | no | Effective policy with per-value provenance |
-| `bergman policy match` | no | Which tables each rule matches |
-
-Global flags: `--config`, `--format text|json`, `--audit-log <path>`, `--log <level>`.
-
-`bergman run` exits `2` when any operation failed or was refused, so a broken
-cron job does not look healthy.
-
-```bash
-# Reclaim storage tonight; rewrite nothing.
-bergman run --only remove-orphans,expire-snapshots
-```
-
-Any subset is safe: the per-table order is preserved, and dropping an operation
-only ever makes the others do less.
-
----
-
-## Features
-
 | Feature | Default | Carries |
 |---|:--:|---|
 | `cli` | ✅ | The binary, terminal rendering, logging setup |
@@ -469,35 +206,7 @@ only ever makes the others do less.
 | `storage-s3` / `-gcs` / `-azure` | ✅ via `storage-all` | Cloud object stores |
 | `metrics` | — | Prometheus metrics, and the daemon's HTTP surface: `/metrics`, `/health`, `/events` |
 
-Metric labels are `catalog`, `namespace`, `operation` and `outcome` — bounded by
-construction. The table name is deliberately not one: a series is created per
-label combination and kept forever, so a large warehouse would take the
-Prometheus server down. Per-table facts live in the audit trail, which has no
-cardinality budget.
-
-Local filesystem and in-memory storage are always available, which is what keeps
-the test suite free of containers. Embedders build `--no-default-features`.
-
-### Resource limits
-
-Two knobs decide how much machine maintenance may use, and they are deliberately
-in different units:
-
-```toml
-[limits]
-io_concurrency = 32          # object-store requests in flight, per operation
-# compaction_parallelism = 8 # CPU threads per file group; omit for the machine's
-```
-
-`io_concurrency` bounds what is latency-bound — reading manifests, deleting
-files — so the useful number is far above the core count. `compaction_parallelism`
-bounds what is CPU-bound: the `target_partitions` of the DataFusion plan that
-applies equality deletes and sorts. Raising it does not raise the memory ceiling;
-`compaction.max_sort_memory` does, and the spill pool is shared across threads.
-
-They are parameters rather than constants because an embedder sharing an HTTP
-connection pool with the rest of a service has to be able to say how much of it
-maintenance may take.
+[Library →](https://hupe1980.github.io/bergman/docs/library/)
 
 ---
 
@@ -507,20 +216,20 @@ maintenance may take.
 just test          # the full suite
 just lint          # fmt + clippy -D warnings
 just check-all     # every feature alone, plus all and none
-just deny          # advisories, licences, bans, sources
 just site          # the documentation site's internal links
-just ci            # everything above, in the order CI runs it
+just ci            # lint, check-all, test, docs, site
+just deny          # advisories, licences, bans, sources — run separately
+just msrv          # build on the MSRV — run separately
+just cross-engine  # opt-in, needs uv: PyIceberg 0.12.0 writes, Bergman maintains, PyIceberg reads
 ```
 
-Every optional feature is built **alone** in CI, not only under `--all-features`
-— a feature that compiles in that combination can be broken by itself, because
-another crate's feature unification was switching on what it needed.
+The suite needs no containers or cloud credentials: it builds real tables on the
+local filesystem and commits to an in-memory catalog.
 
 ## Changelog
 
-Notable changes, including breaking ones and their migration notes, are in
 [CHANGELOG.md](CHANGELOG.md). Bergman is pre-1.0: breaking changes land in minor
-versions.
+versions, with migration notes.
 
 ## License
 

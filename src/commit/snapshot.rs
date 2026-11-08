@@ -26,9 +26,9 @@
 use std::collections::{HashMap, HashSet};
 
 use iceberg::spec::{
-    DataContentType, DataFile, FormatVersion, MAIN_BRANCH, ManifestContentType, ManifestEntry,
-    ManifestFile, ManifestListWriter, ManifestStatus, ManifestWriterBuilder, Operation,
-    PartitionSpec, Snapshot, SnapshotRetention, Summary,
+    DataContentType, DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestContentType,
+    ManifestEntry, ManifestFile, ManifestListWriter, ManifestStatus, ManifestWriterBuilder,
+    Operation, PartitionSpec, Snapshot, SnapshotRetention, Summary,
 };
 use iceberg::table::Table;
 use iceberg::{TableRequirement, TableUpdate};
@@ -78,6 +78,19 @@ impl FileRef {
         Self {
             path: normalize(entry.file_path()),
             offset: entry.data_file().content_offset(),
+        }
+    }
+
+    /// The identity of a delete file as a scan task reports it.
+    ///
+    /// The scan carries the manifest entry's `content_offset`, so a deletion
+    /// vector built from a task is the same identity [`FileRef::of_entry`]
+    /// gives the entry it came from — and a removal built from the scan matches
+    /// that entry and none of its siblings in the same Puffin file.
+    pub fn of_scan_delete(delete: &iceberg::scan::FileScanTaskDeleteFile) -> Self {
+        Self {
+            path: normalize(&delete.file_path),
+            offset: delete.content_offset,
         }
     }
 
@@ -239,7 +252,8 @@ impl<'a> SnapshotProducer<'a> {
         // Checked before a single manifest is written: a refusal that arrived
         // at install time would already have left Avro files under the table's
         // metadata directory for the orphan scanner to clean up.
-        self.check_authorable()?;
+        self.check_readable()?;
+        self.check_lineage(&rewrite.added)?;
 
         let metadata = self.table.metadata();
         let ident = self.table.identifier().to_string();
@@ -368,6 +382,14 @@ impl<'a> SnapshotProducer<'a> {
         // below is the one allowed to be sharp.
         let mut dangling: Vec<FileRef> = entries()
             .filter(|(_, entry)| entry.content_type() != DataContentType::Data)
+            // Never a deletion vector. It applies to exactly one data file, and
+            // the spec requires whoever removes that file to drop the vector in
+            // the same commit, so a dangling one is another writer's violation
+            // rather than something the format accumulates — and retiring a
+            // vector on inference is the most dangerous metadata operation
+            // there is. Its container is reclaimed by the orphan scanner once
+            // nothing names it.
+            .filter(|(_, entry)| entry.data_file().file_format() != DataFileFormat::Puffin)
             .filter(|(_, entry)| !still_applied.contains(&normalize(entry.file_path())))
             .filter(|(spec_id, entry)| {
                 is_dead_by_sequence(*spec_id, entry, &lowest, lowest_anywhere)
@@ -389,21 +411,7 @@ impl<'a> SnapshotProducer<'a> {
     /// answer. On the ordinary table, which has no delete files whatsoever,
     /// that walk would happen every cycle forever.
     pub async fn has_delete_manifests(&self, parent: &iceberg::spec::SnapshotRef) -> Result<bool> {
-        let metadata = self.table.metadata();
-        let bytes = self
-            .table
-            .file_io()
-            .new_input(parent.manifest_list())
-            .map_err(|e| Error::Storage(Box::new(e)))?
-            .read()
-            .await
-            .map_err(|e| Error::Storage(Box::new(e)))?;
-
-        let manifest_list =
-            iceberg::spec::ManifestList::parse_with_version(&bytes, metadata.format_version())
-                .map_err(|e| {
-                    Error::metadata(self.table.identifier().to_string(), format!("{e}"))
-                })?;
+        let manifest_list = crate::catalog::read::manifest_list(self.table, parent).await?;
 
         Ok(manifest_list
             .entries()
@@ -416,17 +424,62 @@ impl<'a> SnapshotProducer<'a> {
         self.snapshot_id
     }
 
-    /// Refuse a table whose snapshots Bergman cannot author correctly.
+    /// Refuse a table whose manifests Bergman cannot read: one declaring an
+    /// encryption key.
     ///
-    /// See [`super::authoring_refusal`] for what that means and why the answer
-    /// is a refusal rather than a best effort.
-    pub fn check_authorable(&self) -> Result<()> {
-        match super::authoring_refusal(self.table.metadata().format_version()) {
+    /// The planner and the operation ask the same question
+    /// ([`crate::health::unreadable_reason`]); an embedder can reach the
+    /// producer without either, and would otherwise fail three layers down on
+    /// a manifest it cannot decrypt, with no word about why.
+    fn check_readable(&self) -> Result<()> {
+        match crate::health::unreadable_reason(self.table.metadata()) {
             None => Ok(()),
             Some(reason) => Err(Error::refused(
                 "rewrite",
                 self.table.identifier().to_string(),
                 reason,
+            )),
+        }
+    }
+
+    /// Refuse an added v3 data file that does not carry its rows' lineage.
+    ///
+    /// A v3 reader gives a row with a null `_row_id` an id inherited from its
+    /// file's position, and an added file's inherited range is fresh. That is
+    /// right for rows that are new and silent renumbering for rows a rewrite
+    /// moved — and from a `DataFile` the producer cannot tell which the caller
+    /// meant. So it insists on the two columns that make the answer the same
+    /// either way: a file carrying `_row_id` and `_last_updated_sequence_number`
+    /// physically keeps every id it holds, and still lets a null one inherit.
+    ///
+    /// Read from the file's column metrics, which are keyed by field id and
+    /// written by the same writer that wrote the columns.
+    fn check_lineage(&self, added: &[DataFile]) -> Result<()> {
+        use iceberg::metadata_columns::{
+            RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_FIELD_ID_ROW_ID,
+        };
+
+        if self.table.metadata().format_version() < FormatVersion::V3 {
+            return Ok(());
+        }
+        let missing = added.iter().find(|file| {
+            file.content_type() == DataContentType::Data
+                && !(file.value_counts().contains_key(&RESERVED_FIELD_ID_ROW_ID)
+                    && file
+                        .value_counts()
+                        .contains_key(&RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER))
+        });
+        match missing {
+            None => Ok(()),
+            Some(file) => Err(Error::refused(
+                "rewrite",
+                self.table.identifier().to_string(),
+                format!(
+                    "{} has no `_row_id` and `_last_updated_sequence_number` columns; \
+                     committing it into a format v3 table would give every row it holds \
+                     a new identity",
+                    file.file_path()
+                ),
             )),
         }
     }
@@ -446,17 +499,15 @@ impl<'a> SnapshotProducer<'a> {
         let parent_id = parent.map(|p| p.snapshot_id());
         let metadata = self.table.metadata();
 
-        // The backstop for the check `rewrite_files` and the planner also make.
-        // Every snapshot Bergman authors passes through here, so an embedder or
-        // a future operation that skipped both still cannot produce one for a
-        // table whose row lineage it would destroy.
-        self.check_authorable()?;
-
         // Bergman commits on `main` and asserts `main` has not moved. If the
         // table's current snapshot is not `main`'s head, that assertion is
         // about a different snapshot than the one this commit was built on —
         // and the commit would move `main` to a snapshot descending from
         // something else entirely.
+        // The backstop for every snapshot Bergman authors, including a
+        // manifest rewrite an embedder drives without the operation's check.
+        self.check_readable()?;
+
         let main_head = metadata
             .snapshot_for_ref(MAIN_BRANCH)
             .map(|s| s.snapshot_id());
@@ -471,17 +522,22 @@ impl<'a> SnapshotProducer<'a> {
             ));
         }
 
-        let manifest_list = self.write_manifest_list(parent, manifests).await?;
+        let (manifest_list, row_range) = self.write_manifest_list(parent, manifests).await?;
 
-        let snapshot = Snapshot::builder()
+        let builder = Snapshot::builder()
             .with_snapshot_id(self.snapshot_id)
             .with_parent_snapshot_id(parent_id)
             .with_sequence_number(metadata.next_sequence_number())
             .with_timestamp_ms(chrono::Utc::now().timestamp_millis())
             .with_manifest_list(manifest_list)
             .with_schema_id(metadata.current_schema_id())
-            .with_summary(summary)
-            .build();
+            .with_summary(summary);
+        // The range the list writer assigned, claimed so the catalog advances
+        // `next-row-id` past it. `None` below v3, where there is no range.
+        let snapshot = match row_range {
+            Some((first, added)) => builder.with_row_range(first, added).build(),
+            None => builder.build(),
+        };
 
         Ok((
             vec![
@@ -530,28 +586,11 @@ impl<'a> SnapshotProducer<'a> {
         &self,
         parent: &iceberg::spec::SnapshotRef,
     ) -> Result<Vec<LoadedManifest>> {
-        let file_io = self.table.file_io();
-        let metadata = self.table.metadata();
-
-        let bytes = file_io
-            .new_input(parent.manifest_list())
-            .map_err(|e| Error::Storage(Box::new(e)))?
-            .read()
-            .await
-            .map_err(|e| Error::Storage(Box::new(e)))?;
-
-        let manifest_list =
-            iceberg::spec::ManifestList::parse_with_version(&bytes, metadata.format_version())
-                .map_err(|e| {
-                    Error::metadata(self.table.identifier().to_string(), format!("{e}"))
-                })?;
+        let manifest_list = crate::catalog::read::manifest_list(self.table, parent).await?;
 
         let mut loaded = Vec::with_capacity(manifest_list.entries().len());
         for manifest_file in manifest_list.entries() {
-            let manifest = manifest_file
-                .load_manifest(file_io)
-                .await
-                .map_err(|e| Error::Storage(Box::new(e)))?;
+            let manifest = crate::catalog::read::manifest(self.table, manifest_file).await?;
 
             let entries: Vec<ManifestEntry> = manifest
                 .entries()
@@ -630,12 +669,12 @@ impl<'a> SnapshotProducer<'a> {
                 (false, FormatVersion::V1) => builder.build_v1(),
                 (false, FormatVersion::V2) => builder.build_v2_data(),
                 (true, FormatVersion::V2) => builder.build_v2_deletes(),
-                // See `super::v3_writer_unimplemented`: upstream's v3 writers
-                // work, which is exactly why calling them here would be a
-                // silent data bug rather than a compile error.
-                (_, FormatVersion::V3) => {
-                    return Err(super::v3_writer_unimplemented(self.table.identifier()));
-                }
+                // A carried v3 entry keeps its own `first_row_id`: the manifest
+                // reader materialized the inherited value on load, and the
+                // writer serializes it, so the fresh `first_row_id` this
+                // rebuilt manifest is about to be assigned renumbers nothing.
+                (false, FormatVersion::V3) => builder.build_v3_data(),
+                (true, FormatVersion::V3) => builder.build_v3_deletes(),
                 (true, FormatVersion::V1) => {
                     return Err(Error::metadata(
                         self.table.identifier().to_string(),
@@ -677,9 +716,10 @@ impl<'a> SnapshotProducer<'a> {
             let mut writer = match format_version {
                 FormatVersion::V1 => builder.build_v1(),
                 FormatVersion::V2 => builder.build_v2_data(),
-                FormatVersion::V3 => {
-                    return Err(super::v3_writer_unimplemented(self.table.identifier()));
-                }
+                // An added v3 file's entry leaves `first_row_id` null. Its rows
+                // carry their ids physically (see `check_lineage`), and the
+                // inherited range only ever applies to rows whose id is null.
+                FormatVersion::V3 => builder.build_v3_data(),
             };
 
             for file in added {
@@ -721,12 +761,19 @@ impl<'a> SnapshotProducer<'a> {
             })
     }
 
-    /// Write the manifest list, returning its location.
+    /// Write the manifest list, returning its location and, for a v3 table, the
+    /// row-id range it assigned.
+    ///
+    /// On v3 the list writer is seeded with the table's `next-row-id` and
+    /// assigns every data manifest that has no `first_row_id` a fresh range of
+    /// `existing + added` rows — Java's rule. The snapshot must claim exactly
+    /// that range, so the catalog advances `next-row-id` past it and no later
+    /// writer hands out an id this snapshot's manifests already cover.
     pub(crate) async fn write_manifest_list(
         &self,
         parent: Option<&iceberg::spec::SnapshotRef>,
         manifests: Vec<ManifestFile>,
-    ) -> Result<String> {
+    ) -> Result<(String, Option<(u64, u64)>)> {
         let parent_id = parent.map(|p| p.snapshot_id());
         let metadata = self.table.metadata();
         let location = format!(
@@ -751,24 +798,28 @@ impl<'a> SnapshotProducer<'a> {
             FormatVersion::V2 => {
                 ManifestListWriter::v2(output, self.snapshot_id, parent_id, sequence_number)
             }
-            // `ManifestListWriter::v3` would take `metadata.next_row_id()` and
-            // produce a list a catalog accepts — while nothing advances
-            // `next-row-id`, so every later snapshot would claim the same
-            // range. That is the trap, and it is why this is an error.
-            FormatVersion::V3 => {
-                return Err(super::v3_writer_unimplemented(self.table.identifier()));
-            }
+            FormatVersion::V3 => ManifestListWriter::v3(
+                output,
+                self.snapshot_id,
+                parent_id,
+                sequence_number,
+                Some(metadata.next_row_id()),
+            ),
         };
 
         writer
             .add_manifests(manifests.into_iter())
             .map_err(|e| Error::Storage(Box::new(e)))?;
+        let row_range = writer.next_row_id().map(|next| {
+            let first = metadata.next_row_id();
+            (first, next - first)
+        });
         writer
             .close()
             .await
             .map_err(|e| Error::Storage(Box::new(e)))?;
 
-        Ok(location)
+        Ok((location, row_range))
     }
 
     pub(crate) fn new_manifest_output(&self, kind: &str) -> Result<iceberg::io::OutputFile> {

@@ -59,6 +59,21 @@ impl TestTable {
         Self::build(format, iceberg::spec::SortOrder::unsorted_order())
     }
 
+    /// An unpartitioned v2 table carrying the given table properties.
+    ///
+    /// A rewrite inherits every opinion the table has about how its files are
+    /// written, and most of those opinions are properties.
+    pub fn with_properties(properties: &[(&str, &str)]) -> Result<Self> {
+        Self::build_with(
+            iceberg::spec::FormatVersion::V2,
+            iceberg::spec::SortOrder::unsorted_order(),
+            properties
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+    }
+
     /// A table that declares a sort order of its own.
     ///
     /// The layer that stops a rewrite destroying a layout the table configured
@@ -142,7 +157,42 @@ impl TestTable {
         format: iceberg::spec::FormatVersion,
         sort_order: iceberg::spec::SortOrder,
     ) -> Result<Self> {
-        let dir = tempfile::tempdir().expect("temp dir");
+        Self::build_with(format, sort_order, HashMap::new())
+    }
+
+    /// The same, in a directory under `parent` — for a table another process
+    /// reads after this one exits.
+    pub fn with_format_in(
+        format: iceberg::spec::FormatVersion,
+        parent: &std::path::Path,
+    ) -> Result<Self> {
+        Self::build_in(
+            format,
+            iceberg::spec::SortOrder::unsorted_order(),
+            HashMap::new(),
+            tempfile::tempdir_in(parent).expect("temp dir"),
+        )
+    }
+
+    fn build_with(
+        format: iceberg::spec::FormatVersion,
+        sort_order: iceberg::spec::SortOrder,
+        properties: HashMap<String, String>,
+    ) -> Result<Self> {
+        Self::build_in(
+            format,
+            sort_order,
+            properties,
+            tempfile::tempdir().expect("temp dir"),
+        )
+    }
+
+    fn build_in(
+        format: iceberg::spec::FormatVersion,
+        sort_order: iceberg::spec::SortOrder,
+        properties: HashMap<String, String>,
+        dir: tempfile::TempDir,
+    ) -> Result<Self> {
         let location = format!("file://{}", dir.path().display());
 
         let metadata = TableMetadataBuilder::new(
@@ -151,7 +201,7 @@ impl TestTable {
             sort_order,
             location,
             format,
-            HashMap::new(),
+            properties,
         )
         .expect("metadata builder")
         .build()
@@ -303,9 +353,9 @@ impl TestTable {
     /// Serialize a `deletion-vector-v1` blob: the bytes that go inside a Puffin
     /// file for one data file's deleted positions.
     ///
-    /// Written by hand because **no released `iceberg-rust` can write one** —
-    /// its serializer is an open PR upstream — and because a v3 fixture that
-    /// cannot produce a deletion vector cannot exercise any of the v3 claims.
+    /// Written by hand because `iceberg` 0.11.0 has no writer for one, and a v3
+    /// fixture that cannot produce a deletion vector cannot exercise any of the
+    /// v3 claims.
     /// The layout is the Puffin spec's, quoted here because every field of it is
     /// a way to get this silently wrong:
     ///
@@ -426,7 +476,9 @@ impl TestTable {
             .file_io
             .new_input(&location)
             .map_err(|e| Error::Storage(Box::new(e)))?;
-        let reader = PuffinReader::new(input);
+        let reader = PuffinReader::new(input)
+            .await
+            .map_err(|e| Error::Storage(Box::new(e)))?;
         let metadata = reader
             .file_metadata()
             .await
@@ -470,11 +522,10 @@ impl TestTable {
     /// Uses Bergman's own snapshot producer where it can, so the fixture and
     /// the code under test agree about what a commit looks like.
     ///
-    /// A v3 table is the exception, and deliberately so: Bergman refuses to
-    /// author a v3 snapshot at all (see `bergman::commit::authoring_refusal`),
-    /// which is exactly what the v3 tests exist to check — so the fixture has
-    /// to be able to build one the way a *writer* would, or those tests could
-    /// only ever run against an empty table.
+    /// A v3 table is the exception, and deliberately so: its appends are
+    /// written the way an independent writer would — assigning row lineage
+    /// itself — so the v3 tests check Bergman against another author's
+    /// snapshots rather than against its own.
     pub async fn append(&self, files: Vec<DataFile>) -> Result<()> {
         if self.committer.metadata().format_version() == iceberg::spec::FormatVersion::V3 {
             return self.append_as_a_writer_would(files, Vec::new()).await;
@@ -685,6 +736,19 @@ pub struct FixtureLoader {
     committer: Arc<InMemoryCommitter>,
     file_io: FileIO,
     location: String,
+}
+
+impl FixtureLoader {
+    /// A loader for a table this fixture did not create — one another engine
+    /// wrote, whose metadata the cross-engine suite hands to an
+    /// [`InMemoryCommitter`].
+    pub fn new(committer: Arc<InMemoryCommitter>, file_io: FileIO, location: String) -> Self {
+        Self {
+            committer,
+            file_io,
+            location,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -981,7 +1045,7 @@ pub async fn live_data_files(table: &Table) -> Result<Vec<String>> {
 
     let mut paths = Vec::new();
     while let Some(task) = stream.next().await {
-        paths.push(task?.data_file_path);
+        paths.push(task?.data_file_path().to_string());
     }
     paths.sort();
     Ok(paths)
@@ -1000,8 +1064,8 @@ pub async fn live_delete_files(table: &Table) -> Result<Vec<String>> {
 
     let mut paths = Vec::new();
     while let Some(task) = stream.next().await {
-        for delete in task?.deletes {
-            paths.push(delete.file_path);
+        for delete in task?.deletes() {
+            paths.push(delete.file_path.clone());
         }
     }
     paths.sort();
@@ -1300,8 +1364,57 @@ pub async fn live_data_files_with_sizes(table: &Table) -> Result<Vec<(String, u6
     let mut files = Vec::new();
     while let Some(task) = stream.next().await {
         let task = task?;
-        files.push((task.data_file_path, task.file_size_in_bytes));
+        files.push((task.data_file_path().to_string(), task.file_size_in_bytes()));
     }
     files.sort();
     Ok(files)
+}
+
+/// Every row's `(id, _row_id, _last_updated_sequence_number)`, read through
+/// upstream's own scan — the reader every engine's lineage claim is checked by,
+/// and independent of Bergman's read path. Sorted by `id`.
+pub async fn read_lineage(table: &Table) -> Result<Vec<(i32, Option<i64>, Option<i64>)>> {
+    use arrow::array::{Array, Int64Array};
+    use futures::StreamExt;
+
+    let scan = table
+        .scan()
+        .select(["id", "_row_id", "_last_updated_sequence_number"])
+        .build()?;
+    let mut stream = scan.to_arrow().await?;
+
+    let mut rows = Vec::new();
+    while let Some(batch) = stream.next().await {
+        let batch = batch.map_err(|e| Error::Storage(Box::new(e)))?;
+        let ids = batch
+            .column_by_name("id")
+            .expect("id column")
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int32");
+        // Synthesized lineage can arrive as a run-end or dictionary encoding
+        // of a constant, so it is cast to plain `Int64` before being read.
+        let column = |name: &str| {
+            let raw = batch
+                .column_by_name(name)
+                .unwrap_or_else(|| panic!("{name} column"));
+            arrow::compute::cast(raw, &DataType::Int64)
+                .unwrap_or_else(|e| panic!("{name} ({}) is not an integer: {e}", raw.data_type()))
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int64")
+                .clone()
+        };
+        let row_ids = column("_row_id");
+        let seqs = column("_last_updated_sequence_number");
+        for i in 0..batch.num_rows() {
+            rows.push((
+                ids.value(i),
+                (!row_ids.is_null(i)).then(|| row_ids.value(i)),
+                (!seqs.is_null(i)).then(|| seqs.value(i)),
+            ));
+        }
+    }
+    rows.sort();
+    Ok(rows)
 }

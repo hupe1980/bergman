@@ -1,7 +1,7 @@
 //! Orphan-file removal.
 //!
 //! This is the one operation that can destroy a healthy table, so it is the one
-//! with the most machinery between a candidate and a deletion. Seven
+//! with the most machinery between a candidate and a deletion. Eight
 //! independent checks stand in the way, and each exists because of a way this
 //! goes wrong:
 //!
@@ -126,7 +126,7 @@ pub async fn run(
         return Err(nested_refusal(table_ref, &location, nested));
     }
 
-    let reachable = reachability::compute(table_ref, table, env.io_concurrency).await?;
+    let reachable = reachability::compute(table, env.io_concurrency).await?;
     // A table with metadata but no reachable files at all is not a table with
     // nothing but garbage under it — far more likely, something went wrong
     // reading it. Deleting on that basis would empty the warehouse.
@@ -268,7 +268,7 @@ pub async fn run(
     // Check 6. Listing a large table takes long enough for a writer to commit,
     // and any file that commit referenced is now live.
     let fresh = env.loader.reload(env.ident).await?;
-    let reachable_now = reachability::compute(table_ref, &fresh, env.io_concurrency).await?;
+    let reachable_now = reachability::compute(&fresh, env.io_concurrency).await?;
 
     let (mut doomed, reprieved) = reverify(candidates, &reachable_now);
     outcome.reprieved = reprieved;

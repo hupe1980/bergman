@@ -48,7 +48,7 @@ use iceberg::table::Table;
 
 use crate::commit::{BranchRetention, FileRef, RewriteFiles, SnapshotProducer, TableCommitter};
 use crate::error::{Error, Result};
-use crate::health::{FileIndex, PartitionKey as HealthPartitionKey};
+use crate::health::PartitionKey as HealthPartitionKey;
 use crate::obs::{MaintenanceObserver, OperationContext};
 use crate::ops::reachability::normalize;
 use crate::ops::{MAX_COMMIT_ATTEMPTS, OpEnv, TableLoader, retry_delay};
@@ -100,19 +100,16 @@ struct Job<'a> {
     settings: &'a Settings,
     observer: &'a dyn MaintenanceObserver,
     ctx: OperationContext<'a>,
-    /// How many object-store requests this job may keep in flight, from
-    /// `limits.io_concurrency`.
-    concurrency: usize,
     /// How much machine one group's rewrite may use.
     tuning: rewrite::Tuning,
 }
 
-/// One snapshot, in the three views a rewrite needs.
+/// One snapshot, in the two views a rewrite needs.
 ///
 /// They move together. Each answers a different question about the same
-/// snapshot — what the table is, which files are live with which deletes, and
-/// what the manifests say that the scan omits — so mixing readings from two
-/// snapshots is a rewrite reasoning about a table that never existed.
+/// snapshot — what the table is, and which files are live with which deletes
+/// applying to each — so mixing readings from two snapshots is a rewrite
+/// reasoning about a table that never existed.
 ///
 /// Reloaded whenever the table moves, including when *we* moved it: every group
 /// commits on its own, so a group offered against the plan-time parent would
@@ -121,41 +118,40 @@ struct Job<'a> {
 struct TableState {
     table: Table,
     tasks: Vec<FileScanTask>,
-    files: FileIndex,
 }
 
 impl TableState {
-    /// Read all three views of the table as it currently stands.
-    async fn load(
-        loader: &dyn TableLoader,
-        ident: &TableIdent,
-        table_ref: &TableRef,
-        concurrency: usize,
-    ) -> Result<Self> {
+    /// Read both views of the table as it currently stands.
+    async fn load(loader: &dyn TableLoader, ident: &TableIdent) -> Result<Self> {
         let table = loader.reload(ident).await?;
-        Self::of(table, table_ref, concurrency).await
+        Self::of(table).await
     }
 
     /// The same, for a table already in hand.
-    async fn of(table: Table, table_ref: &TableRef, concurrency: usize) -> Result<Self> {
+    async fn of(table: Table) -> Result<Self> {
         let tasks = plan_all(&table).await?;
-        let files = crate::health::file_index(table_ref, &table, concurrency).await?;
-        Ok(Self {
-            table,
-            tasks,
-            files,
-        })
+        Ok(Self { table, tasks })
     }
 
-    /// The partition a scanned file belongs to, as the manifests record it.
+    /// The partition a scanned file belongs to, under the spec it was written
+    /// with.
     ///
-    /// The key is rendered by [`crate::health`], which is also what the planner
-    /// carries, so the plan and the rewrite agree on what a partition is by
-    /// construction rather than by two implementations happening to match.
+    /// Both halves come from the task, which carries the manifest entry's own
+    /// partition tuple and the spec that manifest was written under. The key is
+    /// rendered by [`crate::health`], which is also what the planner carries,
+    /// so the plan and the rewrite agree on what a partition is by construction
+    /// rather than by two implementations happening to match.
+    ///
+    /// `None` when the scan did not attach a spec, which it always does for a
+    /// task planned from a manifest; a file whose partition is unknown is never
+    /// rewritten, because its rows could be filed anywhere.
     fn partition_of(&self, task: &FileScanTask) -> Option<HealthPartitionKey> {
-        self.files
-            .partition_of(&normalize(&task.data_file_path))
-            .cloned()
+        let spec = task.partition_spec()?;
+        if spec.is_unpartitioned() {
+            return Some(HealthPartitionKey::unpartitioned(spec.spec_id()));
+        }
+        let schema = self.table.metadata().current_schema();
+        Some(HealthPartitionKey::new(spec, schema, task.partition()?))
     }
 
     /// The live tasks whose paths are `wanted`.
@@ -169,10 +165,45 @@ impl TableState {
     fn select(&self, wanted: &HashSet<String>) -> Vec<FileScanTask> {
         self.tasks
             .iter()
-            .filter(|t| wanted.contains(&normalize(&t.data_file_path)))
+            .filter(|t| wanted.contains(&normalize(t.data_file_path())))
             .cloned()
             .collect()
     }
+}
+
+/// The same scan task with a different delete list and projection.
+///
+/// `FileScanTask` is immutable and validated on construction, so a task that
+/// must drop the deletes Bergman applies itself is rebuilt from every field the
+/// scan gave it. One function, so a field upstream adds is copied in one place
+/// — a rebuilt task that silently lost its partition, its name mapping or its
+/// encryption key would read the file differently from the scan that planned it.
+pub(crate) fn retask(
+    task: &FileScanTask,
+    deletes: Vec<iceberg::scan::FileScanTaskDeleteFile>,
+    project_field_ids: Vec<i32>,
+) -> Result<FileScanTask> {
+    FileScanTask::builder()
+        .with_file_size_in_bytes(task.file_size_in_bytes())
+        .with_start(task.start())
+        .with_length(task.length())
+        .with_record_count(task.record_count())
+        .with_first_row_id(task.first_row_id())
+        .with_data_sequence_number(task.data_sequence_number())
+        .with_data_file_path(task.data_file_path().to_string())
+        .with_data_file_format(task.data_file_format())
+        .with_schema(task.schema_ref())
+        .with_project_field_ids(project_field_ids)
+        .with_predicate(task.predicate().cloned())
+        .with_deletes(deletes)
+        .with_partition(task.partition().cloned())
+        .with_partition_spec(task.partition_spec().cloned())
+        .with_name_mapping(task.name_mapping().cloned())
+        .with_unified_partition_type(task.unified_partition_type().cloned())
+        .with_case_sensitive(task.case_sensitive())
+        .with_key_metadata(task.key_metadata().map(Box::from))
+        .build()
+        .map_err(|e| Error::Storage(Box::new(e)))
 }
 
 /// The resolved knobs a rewrite reads, flattened out of the policy.
@@ -198,9 +229,9 @@ impl Settings {
     /// conservative — a delete-triggered partition offers all its files — and
     /// this narrows that to the files a rewrite actually improves.
     fn is_eligible(&self, task: &FileScanTask) -> bool {
-        !task.deletes.is_empty()
-            || task.file_size_in_bytes < self.small
-            || task.file_size_in_bytes > self.large
+        !task.deletes().is_empty()
+            || task.file_size_in_bytes() < self.small
+            || task.file_size_in_bytes() > self.large
     }
 }
 
@@ -245,7 +276,7 @@ impl FileGroup {
         let deletes: HashSet<&str> = self
             .tasks
             .iter()
-            .flat_map(|t| t.deletes.iter())
+            .flat_map(|t| t.deletes().iter())
             .map(|d| d.file_path.as_str())
             .collect();
 
@@ -253,7 +284,7 @@ impl FileGroup {
     }
 
     fn bytes(&self) -> u64 {
-        self.tasks.iter().map(|t| t.file_size_in_bytes).sum()
+        self.tasks.iter().map(|t| t.file_size_in_bytes()).sum()
     }
 }
 
@@ -287,14 +318,6 @@ pub async fn run(
     // data. A table whose manifests are encrypted is refused by name here as
     // well as in the planner.
     env.require_readable_manifests("compact")?;
-
-    // Refused before the table is scanned. A v3 table's row lineage cannot
-    // survive a rewrite Bergman performs (see `crate::commit::authoring_refusal`),
-    // and discovering that after reading a partition would be a full data read
-    // spent to reach the same answer.
-    if let Some(reason) = crate::commit::authoring_refusal(metadata.format_version()) {
-        return Err(Error::refused("compact", table_ref, reason));
-    }
 
     // Iceberg's data file formats are Parquet, Avro and ORC. Bergman handles
     // Parquet and only Parquet, in both directions: upstream's `ArrowReader`
@@ -343,7 +366,7 @@ pub async fn run(
     // and finding delete files that apply to nothing at all. The manifest index
     // comes with it, because the scan omits a file's partition and a delete
     // file's format and both are needed per group.
-    let mut state = TableState::of(table.clone(), table_ref, env.io_concurrency).await?;
+    let mut state = TableState::of(table.clone()).await?;
 
     let job = Job {
         ident: env.ident,
@@ -352,7 +375,6 @@ pub async fn run(
         settings: &resolved,
         observer: env.observer,
         ctx: env.ctx,
-        concurrency: env.io_concurrency,
         tuning: rewrite::Tuning {
             parallelism: env.compaction_parallelism,
             read_concurrency: env.io_concurrency,
@@ -386,7 +408,7 @@ pub async fn run(
                 // read is metadata only, and it is the same read the retry
                 // would have done anyway; doing it here means doing it *before*
                 // the wasted rewrite rather than after.
-                match TableState::load(job.loader, job.ident, table_ref, job.concurrency).await {
+                match TableState::load(job.loader, job.ident).await {
                     Ok(fresh) => state = fresh,
                     // The table cannot be re-read, so no later group can be
                     // offered honestly. Stopping keeps what has been committed
@@ -544,8 +566,8 @@ impl Job<'_> {
                 // rows anywhere.
                 tracing::debug!(
                     table = %self.ctx.table,
-                    file = %task.data_file_path,
-                    "scanned file is not in the manifest partition index; skipping"
+                    file = %task.data_file_path(),
+                    "scanned file carries no partition spec; skipping"
                 );
                 continue;
             };
@@ -591,7 +613,7 @@ impl Job<'_> {
             // Smallest first, so a group fills with the files that most need
             // merging and a partial run leaves the largest files alone — they
             // were closest to target anyway.
-            tasks.sort_by_key(|t| t.file_size_in_bytes);
+            tasks.sort_by_key(|t| t.file_size_in_bytes());
 
             for (index, chunk) in self
                 .pack(&tasks)
@@ -656,7 +678,7 @@ impl Job<'_> {
                 || has_deletes(chunk)
                 || chunk
                     .iter()
-                    .any(|t| t.file_size_in_bytes > self.settings.large))
+                    .any(|t| t.file_size_in_bytes() > self.settings.large))
     }
 
     /// Bin-pack one partition's files into groups.
@@ -666,7 +688,7 @@ impl Job<'_> {
         let mut bytes = 0u64;
 
         for task in tasks {
-            let would_be = bytes.saturating_add(task.file_size_in_bytes);
+            let would_be = bytes.saturating_add(task.file_size_in_bytes());
             let full = !current.is_empty()
                 && (would_be > self.settings.max_group_bytes
                     || current.len() >= self.settings.max_input_files);
@@ -674,7 +696,7 @@ impl Job<'_> {
                 packed.push(std::mem::take(&mut current));
                 bytes = 0;
             }
-            bytes = bytes.saturating_add(task.file_size_in_bytes);
+            bytes = bytes.saturating_add(task.file_size_in_bytes());
             current.push(task);
         }
 
@@ -703,7 +725,7 @@ impl Job<'_> {
         let wanted: HashSet<String> = group
             .tasks
             .iter()
-            .map(|t| normalize(&t.data_file_path))
+            .map(|t| normalize(t.data_file_path()))
             .collect();
 
         let mut borrowed = Some(state);
@@ -738,10 +760,7 @@ impl Job<'_> {
                     tokio::time::sleep(retry_delay(attempt)).await;
 
                     borrowed = None;
-                    reloaded = Some(
-                        TableState::load(self.loader, self.ident, self.ctx.table, self.concurrency)
-                            .await?,
-                    );
+                    reloaded = Some(TableState::load(self.loader, self.ident).await?);
                 }
                 Err(e) => return Err(e),
             }
@@ -767,13 +786,14 @@ impl Job<'_> {
             return Ok(None);
         }
 
-        let in_group: HashSet<String> =
-            tasks.iter().map(|t| normalize(&t.data_file_path)).collect();
+        let in_group: HashSet<String> = tasks
+            .iter()
+            .map(|t| normalize(t.data_file_path()))
+            .collect();
 
         // A group must never span partition specs: output goes out under one
         // spec, and a commit claiming it replaces files partitioned differently
-        // mis-files every row in it. The spec id comes from the manifest index
-        // rather than the task, which never carries one.
+        // mis-files every row in it.
         let spec_ids: HashSet<i32> = tasks
             .iter()
             .filter_map(|t| state.partition_of(t).map(|k| k.spec_id))
@@ -799,74 +819,59 @@ impl Job<'_> {
         // the ones already there.
         if let Some(other) = tasks
             .iter()
-            .find(|t| t.data_file_format != DataFileFormat::Parquet)
+            .find(|t| t.data_file_format() != DataFileFormat::Parquet)
         {
             return Err(Error::refused(
                 "compact",
                 table_ref,
                 format!(
                     "{group} holds a {:?} data file ({}); Bergman reads only Parquet",
-                    other.data_file_format, other.data_file_path
+                    other.data_file_format(),
+                    other.data_file_path()
                 ),
             ));
         }
 
-        // The same rule for the delete files that apply to the group, whose
-        // format `FileScanTaskDeleteFile` does not carry — so it comes from the
-        // manifest index, which is exact. Reading a delete file wrongly is
-        // worse than reading a data file wrongly: an equality delete that fails
-        // to parse is one whose rows would not be removed.
-        for delete in tasks.iter().flat_map(|t| t.deletes.iter()) {
-            match state.files.delete_format_of(&normalize(&delete.file_path)) {
-                Some(DataFileFormat::Parquet) => {}
-                Some(other) => {
-                    return Err(Error::refused(
-                        "compact",
-                        table_ref,
-                        format!(
-                            "{group} is covered by a {other:?} delete file ({}); \
-                             Bergman reads only Parquet",
-                            delete.file_path
-                        ),
-                    ));
-                }
-                // The scan named a delete file the manifests did not. Both read
-                // the same snapshot, so the table moved underneath the plan —
-                // and a rewrite that applied an unknown delete file, or failed
-                // to, is not one to guess at.
-                None => {
-                    return Err(Error::StalePlan {
-                        table: table_ref.to_string(),
-                        detail: format!(
-                            "delete file {} is not in the manifest index; \
-                             a concurrent commit changed the table",
-                            delete.file_path
-                        ),
-                    });
-                }
-            }
+        // The same rule for the delete files that apply to the group, as the
+        // manifest entry records each one's format. Reading a delete file
+        // wrongly is worse than reading a data file wrongly: an equality delete
+        // that fails to parse is one whose rows would not be removed.
+        if let Some(delete) = tasks
+            .iter()
+            .flat_map(|t| t.deletes().iter())
+            .find(|d| !readable_delete(d))
+        {
+            return Err(Error::refused(
+                "compact",
+                table_ref,
+                format!(
+                    "{group} is covered by a {:?} {:?} delete file ({}); \
+                     Bergman reads Parquet delete files only",
+                    delete.file_format, delete.file_type, delete.file_path
+                ),
+            ));
         }
 
         // The delete-file rule. A delete file referenced by anything outside
         // this group is still doing work there, so it stays — and because it
         // stays, the data files it applies to inside the group are still
         // correct after the rewrite.
-        let deletes_elsewhere: HashSet<String> = all_tasks
+        let deletes_elsewhere: HashSet<FileRef> = all_tasks
             .iter()
-            .filter(|t| !in_group.contains(&normalize(&t.data_file_path)))
-            .flat_map(|t| t.deletes.iter())
-            .map(|d| normalize(&d.file_path))
+            .filter(|t| !in_group.contains(&normalize(t.data_file_path())))
+            .flat_map(|t| t.deletes().iter())
+            .map(FileRef::of_scan_delete)
             .collect();
 
-        let deletes_in_group: HashSet<String> = tasks
+        let deletes_in_group: HashSet<FileRef> = tasks
             .iter()
-            .flat_map(|t| t.deletes.iter())
-            .map(|d| normalize(&d.file_path))
+            .flat_map(|t| t.deletes().iter())
+            .map(FileRef::of_scan_delete)
             .collect();
 
         let retirable = retirable_deletes(&deletes_in_group, &deletes_elsewhere);
 
-        let bytes_read: u64 = tasks.iter().map(|t| t.file_size_in_bytes).sum();
+        let bytes_read: u64 = tasks.iter().map(|t| t.file_size_in_bytes()).sum();
 
         // Rows expected out: what the manifests say went in. Metadata only, so
         // this costs nothing and still catches the failure that matters.
@@ -934,7 +939,7 @@ impl Job<'_> {
         // The delete files appended below may not — see `FileRef`.
         let mut removed: Vec<FileRef> = tasks
             .iter()
-            .map(|t| FileRef::path(&t.data_file_path))
+            .map(|t| FileRef::path(t.data_file_path()))
             .collect();
         removed.extend(retirable.iter().cloned());
 
@@ -1009,7 +1014,7 @@ impl Job<'_> {
         let tasks = plan_all(&table).await?;
         let still_applied: HashSet<String> = tasks
             .iter()
-            .flat_map(|t| t.deletes.iter())
+            .flat_map(|t| t.deletes().iter())
             .map(|d| normalize(&d.file_path))
             .collect();
 
@@ -1047,7 +1052,7 @@ impl Job<'_> {
 /// A single file is worth rewriting on its own only when doing so retires
 /// something; otherwise it would be read and written back byte-for-byte.
 fn has_deletes(chunk: &[&FileScanTask]) -> bool {
-    chunk.iter().any(|t| !t.deletes.is_empty())
+    chunk.iter().any(|t| !t.deletes().is_empty())
 }
 
 /// What the manifests say a group's rewrite should produce: a closed interval.
@@ -1120,9 +1125,9 @@ fn expected_rows(tasks: &[FileScanTask]) -> Option<ExpectedRows> {
     let mut floor = 0u64;
     let mut ceiling = 0u64;
     for task in tasks {
-        let rows = task.record_count?;
+        let rows = task.record_count()?;
         ceiling = ceiling.saturating_add(rows);
-        if task.deletes.is_empty() {
+        if task.deletes().is_empty() {
             floor = floor.saturating_add(rows);
         }
     }
@@ -1158,28 +1163,40 @@ fn check_sort_columns(
 ///
 /// Split out so the rule can be tested directly: it is the one that resurrects
 /// deleted rows when it is wrong, and nothing fails visibly when it is.
-fn retirable_deletes(in_group: &HashSet<String>, elsewhere: &HashSet<String>) -> Vec<FileRef> {
-    // Paths, because a scan task is all this has to go on:
-    // `FileScanTaskDeleteFile` carries no `content_offset`, so a deletion vector
-    // is indistinguishable from its Puffin container here.
-    //
-    // That is safe rather than merely tolerable, and the direction matters. A
-    // `FileRef` with no offset does not match a deletion-vector entry, which
-    // carries one — so on a table that somehow reached this path with DVs, the
-    // removal fails the liveness check in `rewrite_files` **loudly**, instead of
-    // matching by path and taking the dangling vector's live siblings with it.
-    // Refusing to commit is the correct failure; silent resurrection is not.
-    let mut out: Vec<FileRef> = in_group.difference(elsewhere).map(FileRef::path).collect();
+fn retirable_deletes(in_group: &HashSet<FileRef>, elsewhere: &HashSet<FileRef>) -> Vec<FileRef> {
+    // Compared as identities, not paths. A deletion vector shares its Puffin
+    // file with the vectors of other data files, so "is this delete still used
+    // elsewhere?" is a question about the vector — `(path, offset)` — and the
+    // scan carries the offset. A path comparison would keep a group's own
+    // vector because a sibling in the same container is still live.
+    let mut out: Vec<FileRef> = in_group.difference(elsewhere).cloned().collect();
     out.sort();
     out
+}
+
+/// Whether Bergman's read path can apply this delete file.
+///
+/// Parquet position and equality delete files, and — the reader decodes them —
+/// deletion vectors in Puffin. Anything else reaches upstream's reader as a
+/// failure to find a Parquet footer, which is a baffling error where a named
+/// refusal belongs.
+fn readable_delete(delete: &iceberg::scan::FileScanTaskDeleteFile) -> bool {
+    use iceberg::spec::DataContentType;
+    matches!(
+        (delete.file_type, delete.file_format),
+        (
+            DataContentType::PositionDeletes | DataContentType::EqualityDeletes,
+            DataFileFormat::Parquet
+        ) | (DataContentType::PositionDeletes, DataFileFormat::Puffin)
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn set(paths: &[&str]) -> HashSet<String> {
-        paths.iter().map(|p| normalize(p)).collect()
+    fn refs(paths: &[&str]) -> HashSet<FileRef> {
+        paths.iter().map(FileRef::path).collect()
     }
 
     fn job(max_group_bytes: u64, max_input_files: usize) -> Settings {
@@ -1195,22 +1212,25 @@ mod tests {
     }
 
     fn task(size: u64) -> FileScanTask {
-        FileScanTask {
-            file_size_in_bytes: size,
-            start: 0,
-            length: size,
-            record_count: Some(10),
-            data_file_path: format!("s3://b/t/data/{size}-{}.parquet", uuid::Uuid::new_v4()),
-            data_file_format: iceberg::spec::DataFileFormat::Parquet,
-            schema: iceberg::spec::Schema::builder().build().unwrap().into(),
-            project_field_ids: vec![],
-            predicate: None,
-            deletes: vec![],
-            partition: None,
-            partition_spec: None,
-            name_mapping: None,
-            case_sensitive: true,
-        }
+        task_with(size, Some(10))
+    }
+
+    fn task_with(size: u64, record_count: Option<u64>) -> FileScanTask {
+        FileScanTask::builder()
+            .with_file_size_in_bytes(size)
+            .with_start(0)
+            .with_length(size)
+            .with_record_count(record_count)
+            .with_data_file_path(format!(
+                "s3://b/t/data/{size}-{}.parquet",
+                uuid::Uuid::new_v4()
+            ))
+            .with_data_file_format(iceberg::spec::DataFileFormat::Parquet)
+            .with_schema(iceberg::spec::Schema::builder().build().unwrap().into())
+            .with_project_field_ids(vec![])
+            .with_case_sensitive(true)
+            .build()
+            .unwrap()
     }
 
     #[test]
@@ -1264,7 +1284,6 @@ mod tests {
         };
         let committer = NoCommit;
         let job = Job {
-            concurrency: 4,
             tuning: rewrite::Tuning {
                 parallelism: 1,
                 read_concurrency: 4,
@@ -1298,12 +1317,50 @@ mod tests {
         );
     }
 
+    fn dv(path: &str, offset: i64, target: &str) -> iceberg::scan::FileScanTaskDeleteFile {
+        iceberg::scan::FileScanTaskDeleteFile::builder()
+            .with_file_path(path.into())
+            .with_file_size_in_bytes(4096)
+            .with_file_type(iceberg::spec::DataContentType::PositionDeletes)
+            .with_file_format(DataFileFormat::Puffin)
+            .with_partition_spec_id(0)
+            .with_referenced_data_file(Some(target.into()))
+            .with_content_offset(Some(offset))
+            .with_content_size_in_bytes(Some(64))
+            .build()
+    }
+
+    #[test]
+    fn a_deletion_vector_reference_from_a_scan_keeps_its_offset() {
+        // A vector is a blob inside a Puffin file that may hold others. Its
+        // identity is the offset as much as the path; a reference built from a
+        // scan that dropped it would name the container, not the vector.
+        let reference = FileRef::of_scan_delete(&dv("s3://b/t/data/dvs.puffin", 4, "a.parquet"));
+        assert_eq!(reference.offset, Some(4));
+        assert!(reference.is_blob());
+    }
+
+    #[test]
+    fn a_groups_own_vector_is_retired_and_its_container_sibling_is_not() {
+        // Two vectors in one Puffin file, one for a data file in the group and
+        // one for a file outside it. Compared by path they are one file: the
+        // group's vector would be kept for ever, or — under a rule loose in the
+        // other direction — its sibling would be retired and the rows it hides
+        // would come back. Compared by identity, exactly the group's own goes.
+        let ours = FileRef::of_scan_delete(&dv("s3://b/t/data/dvs.puffin", 4, "a.parquet"));
+        let theirs = FileRef::of_scan_delete(&dv("s3://b/t/data/dvs.puffin", 68, "z.parquet"));
+
+        let in_group: HashSet<FileRef> = [ours.clone()].into();
+        let elsewhere: HashSet<FileRef> = [theirs].into();
+        assert_eq!(retirable_deletes(&in_group, &elsewhere), vec![ours]);
+    }
+
     #[test]
     fn a_delete_file_shared_with_another_group_is_not_retired() {
         // The rule that matters. This delete file is still hiding rows in a
         // file outside the group; dropping it brings them back.
-        let in_group = set(&["s3://b/t/d1.parquet", "s3://b/t/shared.parquet"]);
-        let elsewhere = set(&["s3://b/t/shared.parquet"]);
+        let in_group = refs(&["s3://b/t/d1.parquet", "s3://b/t/shared.parquet"]);
+        let elsewhere = refs(&["s3://b/t/shared.parquet"]);
 
         assert_eq!(
             retirable_deletes(&in_group, &elsewhere),
@@ -1315,7 +1372,7 @@ mod tests {
     fn a_delete_file_exclusive_to_the_group_is_retired() {
         // Its rows have been applied and written out, so keeping it would make
         // every future read pay for a file that hides nothing.
-        let in_group = set(&["s3://b/t/d1.parquet"]);
+        let in_group = refs(&["s3://b/t/d1.parquet"]);
         assert_eq!(
             retirable_deletes(&in_group, &HashSet::new()),
             vec![FileRef::path("s3://b/t/d1.parquet")]
@@ -1326,11 +1383,8 @@ mod tests {
     fn retirement_compares_normalized_paths() {
         // The scan reports `s3://`, the manifest may say `s3a://`. Treating
         // them as different files would retire one that is still in use.
-        let in_group = set(&["s3://b/t/d1.parquet"]);
-        let elsewhere: HashSet<String> = ["s3a://b/t//d1.parquet"]
-            .iter()
-            .map(|p| normalize(p))
-            .collect();
+        let in_group = refs(&["s3://b/t/d1.parquet"]);
+        let elsewhere = refs(&["s3a://b/t//d1.parquet"]);
         assert!(retirable_deletes(&in_group, &elsewhere).is_empty());
     }
 
@@ -1350,7 +1404,6 @@ mod tests {
         };
         let committer = NoCommit;
         let job = Job {
-            concurrency: 4,
             tuning: rewrite::Tuning {
                 parallelism: 1,
                 read_concurrency: 4,
@@ -1388,7 +1441,6 @@ mod tests {
         };
         let committer = NoCommit;
         let job = Job {
-            concurrency: 4,
             tuning: rewrite::Tuning {
                 parallelism: 1,
                 read_concurrency: 4,
@@ -1411,15 +1463,18 @@ mod tests {
         );
     }
 
-    fn with_a_delete(mut task: FileScanTask) -> FileScanTask {
-        task.deletes.push(iceberg::scan::FileScanTaskDeleteFile {
-            file_path: "s3://b/t/d.parquet".into(),
-            file_size_in_bytes: 1,
-            file_type: iceberg::spec::DataContentType::PositionDeletes,
-            partition_spec_id: 0,
-            equality_ids: None,
-        });
-        task
+    fn with_a_delete(task: FileScanTask) -> FileScanTask {
+        let mut deletes = task.deletes().to_vec();
+        deletes.push(
+            iceberg::scan::FileScanTaskDeleteFile::builder()
+                .with_file_path("s3://b/t/d.parquet".into())
+                .with_file_size_in_bytes(1)
+                .with_file_type(iceberg::spec::DataContentType::PositionDeletes)
+                .with_file_format(iceberg::spec::DataFileFormat::Parquet)
+                .with_partition_spec_id(0)
+                .build(),
+        );
+        retask(&task, deletes, task.project_field_ids().to_vec()).unwrap()
     }
 
     #[test]
@@ -1569,8 +1624,7 @@ mod tests {
 
     #[test]
     fn expected_rows_are_unknown_when_a_task_covers_part_of_a_file() {
-        let mut tasks = vec![task(10)];
-        tasks[0].record_count = None;
+        let tasks = vec![task_with(10, None)];
         assert_eq!(expected_rows(&tasks), None);
     }
 

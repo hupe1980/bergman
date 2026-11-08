@@ -41,6 +41,14 @@ concepts/
 # none of which resolves for a reader of the published tree.
 .claude/
 
+# Feature specifications and the Spec Kit machinery that produces them: one
+# `specs/NNN-slug/` per roadmap item, the constitution plans are checked against,
+# and the `/speckit-*` skills under `.claude/`. Internal for the same reason as
+# `concepts/` — they cite its numbers — so nothing published may cite a path in
+# either.
+/specs/
+/.specify/
+
 # Custom
 .DS_Store
 

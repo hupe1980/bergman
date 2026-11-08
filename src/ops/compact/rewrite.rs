@@ -145,12 +145,14 @@ fn bucket_by_equality_deletes<'a>(
 
     for task in group {
         let mut deletes: Vec<EqualityDelete> = task
-            .deletes
+            .deletes()
             .iter()
             .filter(|d| d.file_type == DataContentType::EqualityDeletes)
             .map(|d| EqualityDelete {
                 path: d.file_path.clone(),
                 size: d.file_size_in_bytes,
+                format: d.file_format,
+                key_metadata: d.key_metadata.clone(),
                 equality_ids: d.equality_ids.clone().unwrap_or_default(),
             })
             .collect();
@@ -180,6 +182,9 @@ fn bucket_by_equality_deletes<'a>(
 struct EqualityDelete {
     path: String,
     size: u64,
+    /// As the manifest records it, rather than assumed to be Parquet.
+    format: iceberg::spec::DataFileFormat,
+    key_metadata: Option<Box<[u8]>>,
     equality_ids: Vec<i32>,
 }
 
@@ -217,15 +222,31 @@ async fn bucket_frame(
     // Positional deletes stay on the task, where upstream turns them into a
     // Parquet row selection. Equality deletes are stripped, because we are
     // about to do them properly.
+    //
+    // On a v3 table the read also asks for each row's lineage, which upstream's
+    // reader supplies physical-value-first and inherits only where the file
+    // holds none. It flows through the anti-join and the sort like any other
+    // column and is written back physically (see `super::writer`), which is the
+    // only way a row keeps its identity when it moves to another file.
+    let lineage = super::writer::lineage_field_ids(table.metadata());
     let data_tasks: Vec<FileScanTask> = tasks
         .iter()
         .map(|task| {
-            let mut task = (*task).clone();
-            task.deletes
-                .retain(|d| d.file_type != DataContentType::EqualityDeletes);
-            task
+            let positional = task
+                .deletes()
+                .iter()
+                .filter(|d| d.file_type != DataContentType::EqualityDeletes)
+                .cloned()
+                .collect();
+            let mut projection = task.project_field_ids().to_vec();
+            for id in &lineage {
+                if !projection.contains(id) {
+                    projection.push(*id);
+                }
+            }
+            super::retask(task, positional, projection)
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
     let data_table = format!("{DATA_TABLE}_{index}");
     let data = read_tasks(table, data_tasks, tuning)?;
@@ -242,9 +263,8 @@ async fn bucket_frame(
     // generations of delete file stay live until compaction retires them — and
     // a group can therefore carry more than one set. Anti-joins compose
     // exactly: a row survives when it matches *none* of them, which is what
-    // chaining `LeftAnti` computes. So this is a loop rather than the refusal
-    // it used to be, and no legal table is turned away for a shape the
-    // arithmetic handles.
+    // chaining `LeftAnti` computes, so no legal table is turned away for a
+    // shape the arithmetic handles.
     //
     // `LeftAnti` keeps only the left side's columns and their qualifier, so
     // each join after the first still addresses `data_table` by name.
@@ -335,13 +355,10 @@ fn session(memory_budget: u64, parallelism: usize) -> Result<SessionContext> {
         .build_arc()
         .map_err(datafusion_error)?;
 
-    // The plan is as wide as the deployment allows. This used to be pinned to
-    // one partition on the argument that parallelism lives across tables and
-    // file groups — which is true and was not sufficient: groups within a table
-    // commit sequentially by construction (each is offered against the snapshot
-    // the last one produced), so a single table's rewrite was serial whatever
-    // the host had. A table with one hot partition is exactly the table that
-    // needs compacting, and it got one core.
+    // The plan is as wide as the deployment allows. Groups within a table
+    // commit sequentially by construction (each is offered against the
+    // snapshot the last one produced), so the parallelism a single hot
+    // partition gets is the parallelism inside its rewrite.
     //
     // Widening is safe with respect to the two things that could break:
     //
@@ -381,14 +398,12 @@ fn read_tasks(
     let runtime = iceberg::Runtime::try_current()
         .map_err(|e| Error::config(format!("compaction needs a tokio runtime: {e}")))?;
 
+    let first = tasks
+        .first()
+        .ok_or_else(|| Error::config("a scan needs at least one file"))?;
     let schema: ArrowSchemaRef = Arc::new(
-        iceberg::arrow::schema_to_arrow_schema(
-            tasks
-                .first()
-                .map(|t| t.schema.as_ref())
-                .ok_or_else(|| Error::config("a scan needs at least one file"))?,
-        )
-        .map_err(|e| Error::Storage(Box::new(e)))?,
+        iceberg::arrow::schema_to_arrow_schema(&projected_schema(first)?)
+            .map_err(|e| Error::Storage(Box::new(e)))?,
     );
 
     let task_stream = futures::stream::iter(tasks.into_iter().map(Ok)).boxed();
@@ -405,10 +420,85 @@ fn read_tasks(
         .stream()
         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)));
 
+    let declared = schema.clone();
+    let batches = batches.and_then(move |batch| {
+        let declared = declared.clone();
+        async move { conform(batch, &declared) }
+    });
+
     Ok(Box::pin(RecordBatchStreamAdapter::new(
         schema,
         Box::pin(batches),
     )))
+}
+
+/// Bring a batch to exactly the declared schema.
+///
+/// Upstream's reader is free to encode a column more compactly than its
+/// declared type — an inherited `_last_updated_sequence_number` is one value
+/// for a whole file and arrives run-end encoded. `DataFusion` trusts the
+/// declared schema rather than checking it, so a batch that disagreed would
+/// reach the writer and fail there. Decoded here instead, and every column is
+/// checked rather than only the one known to differ, so a future encoding
+/// change upstream is absorbed rather than discovered.
+fn conform(
+    batch: datafusion::arrow::array::RecordBatch,
+    declared: &ArrowSchemaRef,
+) -> datafusion::error::Result<datafusion::arrow::array::RecordBatch> {
+    if batch.schema().fields() == declared.fields() {
+        return Ok(batch);
+    }
+    // A batch with a different number of columns is a different projection,
+    // not a different encoding; pairing its columns with the declared fields
+    // by position would write one column's values under another's name.
+    if batch.num_columns() != declared.fields().len() {
+        return Err(datafusion::error::DataFusionError::Internal(format!(
+            "the reader produced {} columns where the scan declared {}",
+            batch.num_columns(),
+            declared.fields().len()
+        )));
+    }
+    let columns = declared
+        .fields()
+        .iter()
+        .zip(batch.columns())
+        .map(|(field, column)| {
+            if column.data_type() == field.data_type() {
+                Ok(column.clone())
+            } else {
+                datafusion::arrow::compute::cast(column, field.data_type())
+            }
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(datafusion::arrow::array::RecordBatch::try_new(
+        declared.clone(),
+        columns,
+    )?)
+}
+
+/// The schema a task's batches arrive in: its projected fields, in projection
+/// order, with each reserved field id resolved to its metadata column.
+///
+/// Declared from the projection rather than from the task's table schema,
+/// because the two differ exactly where it matters: a v3 rewrite projects
+/// `_row_id` and `_last_updated_sequence_number`, which are in no table schema,
+/// and a stream declared without them would have the plan drop the very
+/// columns that carry each row's identity.
+fn projected_schema(task: &FileScanTask) -> Result<iceberg::spec::Schema> {
+    let fields = task
+        .project_field_ids()
+        .iter()
+        .map(|id| match task.schema().field_by_id(*id) {
+            Some(field) => Ok(field.clone()),
+            None => iceberg::metadata_columns::get_metadata_field(*id).cloned(),
+        })
+        .collect::<iceberg::Result<Vec<_>>>()
+        .map_err(|e| Error::Storage(Box::new(e)))?;
+    iceberg::spec::Schema::builder()
+        .with_schema_id(task.schema().schema_id())
+        .with_fields(fields)
+        .build()
+        .map_err(|e| Error::Storage(Box::new(e)))
 }
 
 /// Wrap a record-batch stream as a `DataFusion` table.
@@ -537,12 +627,10 @@ fn equality_delete_sets(
 
 /// Turn equality delete files into scan tasks that read only their key columns.
 ///
-/// The tasks say `Parquet`, and that is a fact rather than an assumption:
-/// `FileScanTaskDeleteFile` carries no format, so the caller checks each delete
-/// file's real format against the manifest index and refuses the group when it
-/// is anything else (see `crate::ops::compact::rewrite_once`). Upstream's reader
-/// opens a Parquet stream regardless of what the field says, so a wrong value
-/// here would not change what is read — it would only make the task lie.
+/// Each task carries the delete file's format as the manifest records it. The
+/// caller refuses a group whose equality deletes are anything but Parquet (see
+/// `crate::ops::compact::rewrite_once`), because upstream's reader opens a
+/// Parquet stream whatever the field says.
 fn delete_scan_tasks(
     table: &Table,
     deletes: &[EqualityDelete],
@@ -586,26 +674,25 @@ fn delete_scan_tasks(
             .map_err(|e| Error::Storage(Box::new(e)))?,
     );
 
-    Ok(deletes
+    deletes
         .iter()
-        .map(|delete| FileScanTask {
-            file_size_in_bytes: delete.size,
-            start: 0,
-            length: delete.size,
-            record_count: None,
-            data_file_path: delete.path.clone(),
-            data_file_format: iceberg::spec::DataFileFormat::Parquet,
-            schema: projected.clone(),
-            project_field_ids: field_ids.clone(),
-            predicate: None,
-            // A delete file has no deletes of its own.
-            deletes: Vec::new(),
-            partition: None,
-            partition_spec: None,
-            name_mapping: None,
-            case_sensitive: true,
+        .map(|delete| {
+            FileScanTask::builder()
+                .with_file_size_in_bytes(delete.size)
+                .with_start(0)
+                .with_length(delete.size)
+                .with_data_file_path(delete.path.clone())
+                .with_data_file_format(delete.format)
+                .with_schema(projected.clone())
+                .with_project_field_ids(field_ids.clone())
+                // A delete file has no deletes of its own, and no partition:
+                // it is read for its key columns only.
+                .with_case_sensitive(true)
+                .with_key_metadata(delete.key_metadata.clone())
+                .build()
+                .map_err(|e| Error::Storage(Box::new(e)))
         })
-        .collect())
+        .collect()
 }
 
 fn datafusion_error(e: impl std::fmt::Display) -> Error {
@@ -622,31 +709,33 @@ mod tests {
     use super::*;
 
     fn task(path: &str, deletes: Vec<(&str, DataContentType)>) -> FileScanTask {
-        FileScanTask {
-            file_size_in_bytes: 100,
-            start: 0,
-            length: 100,
-            record_count: Some(10),
-            data_file_path: path.to_string(),
-            data_file_format: iceberg::spec::DataFileFormat::Parquet,
-            schema: iceberg::spec::Schema::builder().build().unwrap().into(),
-            project_field_ids: vec![],
-            predicate: None,
-            deletes: deletes
-                .into_iter()
-                .map(|(p, t)| iceberg::scan::FileScanTaskDeleteFile {
-                    file_path: p.to_string(),
-                    file_size_in_bytes: 1,
-                    file_type: t,
-                    partition_spec_id: 0,
-                    equality_ids: Some(vec![1]),
-                })
-                .collect(),
-            partition: None,
-            partition_spec: None,
-            name_mapping: None,
-            case_sensitive: true,
-        }
+        FileScanTask::builder()
+            .with_file_size_in_bytes(100)
+            .with_start(0)
+            .with_length(100)
+            .with_record_count(Some(10))
+            .with_data_file_path(path.to_string())
+            .with_data_file_format(iceberg::spec::DataFileFormat::Parquet)
+            .with_schema(iceberg::spec::Schema::builder().build().unwrap().into())
+            .with_project_field_ids(vec![])
+            .with_deletes(
+                deletes
+                    .into_iter()
+                    .map(|(p, t)| {
+                        iceberg::scan::FileScanTaskDeleteFile::builder()
+                            .with_file_path(p.to_string())
+                            .with_file_size_in_bytes(1)
+                            .with_file_type(t)
+                            .with_file_format(iceberg::spec::DataFileFormat::Parquet)
+                            .with_partition_spec_id(0)
+                            .with_equality_ids(Some(vec![1]))
+                            .build()
+                    })
+                    .collect(),
+            )
+            .with_case_sensitive(true)
+            .build()
+            .unwrap()
     }
 
     #[test]

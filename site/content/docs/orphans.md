@@ -4,12 +4,10 @@ description = "The one operation that can destroy a healthy table, and the eight
 weight = 7
 +++
 An orphan is a file under a table's location that no retained metadata
-references. They accumulate from failed writes, abandoned commits, and
-maintenance that expired snapshots without reclaiming what they held.
-
-Removing them is the single most dangerous thing Bergman does. A reachable set
-missing one live file is a reachable set that destroys a table, and object
-storage has no undo. This page is the safety model.
+references — left by failed writes, abandoned commits, or expiration that did
+not reclaim its files. Removing them is the most dangerous thing Bergman does:
+a reachable set missing one live file destroys a table, and object storage has
+no undo. This page is the safety model.
 
 ## Enable it deliberately, twice
 
@@ -22,37 +20,29 @@ mode       = "delete"   # ...and is allowed to delete
 older_than = "7d"
 ```
 
-`enabled` alone gets you a **report**. Deleting takes a second, explicit opt-in.
-That is not ceremony: the default has to be the safe one, because an operator
-who forgets to say should get a list, not an incident.
+`enabled` alone gets you a **report**. Deleting takes a second opt-in.
 
 ## The eight checks
 
-Every candidate passes all eight before it is deleted. Each exists because of a
-specific way this goes wrong.
+Every candidate passes all eight before it is deleted.
 
 ### 1. Dry run by default
 
-`mode` defaults to `"dry-run"`, which reports what would go:
+`mode` defaults to `"dry-run"`:
 
 ```text
   [--] remove-orphans: 1,284 orphans totalling 4.20 GiB found in 6,102 objects
        (dry run; set mode = "delete" to remove them)
 ```
 
-Read one of these before you ever set `delete`. The count and the size are the
-two numbers that tell you whether the reachable set looks sane — if a table with
-480 live files reports 6,000 orphans, something is wrong with your configuration,
-not with your table.
+Read one before setting `delete`. A table with 480 live files reporting 6,000
+orphans points at your configuration, not your table.
 
 ### 2. A grace period with a hard floor {#the-grace-period}
 
-Writers stage data files **before** the commit that references them. Between
-those two moments the file is on disk and unreferenced — indistinguishable, to a
-scanner, from garbage. Deleting it corrupts a table that was doing nothing wrong.
-
-`older_than` defaults to 7 days and is bounded below by a **24-hour floor that
-cannot be configured away**:
+Writers stage data files **before** the commit that references them, so a young
+unreferenced file is more likely a live write than garbage. `older_than`
+defaults to 7 days, with a **24-hour floor that cannot be configured away**:
 
 ```toml
 older_than = "1h"    # refused at startup
@@ -64,42 +54,28 @@ the 86400s floor. Writers stage files before the commit that references them, so
 a young unreferenced file is more likely a live write than garbage.
 ```
 
-The floor is checked when configuration is validated **and again in the scanner
-itself**, because the library API lets an embedder construct settings directly.
-A safety rule enforced at one of two entry points is a safety rule with a hole in
-it.
+The floor is checked at validation **and again in the scanner**, since the
+library lets an embedder construct settings directly.
 
 ### 3. Unknown age means too young
 
-If the object store does not report a modification time, the file is skipped. A
-store that will not say how old a file is cannot be used to argue that it is old
-enough to delete.
+A file whose store reports no modification time is skipped.
 
 ### 4. Segment-wise containment
 
-`…/db/events` and `…/db/events_archive` share a string prefix, and object stores
-match prefixes as raw strings. A containment check that missed the difference
-would let one table's maintenance offer another table's live files for deletion.
-
-Bergman compares whole path segments, both when listing and again per file. It
-also normalizes spellings first, so all of these name the same object:
+`…/db/events` and `…/db/events_archive` share a string prefix. Bergman compares
+whole path segments, when listing and again per file, after normalizing
+spellings, so these name the same object:
 
 - `s3://bucket/wh/t/f.parquet`
-- `s3a://bucket/wh/t/f.parquet` (what a Hadoop-era writer produces)
+- `s3a://bucket/wh/t/f.parquet` (a Hadoop-era writer)
 - `s3://bucket/wh/t//f.parquet` (a naive path join)
-
-A live file spelled differently from its metadata would otherwise look exactly
-like garbage.
 
 ### 5. No scanning a location another table lives inside
 
-A table at `s3://lake/wh/db` whose sibling sits at `s3://lake/wh/db/events` is a
-trap that containment cannot catch. Every one of that nested table's live files
-*is* inside this table's location, and *is* unreachable from this table's
-metadata — because it belongs to somebody else. That is precisely the definition
-of an orphan, and precisely wrong.
-
-Bergman refuses the scan and names the nested table:
+If `s3://lake/wh/db/events` is a table inside `s3://lake/wh/db`, every one of
+its live files is inside the outer table's location and unreachable from its
+metadata — an orphan by definition, and wrong. Bergman refuses the scan:
 
 ```
 remove-orphans refused on prod.db.warehouse: table "s3://lake/wh/db/events"
@@ -108,88 +84,49 @@ like orphans here. Move one of the two, or exclude this table from orphan
 removal.
 ```
 
-Refusing rather than quietly scanning around the nested table is deliberate: a
-warehouse laid out this way needs fixing, and working around it would leave the
-hazard in place for the next table added underneath.
-
-**This is checked two ways, and the second is the one that has to hold.**
-
-The first consults the locations of tables Bergman has examined. It is cheap and
-it can refuse before a single object is listed — but that ledger is structurally
-incomplete. A table no rule matches, one a rule `skip`s, one outside this
-cycle's `--table` scope, or one that failed to load is simply absent from it.
-And a deliberately-excluded table is *exactly* the one most likely to be sitting
-somewhere it should not be, so relying on the ledger alone would leave the
-nested table an operator was most careful about the least protected.
-
-The second reads the listing the scan is already walking. An Iceberg table's
-identity is a `metadata/….metadata.json` document at its root; this table's own
-live at `<location>/metadata/…`, so one found at
-`<location>/<anything>/metadata/…` belongs to a *different* table whose root is
-`<location>/<anything>`. No ledger, no prior examination, no extra I/O — and it
-holds for a table Bergman has never heard of.
-
-Note that this keys on the metadata document's own suffix, not on a directory
-name. A table's data may legitimately sit in a directory called `metadata`, and
-a name-based heuristic would trip over it.
+It is checked two ways. The first consults the locations of tables Bergman has
+examined this cycle, and can refuse before listing — but misses tables that are
+unmatched, skipped, out of `--table` scope or failed to load. The second, which
+has to hold, reads the listing itself: a `metadata/….metadata.json` found at
+`<location>/<anything>/metadata/…` belongs to another table rooted at
+`<location>/<anything>`. It keys on the metadata document, not a directory
+name, so a data directory called `metadata` does not trip it.
 
 ### 6. Re-verification before deleting
 
-Listing a large table takes long enough for a writer to commit, and any file that
-commit referenced is now live. So after listing and before deleting, Bergman
-reloads the table's metadata, recomputes reachability, and drops anything that
-became reachable in between:
+After listing and before deleting, Bergman reloads the metadata, recomputes
+reachability, and drops anything a writer made reachable in between:
 
 ```text
   [ok] remove-orphans: 1,284 orphans deleted (4.20 GiB) from 6,102 objects,
        3 spared as newly reachable
 ```
 
-A non-zero "spared" count is the check doing its job, and worth noticing — it
-means your tables are being written during maintenance windows.
+A non-zero "spared" count means tables are being written during maintenance.
 
 ### 7. A ceiling on the blast radius
 
-However wrong everything above turns out to be, one scan deletes at most
-`limits.max_deletes_per_run` files — 100 000 by default — and says loudly that
-it withheld the rest:
+One scan deletes at most `limits.max_deletes_per_run` files — 100 000 by
+default — and reports what it withheld:
 
 ```text
   [ok] remove-orphans: 100000 orphans deleted (312 GiB) from 6102000 objects,
        48211 left for the next scan by the per-run ceiling of 100000
 ```
 
-The difference between losing a thousand files and losing a million is the
-difference between an incident and a catastrophe. Hitting the ceiling is also
-information in its own right: a healthy table does not produce that many
-orphans, and a scan that quietly deleted them all would have hidden the fact.
-
-Deletions run with bounded concurrency. Deleting a million orphans one round
-trip at a time takes hours; a burst of ten thousand concurrent deletes is how a
-shared bucket starts throttling everybody.
-
-The ceiling lives under `[limits]` rather than under `[orphans]` because it
-governs **every** deletion Bergman performs. Orphan removal and
-[expiration's file cleanup](@/docs/snapshots.md) decide *what* to delete by completely
-different reasoning, but they share one deletion path: apply the ceiling, write
-the audit record, then delete with bounded concurrency. Two implementations of
-that would drift, and the half that drifted would be the half nobody was
-looking at.
+A healthy table does not produce that many orphans, so hitting it is itself a
+signal. Deletions run with bounded concurrency (`limits.io_concurrency`). The
+ceiling lives under `[limits]` because orphan removal and
+[expiration's file cleanup](@/docs/snapshots.md) share one deletion path: apply
+the ceiling, write the audit record, delete.
 
 ### 8. The listing and the metadata must agree that a file exists
 
-The scan lists a location, gets back ten thousand objects, and **not one of them**
-is a file the metadata references. Checks 1–7 all pass: the objects are old,
-unreferenced, inside the location, and no other table lives there. By every rule
-above they are garbage.
-
-They are almost certainly all live, and something is pointing at the wrong place
-— a `location` changed after the data was written, a bucket alias or URI scheme
-normalization did not fold together, a credential scoped to a subdirectory.
-
-A healthy table cannot reach this state: its own `metadata.json`, manifest list
-and manifests live under its location, so a listing returns at least those. Zero
-overlap is an unanswered question, not an answer:
+If a listing returns objects and **not one** is a file the metadata references,
+checks 1–7 would pass every one of them — yet they are almost certainly live,
+and something points at the wrong place: a changed `location`, a bucket alias,
+a credential scoped to a subdirectory. A healthy table's own metadata files are
+under its location, so zero overlap is refused:
 
 ```text
   [refused] remove-orphans: listed 10000 objects under s3://lake/wh/db/events and
@@ -197,80 +134,61 @@ overlap is an unanswered question, not an answer:
             listing and the table's metadata disagree about where its files are
 ```
 
-Nothing is deleted, and the fix is always configuration.
-
-## Memory
-
-The listing is consumed as a **stream** and reduced to candidates as it arrives.
-A table with millions of objects is never held in memory in its entirety just to
-be filtered away — and on a healthy table the answer is almost always empty.
-
-## Empty tables are still scanned
-
-This is the one operation that applies to a table with no snapshots, and it has
-to. A first write that died between staging its data and committing left files
-under the table location that nothing references and nothing else will ever
-reclaim. Every other operation declines an empty table; this one does not.
+The fix is always configuration.
 
 ## Two refusals
 
-Beyond the eight checks, the scanner declines outright in two more situations.
-
-**A table with a current snapshot but no reachable files.** Far more likely than
-"this table is entirely garbage" is that something went wrong reading its
-metadata. Deleting on that basis would empty the warehouse, so it is refused and
-reported:
+**A table with a current snapshot but no reachable files** — more likely a
+metadata read gone wrong than a table that is all garbage:
 
 ```
 remove-orphans refused on prod.db.t: table has a current snapshot but no
 reachable files; refusing to treat everything under its location as garbage
 ```
 
-**A reachable set that could not be fully computed.** An error anywhere in the
-metadata walk aborts the whole computation rather than returning what it managed
-to read. A partial reachable set is indistinguishable from a complete one, and
-would license deleting everything it failed to read.
+**A reachable set that could not be fully computed.** Any error in the metadata
+walk aborts the computation; a partial set would license deleting everything it
+failed to read.
+
+## Memory and empty tables
+
+The listing is consumed as a **stream** and reduced to candidates as it
+arrives. Orphan removal is the one operation that also runs on a table with no
+snapshots, since a first write that died before committing leaves files nothing
+else reclaims.
 
 ## What counts as reachable
 
-Everything, from **all retained snapshots** — not only the current one. A
-snapshot kept for time travel needs its data files as much as the current one
-does.
+Everything from **all retained snapshots**, not only the current one:
 
-- data files and delete files, from every manifest of every retained snapshot,
-  **including entries marked `DELETED`** — such an entry names a file *this*
-  snapshot removed, but an older retained snapshot still reads it
+- data and delete files — including Puffin files holding v3 deletion vectors —
+  from every manifest of every retained snapshot, **including entries marked
+  `DELETED`**, which an older retained snapshot still reads
 - manifests and manifest lists
-- statistics and partition-statistics files (Puffin)
-- every `metadata.json` the metadata log still names, plus the current one
-- `version-hint.text`, if the table was migrated from a Hadoop catalog — it
-  matches nothing in the metadata, so a scanner without this rule would delete
-  the only file that says which `metadata.json` is current
+- statistics and partition-statistics files
+- every `metadata.json` the metadata log names, plus the current one
+- `version-hint.text`, for a table migrated from a Hadoop catalog
+
+A Puffin file stays reachable while any vector in it is referenced.
 
 ## Cadence
 
-Orphan removal is the one operation that is **scheduled rather than
-triggered**. Every other operation decides from metadata Bergman has already
-read; this one cannot know whether a table has orphans without listing its whole
-location, and that listing *is* the cost. Running it on every cycle would make a
-five-minute cadence mean a full object-store listing of every table every five
-minutes — real money on S3, and it finds nothing almost every time.
+Orphan removal is **scheduled rather than triggered**: knowing whether a table
+has orphans means listing its whole location, and that listing is the cost.
 
 ```toml
 [rules.orphans]
 min_interval = "24h"   # the default
 ```
 
-The interval applies **within one process**. A one-shot `bergman run` always
-scans, because the cron entry that invoked it already decided the cadence; a
-long-lived `bergman daemon` on a short cycle throttles itself. Nothing is
-persisted — losing the memory on restart costs one extra listing, and persisting
-it would mean state that has to survive a crash, which is exactly what Bergman
-does not have.
+The interval applies **within one process**: a one-shot `bergman run` always
+scans, and a long-lived `bergman daemon` throttles itself. Nothing is
+persisted; a restart costs one extra listing.
 
 ## The audit trail
 
-The complete deletion list is written **before the first delete**:
+The complete deletion list is written **before the first delete**, so a crash
+mid-deletion leaves a record of what was about to go:
 
 ```bash
 bergman run --audit-log /var/log/bergman.jsonl
@@ -284,13 +202,7 @@ bergman run --audit-log /var/log/bergman.jsonl
  "deleted_files":["s3://lake/warehouse/analytics/events/data/00042-…parquet", …]}
 ```
 
-Writing it first is the point. A crash halfway through a deletion then leaves a
-record of exactly what was about to go — the difference between an incident with
-evidence and one without.
-
 ## Approval gates
-
-Embedders can require sign-off without Bergman knowing how that decision is made:
 
 ```rust
 #[async_trait::async_trait]
@@ -301,20 +213,12 @@ impl MaintenanceObserver for RequireSignoff {
 }
 ```
 
-Returning `false` vetoes the operation, which is then reported as **refused** —
-an outcome that needs attention, not a silent skip. See
+Returning `false` vetoes the operation, reported as **refused**. See
 [Library](@/docs/library.md#observers).
 
 ## Relationship to expiration
 
-Expiring snapshots makes files unreachable; something has to delete them.
-Upstream's `ExpireSnapshotsAction` explicitly does not, so you have two options:
-
-```toml
-[defaults.snapshots]
-delete_files = true      # reclaim immediately, during expiration
-```
-
-or leave it off and let the orphan scanner reclaim them after the grace period.
-The first returns storage sooner; the second keeps a single deletion path with a
-single safety model. Both use the same containment and normalization rules.
+Upstream's `ExpireSnapshotsAction` does not delete the files it makes
+unreachable. Either set `snapshots.delete_files = true` to reclaim them during
+expiration, or leave it off and let this scanner reclaim them after the grace
+period. Both share the same containment and normalization rules.

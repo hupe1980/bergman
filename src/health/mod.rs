@@ -14,7 +14,7 @@
 mod analyze;
 mod partition;
 
-pub use analyze::{FileIndex, analyze, file_index};
+pub use analyze::analyze;
 pub use partition::{Eligible, PartitionHealth, PartitionKey, UNPARTITIONED, partition_path};
 
 use std::time::Duration;
@@ -31,9 +31,9 @@ pub struct TableHealth {
     /// The table's Iceberg format version.
     ///
     /// Serializes as the integer the spec uses (1, 2, 3) — it is upstream's own
-    /// `repr(u8)` type rather than a plain number so that the planner can ask
-    /// [`crate::commit::authoring_refusal`] about it directly, instead of
-    /// carrying a second mapping from integer to meaning.
+    /// `repr(u8)` type rather than a plain number, so that code branching on it
+    /// matches upstream's own variants instead of carrying a second mapping from
+    /// integer to meaning.
     pub format_version: iceberg::spec::FormatVersion,
     /// The table's base location, which bounds every file it may own.
     pub location: String,
@@ -48,22 +48,6 @@ pub struct TableHealth {
     /// explanation is wanted, which is why this reaches the plan as a note.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_format: Option<String>,
-    /// Whether the table asks for the object-storage file layout
-    /// (`write.object-storage.enabled`).
-    ///
-    /// Iceberg inserts a deterministic hash into a data file's path when this is
-    /// on, so that a hot table's objects spread across S3 prefixes instead of
-    /// concentrating in one and collecting 503s. Bergman's writer uses upstream's
-    /// `DefaultLocationGenerator`, which does not — and the released crate offers
-    /// no generator that does — so a rewrite quietly moves files out of the
-    /// layout the table asked for.
-    ///
-    /// Carried here so the planner can *say so* rather than leave it silent. It
-    /// is not a refusal: the table still reads correctly, every path is recorded
-    /// in the metadata, and refusing to compact a table over its prefix layout
-    /// would be worse than the deviation.
-    #[serde(default)]
-    pub object_storage_layout: bool,
     /// The partition spec new files are written under.
     ///
     /// A table whose spec has evolved holds files under several at once, and
@@ -100,9 +84,9 @@ pub struct TableHealth {
 /// Today there is one answer, and it is **encryption**. Iceberg native
 /// encryption went GA in Java 1.11.0: a table declaring `encryption.key-id`
 /// has its data files, its manifests *and its manifest lists* encrypted, with
-/// v3 metadata carrying the wrapped keys in `encryption-keys`. Bergman opens
-/// manifests with `ManifestList::parse_with_version` and
-/// `ManifestFile::load_manifest`, neither of which decrypts anything.
+/// v3 metadata carrying the wrapped keys in `encryption-keys`. Upstream's
+/// readers decrypt only with a key-management client configured on the table,
+/// and Bergman configures none, so an encrypted manifest cannot be read.
 ///
 /// **This is an operability refusal, not a safety one, and the difference is
 /// worth stating precisely.** Every manifest walk in Bergman is all-or-nothing

@@ -33,81 +33,17 @@
 //! implementation and nothing above this module changes.
 
 mod auth;
-mod rest;
+pub(crate) mod rest;
 mod snapshot;
 
 pub use auth::{Credential, TokenSource};
-pub use rest::RestCommitter;
+pub use rest::{RestCommitter, http_client};
 pub use snapshot::{BranchRetention, FileRef, RewriteFiles, SnapshotProducer};
 
 use async_trait::async_trait;
-use iceberg::spec::FormatVersion;
 use iceberg::{TableIdent, TableRequirement, TableUpdate};
 
 use crate::error::Result;
-
-/// Why Bergman will not author a snapshot for a table of this format version,
-/// if it will not.
-///
-/// Only format 3 answers, and it answers for **two independent reasons** — both
-/// must close before a v3 table can be rewritten:
-///
-/// - **Row lineage.** A rewrite must copy each row's existing `_row_id` into the
-///   file replacing it. Bin-packing moves rows between files, so the new file's
-///   positional inheritance would give them different ids; preserving them means
-///   writing a physical column, which no released writer supports. Without it a
-///   rewrite renumbers every row it touches and nothing fails.
-/// - **Deletion vectors.** v3 encodes position deletes as `deletion-vector-v1`
-///   Puffin blobs, which the released reader cannot decode — so a rewrite could
-///   not see the deletes it must apply and would write those rows back.
-///
-/// The refusal sits above the commit layer rather than relying on a catalog to
-/// reject the result, because the failure it prevents is silent.
-///
-/// Operations that do not go through the snapshot producer stay available:
-/// expiration is upstream's own action and orphan removal commits nothing, so a
-/// v3 table's history stays bounded and its storage still gets reclaimed.
-pub fn authoring_refusal(format_version: FormatVersion) -> Option<&'static str> {
-    match format_version {
-        FormatVersion::V1 | FormatVersion::V2 => None,
-        FormatVersion::V3 => Some(
-            "the table is Iceberg format v3, and Bergman cannot yet rewrite one for two \
-             independent reasons: its row lineage cannot be preserved through a rewrite \
-             (the `_row_id` of every moved row must be written back as a physical column, \
-             which no released writer supports), and its deletion vectors cannot be read \
-             at all (the released crate has no `deletion-vector-v1` decoder), so a rewrite \
-             would resurrect every row they hide. Snapshot expiration and orphan removal \
-             still run",
-        ),
-    }
-}
-
-/// The error every v3 writer path returns, because none of them is implemented.
-///
-/// [`authoring_refusal`] refuses a v3 table in three places before anything is
-/// written, so reaching a writer is a bug rather than a table's fault. The arms
-/// exist as errors rather than as `build_v3_*` calls **on purpose**: upstream's
-/// v3 manifest and manifest-list writers are real and would produce files a
-/// catalog accepts, so a plausible-looking "lift the refusal" change is one
-/// match arm away from a table whose every rewritten row is silently
-/// renumbered.
-///
-/// Lifting the refusal is not one arm. It is, at minimum: a writer that
-/// persists `_row_id` and `_last_updated_sequence_number` as physical columns,
-/// a `first_row_id` on every added `DataFile`, a snapshot carrying
-/// `first-row-id` and `added-rows`, and a `TableUpdate` advancing the table's
-/// `next-row-id` by exactly the rows added. Until all of those exist, an error
-/// here is the honest answer.
-pub(crate) fn v3_writer_unimplemented(table: impl std::fmt::Display) -> crate::error::Error {
-    crate::error::Error::refused(
-        "rewrite",
-        table.to_string(),
-        "reached a format v3 writer, which Bergman does not implement: preserving row \
-         lineage through a rewrite needs a physical `_row_id` column, a per-file \
-         `first_row_id`, and a snapshot that advances the table's `next-row-id`. \
-         Producing a v3 snapshot without all of them renumbers rows silently",
-    )
-}
 
 /// Where a table's metadata files belong.
 ///

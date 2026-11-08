@@ -3,13 +3,9 @@ title = "Snapshots"
 description = "Expiring snapshots, what upstream decides, and reclaiming the files expiration leaves behind."
 weight = 6
 +++
-Every Iceberg commit adds a snapshot. Nothing removes them until something
-expires them, so a table written every minute accumulates 1,440 snapshots a day —
-each with a manifest list that planning may touch, and each pinning data files
-that would otherwise be deletable.
-
-This is the most common Iceberg health problem, and it is the one Bergman
-handles end to end today.
+Every Iceberg commit adds a snapshot, and nothing removes them until something
+expires them. A table written every minute gains 1,440 a day, each with a
+manifest list planning may touch and each pinning data files.
 
 ## Configure it
 
@@ -20,23 +16,17 @@ min_to_keep  = 3         # -> history.expire.min-snapshots-to-keep -> 1
 delete_files = false     # reclaim storage during expiration
 ```
 
-Metadata-only expiration is **on by default** — it is the one destructive-sounding
-operation that writes no data files, and unbounded snapshot growth costs
-everybody. Deleting the files it orphans is opt-in.
+Metadata-only expiration is **on by default**; it writes no data files.
+Deleting the files it orphans is opt-in.
 
 ## Bergman does not choose the snapshots
 
 Selection is upstream's `ExpireSnapshotsAction`, which follows Java's
-`RemoveSnapshots`: per-branch ancestry, per-ref retention, ref aging, and the
-rule that a snapshot reachable from *any* retained ref is never expired however
-old it is.
+`RemoveSnapshots`: per-branch ancestry, per-ref retention, ref aging, and never
+expiring a snapshot reachable from a retained ref. Bergman does not reimplement
+it.
 
-Bergman does not reimplement that. It is the subtlest rule in Iceberg, and a
-second implementation would drift from the first — quietly, and in the direction
-of deleting something it should not have.
-
-The consequence is that Bergman's *plan* uses a coarser trigger than the commit
-does:
+The plan therefore says "up to":
 
 ```text
   -> expire-snapshots
@@ -44,64 +34,44 @@ does:
      removes up to 58 snapshots
 ```
 
-"Up to" is doing real work there. If a tag pins an old snapshot, or a branch
-shares an ancestor, fewer go — and the run reports that plainly:
+If a tag pins an old snapshot or a branch shares an ancestor, fewer go:
 
 ```text
   [--] expire-snapshots: no snapshot was expirable under per-branch retention
 ```
 
-That is a normal outcome, not a mistake. It is also the usual answer to "why did
-nothing expire?".
-
-> [!NOTE]
-> Bergman cannot list a table's branches and tags to tell you *which* ref is
-> pinning a snapshot. `TableMetadata::refs` is `pub(crate)` upstream, the only
-> accessor requires knowing a ref's name, and the type derives `Deserialize` but
-> not `Serialize`. Use `SHOW REFS` from a query engine to find the culprit.
+That is a normal outcome. Bergman does not report which ref pins a snapshot; use
+`SHOW REFS` from a query engine.
 
 ## Reclaiming the files
 
-Upstream's action rewrites metadata and stops there. Its own documentation says
-so: *"the now-unreferenced data and metadata files are left untouched. Physical
-file cleanup is the responsibility of a higher-level maintenance operation built
-on top of this action."*
+Upstream's action rewrites metadata only. With `delete_files = true` Bergman:
 
-Bergman is that operation. With `delete_files = true`:
+1. computes the reachable set **before** the commit
+2. commits the expiration
+3. computes the reachable set **again**, from the table as it now is
+4. deletes the difference
 
-1. compute the reachable set **before** the commit, while the snapshots exist
-2. commit the expiration
-3. compute the reachable set **again**, from the table as it now is
-4. delete the difference
-
-Step 3 recomputes rather than predicts. The commit is the thing that decides
-which snapshots went, and a prediction that disagreed with it would delete live
-files.
+Step 3 recomputes rather than predicts — the commit decides which snapshots
+went.
 
 ```text
   [ok] expire-snapshots: 58 snapshots expired, 12043 files deleted
 ```
 
-Every file is re-checked for containment inside the table location before it is
-deleted, and a file that will not delete is reported as a leak rather than
-failing the operation — the metadata commit has already succeeded, so the table
-is correct either way.
+Every file is re-checked for containment inside the table location. A file that
+will not delete is reported as a leak, not a failure — the metadata commit
+already succeeded.
 
 ### One deleter, one safety model
 
-Expiration and [orphan removal](@/docs/orphans.md) decide *what* to delete by
-completely different reasoning, but once a path is on a kill list they share one
-deletion path:
+Expiration and [orphan removal](@/docs/orphans.md) share one deletion path:
 
 1. apply `limits.max_deletes_per_run`, the blast-radius ceiling
 2. write the audit record naming exactly what will go
 3. delete, with bounded concurrency
 
-Two implementations of that would drift, and the half that drifted would be the
-half nobody was looking at.
-
-Nothing is lost to the ceiling here: the files it withholds are unreferenced by
-every retained snapshot, which is exactly what the orphan scanner reclaims.
+Files the ceiling withholds are left for the orphan scanner:
 
 ```text
   [ok] expire-snapshots: 58 snapshots expired, 100000 files deleted
@@ -110,43 +80,32 @@ every retained snapshot, which is exactly what the orphan scanner reclaims.
 
 ## Or leave it to the scanner
 
-With `delete_files = false` (the default), expiration is pure metadata and the
-[orphan scanner](@/docs/orphans.md) reclaims the files later, after its grace
-period. The same deleter either way, at the cost of a few days' storage lag.
-
-Both routes share the same containment and path-normalization rules.
+With `delete_files = false` (the default), the
+[orphan scanner](@/docs/orphans.md) reclaims the files after its grace period —
+the same deleter and containment rules, a few days' storage lag.
 
 ## Commits and conflicts
 
 Expiration commits with compare-and-swap. Losing to a foreground writer is
-expected — Bergman is a background tenant — and is reported as such:
+reported as a conflict, not a failure:
 
 ```text
   [<>] expire-snapshots: table moved during 3 commit attempts; will replan next cycle
 ```
 
-Each retry **reloads the table** rather than re-submitting. See
-[Architecture](@/docs/architecture.md#commits) for why that distinction is a
-correctness property and not an optimization.
+Each retry **reloads the table** rather than re-submitting — see
+[Architecture](@/docs/architecture.md#commits).
 
 ## Metadata files
 
-Old `metadata.json` files accumulate alongside snapshots. Iceberg's own
-`write.metadata.delete-after-commit.enabled` handles these at write time, and
-most catalogs — including [Rustberg](@/docs/rustberg.md) and Lakekeeper — enforce
-it server-side. Bergman treats every `metadata.json` the metadata log still names
-as reachable, so it never deletes one the table still refers to.
-
-Expiration's cleanup deliberately never deletes one either, even when it falls
-out of the log mid-operation. Expiring snapshots does not drop metadata-log
-entries — `write.metadata.previous-versions-max` does, on the catalog's own
-schedule — so one that leaves the log leaves it *between* Bergman's before and
-after readings, and deleting on that basis would race the catalog for a file it
-still owns. The orphan scanner reclaims them, behind its grace period.
+Old `metadata.json` files are governed by Iceberg's
+`write.metadata.delete-after-commit.enabled`, applied at commit time. Every `metadata.json` the metadata log names is reachable.
+Expiration's cleanup never deletes one, even one that leaves the log
+mid-operation, since that would race the catalog; the orphan scanner reclaims
+them behind its grace period.
 
 ## Format v3
 
-Expiration is unaffected by the [v3 limit](@/docs/compaction.md#format-v3): the
-selection and the commit are upstream's own action, not a snapshot Bergman
-authors. A v3 table's history stays bounded even though its data files are not
-rewritten.
+Expiration runs on v3 exactly as on any other format. A Puffin file of deletion
+vectors is reclaimed by [orphan removal](@/docs/orphans.md) only once nothing
+references any vector in it. See [Compaction](@/docs/compaction.md#format-v3).

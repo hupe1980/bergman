@@ -24,6 +24,7 @@
 //! `bergman policy explain` prints. A setting whose origin cannot be shown is a
 //! setting nobody can debug.
 
+pub mod catalog;
 mod matcher;
 mod resolve;
 mod schedule;
@@ -203,8 +204,8 @@ pub struct Limits {
     /// spilling under pressure rather than more resident bytes — which is why
     /// this and `compaction.max_sort_memory` are independent knobs.
     ///
-    /// Set it to 1 to get the old behaviour in a container pinned to one core,
-    /// or where maintenance must stay out of a co-tenant's way.
+    /// Set it to 1 in a container pinned to one core, or where maintenance must
+    /// stay out of a co-tenant's way.
     #[serde(default)]
     pub compaction_parallelism: Option<usize>,
 }

@@ -48,7 +48,7 @@ pub async fn run(
     // still exist. Afterwards, the files they referenced are unreachable by
     // construction and there would be nothing left to diff against.
     let before = if cleanup {
-        Some(reachability::compute(table_ref, table, env.io_concurrency).await?)
+        Some(reachability::compute(table, env.io_concurrency).await?)
     } else {
         None
     };
@@ -216,7 +216,7 @@ async fn delete_now_unreachable(
     ceiling: usize,
     concurrency: usize,
 ) -> Result<Deletion> {
-    let after = reachability::compute(table_ref, updated, concurrency).await?;
+    let after = reachability::compute(updated, concurrency).await?;
     let location = updated.metadata().location();
 
     let mut doomed: Vec<String> = Vec::new();

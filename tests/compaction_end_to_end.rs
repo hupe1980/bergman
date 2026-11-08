@@ -696,61 +696,6 @@ async fn a_sorted_rewrite_of_incrementally_deleted_files_is_globally_sorted() {
     assert_eq!(ids, vec![1, 3, 7]);
 }
 
-#[tokio::test]
-async fn a_v3_table_is_refused_rather_than_silently_renumbered() {
-    // A rewrite cannot carry v3's `_row_id` through, so it would renumber every
-    // row it touched and a MERGE or CDC consumer joining on row id would start
-    // matching the wrong rows, with nothing failing.
-    //
-    // The refusal has to arrive before the read: attempting the commit spends a
-    // full read and write of the partition to learn what the format version
-    // already said.
-    let fixture = TestTable::with_format(iceberg::spec::FormatVersion::V3).unwrap();
-
-    let mut files = Vec::new();
-    for chunk in [&[(1, "a")][..], &[(2, "b")][..], &[(3, "c")][..]] {
-        files.push(fixture.write_data_file(chunk).await.unwrap());
-    }
-    fixture.append(files).await.unwrap();
-
-    let table = fixture.table();
-    let table_ref = TableRef::new("prod", ["db"], "events");
-    let ctx = OperationContext {
-        run_id: "test",
-        table: &table_ref,
-        kind: OperationKind::Compact,
-        matched_rule: "prod.db.events",
-        reason: "test",
-    };
-    let loader = fixture.loader();
-    let env = common::op_env(
-        &table,
-        &fixture.ident,
-        &loader,
-        fixture.committer.as_ref(),
-        ctx,
-    );
-
-    let before = fixture.committer.commit_count();
-    let err = compact::run(
-        &env,
-        &compaction_policy(ENABLED),
-        &[PartitionKey::unpartitioned(0)],
-    )
-    .await
-    .expect_err("a v3 rewrite must be refused");
-
-    assert!(err.to_string().contains("format v3"), "got: {err}");
-    assert_eq!(
-        fixture.committer.commit_count(),
-        before,
-        "nothing may be committed"
-    );
-    // And the table is exactly as it was.
-    assert_eq!(read_all(&fixture.table()).await.unwrap().len(), 3);
-    assert_eq!(live_data_files(&fixture.table()).await.unwrap().len(), 3);
-}
-
 /// Compact using the policy the table's *own* metadata resolves to.
 ///
 /// The other helpers hand the executor a policy built from TOML alone. This one
@@ -1254,4 +1199,62 @@ fn ordered_replaced_counts(metadata: &iceberg::spec::TableMetadata) -> Vec<u64> 
                 .filter(|&count| count > 0)
         })
         .collect()
+}
+
+#[tokio::test]
+async fn an_object_storage_table_gets_hashed_data_paths() {
+    // `write.object-storage.enabled` asks for a hashed directory tree in front
+    // of every data file, so a hot table's objects spread across object-store
+    // prefixes instead of throttling on one. A rewrite that wrote the plain
+    // `data/` layout would concentrate a compacted table's objects in exactly
+    // the prefix the property exists to avoid.
+    let fixture = TestTable::with_properties(&[("write.object-storage.enabled", "true")]).unwrap();
+    let mut files = Vec::new();
+    for chunk in [&[(1, "a"), (2, "b")][..], &[(3, "c"), (4, "d")][..]] {
+        files.push(fixture.write_data_file(chunk).await.unwrap());
+    }
+    fixture.append(files).await.unwrap();
+
+    let result = compact_all(&fixture, &compaction_policy(ENABLED)).await;
+    assert!(
+        matches!(result, OperationResult::Succeeded { .. }),
+        "{result:?}"
+    );
+
+    let data = format!("{}/data/", fixture.location().trim_end_matches('/'));
+    let written = live_data_files(&fixture.table()).await.unwrap();
+    assert_eq!(written.len(), 1);
+    let relative = written[0]
+        .strip_prefix(&data)
+        .unwrap_or_else(|| panic!("{} is not under {data}", written[0]));
+    // Four entropy directories of binary digits, then the file — upstream's
+    // `ObjectStorageLocationGenerator` layout, the same one Java writes.
+    let dirs: Vec<&str> = relative.split('/').collect();
+    assert_eq!(dirs.len(), 5, "{relative}");
+    assert!(
+        dirs[..4]
+            .iter()
+            .all(|d| !d.is_empty() && d.chars().all(|c| c == '0' || c == '1')),
+        "{relative} has no hashed prefix"
+    );
+}
+
+#[tokio::test]
+async fn a_table_without_object_storage_gets_the_plain_data_path() {
+    // The control: without the property the rewrite writes straight into
+    // `data/`, so the test above fails for the property and not for a writer
+    // that hashes everything.
+    let fixture = TestTable::new().unwrap();
+    let mut files = Vec::new();
+    for chunk in [&[(1, "a"), (2, "b")][..], &[(3, "c"), (4, "d")][..]] {
+        files.push(fixture.write_data_file(chunk).await.unwrap());
+    }
+    fixture.append(files).await.unwrap();
+
+    compact_all(&fixture, &compaction_policy(ENABLED)).await;
+
+    let data = format!("{}/data/", fixture.location().trim_end_matches('/'));
+    let written = live_data_files(&fixture.table()).await.unwrap();
+    let relative = written[0].strip_prefix(&data).unwrap();
+    assert!(!relative.contains('/'), "{relative}");
 }

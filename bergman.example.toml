@@ -43,6 +43,13 @@ warehouse = "s3://lake/warehouse"
 # turns an O(catalog) tree walk into an O(subtree) one.
 # namespaces = ["analytics", "streaming.raw"]
 
+# Read the maintenance policy Apache Polaris holds for each table, as a layer
+# below this file: a matching rule and [defaults] win, and the catalog's policy
+# fills only what they leave unset. It never makes Bergman maintain a table no
+# rule matches, and never turns on orphan deletion. A table whose policy cannot
+# be read is not maintained that cycle.
+# policy_source = "polaris"
+
 # Storage configuration, using Iceberg's own property names — so `s3.endpoint`
 # means here what it means in Spark, Trino, and PyIceberg. These reach both the
 # catalog's file client and the object-store client orphan scanning needs.

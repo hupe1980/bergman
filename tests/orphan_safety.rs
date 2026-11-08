@@ -191,9 +191,8 @@ fn a_recent_file_is_outside_the_grace_period() {
 // file was never a deletion candidate to begin with — a fixture that drifts into
 // harmlessness, an operation that quietly stopped running, a store whose listing
 // returns nothing. The control proves deletion was genuinely reachable, so the
-// guarded case can only pass because the guard fired. That is what
-// [`concepts/QUALITY.md`] means by verifying a guard against a planted
-// violation, and it is the discipline the orphan checks did not have.
+// guarded case can only pass because the guard fired: a guard is verified
+// against a planted violation before it is trusted.
 // ─────────────────────────────────────────────────────────────────────────────
 
 mod common;

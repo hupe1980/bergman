@@ -110,12 +110,7 @@ pub fn router_with_events(
         )
 }
 
-/// The subset of a `CloudEvent` that identifies a table.
-///
-/// Deliberately not a `CloudEvents` parser. The envelope carries a dozen fields
-/// Bergman has no use for, and validating them would make this endpoint reject
-/// perfectly good notifications for reasons that do not matter to it. What it
-/// needs is which table changed.
+/// Bergman's own notification shape: which table changed.
 #[derive(Debug, serde::Deserialize)]
 struct TableChanged {
     /// The catalog, as named in Bergman's configuration.
@@ -124,6 +119,109 @@ struct TableChanged {
     namespace: Vec<String>,
     /// The table name.
     table: String,
+}
+
+/// What a notification asks for.
+#[derive(Debug, PartialEq)]
+enum Notification {
+    /// This table changed; plan it.
+    Table(crate::policy::TableRef),
+    /// A well-formed event that changes nothing maintenance cares about — a
+    /// view, a drop, a rename. Accepted, so a bridge does not retry it.
+    Ignored,
+}
+
+/// The event types that mean a table's data or metadata changed.
+///
+/// Lakekeeper's names: a commit is `updateTable`, and a created or registered
+/// table is one Bergman has never planned.
+const TABLE_CHANGED: [&str; 3] = ["updateTable", "createTable", "registerTable"];
+
+/// Read a notification in any of the three shapes `/events` accepts.
+///
+/// - **Bergman's own**: `{"catalog":…,"namespace":[…],"table":…}`.
+/// - **A `CloudEvent` in structured mode** (`application/cloudevents+json`, or
+///   any JSON body carrying `specversion`), as Lakekeeper emits them: the table
+///   is in the extension attributes `name` and `namespace` (parts joined by
+///   0x1F), and `tabular-type` says whether it is a table at all.
+/// - **A `CloudEvent` in binary mode**: the same attributes as `ce-` headers.
+///
+/// A `CloudEvent` names a warehouse by Lakekeeper's id, not a catalog by
+/// Bergman's name, so a bridge says which configured catalog it speaks for:
+/// `/events?catalog=<name>`.
+fn notification(
+    query: Option<&str>,
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+) -> std::result::Result<Notification, &'static str> {
+    // Binary mode: the envelope is in the headers.
+    if headers.contains_key("ce-specversion") {
+        let attribute = |name: &str| {
+            headers
+                .get(format!("ce-{name}"))
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        return cloud_event(
+            query,
+            attribute("type"),
+            attribute("tabular-type"),
+            attribute("namespace"),
+            attribute("name"),
+        );
+    }
+
+    let value: serde_json::Value = serde_json::from_slice(body).map_err(|_| BAD_SHAPE)?;
+    if value.get("specversion").is_some() {
+        let attribute = |name: &str| value.get(name).and_then(|v| v.as_str()).map(str::to_string);
+        return cloud_event(
+            query,
+            attribute("type"),
+            attribute("tabular-type"),
+            attribute("namespace"),
+            attribute("name"),
+        );
+    }
+
+    let body: TableChanged = serde_json::from_value(value).map_err(|_| BAD_SHAPE)?;
+    Ok(Notification::Table(crate::policy::TableRef::new(
+        &body.catalog,
+        body.namespace,
+        &body.table,
+    )))
+}
+
+const BAD_SHAPE: &str = "expected {\"catalog\":…,\"namespace\":[…],\"table\":…} or a CloudEvent";
+
+fn cloud_event(
+    query: Option<&str>,
+    ty: Option<String>,
+    tabular_type: Option<String>,
+    namespace: Option<String>,
+    name: Option<String>,
+) -> std::result::Result<Notification, &'static str> {
+    let ty = ty.ok_or("a CloudEvent must carry a type")?;
+    if !TABLE_CHANGED.contains(&ty.as_str())
+        || tabular_type.as_deref().is_some_and(|t| t != "table")
+    {
+        return Ok(Notification::Ignored);
+    }
+    let catalog = query
+        .into_iter()
+        .flat_map(|q| q.split('&'))
+        .find_map(|pair| pair.strip_prefix("catalog="))
+        .filter(|c| !c.is_empty())
+        .ok_or("a CloudEvent names no Bergman catalog; post it to /events?catalog=<name>")?;
+    let namespace = namespace.ok_or("this CloudEvent carries no namespace extension")?;
+    let name = name.ok_or("this CloudEvent carries no name extension")?;
+    Ok(Notification::Table(crate::policy::TableRef::new(
+        catalog,
+        namespace
+            .split('\u{1f}')
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+        &name,
+    )))
 }
 
 /// Handle a notification, **authenticating before the body is looked at**.
@@ -137,6 +235,7 @@ struct TableChanged {
 /// own.
 async fn receive_event(
     State(state): State<EventState>,
+    uri: axum::http::Uri,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
@@ -151,15 +250,12 @@ async fn receive_event(
         }
     }
 
-    let Ok(body) = serde_json::from_slice::<TableChanged>(&body) else {
-        // Safe to be specific now that the caller is authenticated.
-        return (
-            StatusCode::BAD_REQUEST,
-            "expected {\"catalog\":…,\"namespace\":[…],\"table\":…}",
-        );
+    // Safe to be specific now that the caller is authenticated.
+    let table = match notification(uri.query(), &headers, &body) {
+        Ok(Notification::Table(table)) => table,
+        Ok(Notification::Ignored) => return (StatusCode::ACCEPTED, "ignored"),
+        Err(reason) => return (StatusCode::BAD_REQUEST, reason),
     };
-
-    let table = crate::policy::TableRef::new(&body.catalog, body.namespace.clone(), &body.table);
 
     // Accepted either way. A full queue means a cycle is already pending for
     // more tables than it can be told about, and answering 503 would have a
@@ -340,6 +436,104 @@ mod tests {
 
         let batch = stream.next_batch().await.expect("a batch");
         assert_eq!(batch, vec![TableRef::new("prod", ["analytics"], "events")]);
+    }
+
+    /// A commit, as Lakekeeper 0.15 emits it in structured mode: the table is
+    /// in extension attributes, and a multipart namespace is joined by 0x1F.
+    const LAKEKEEPER_COMMIT: &str = "{\"specversion\":\"1.0\",\"id\":\"1\",\
+        \"source\":\"lakekeeper\",\"type\":\"updateTable\",\"tabular-type\":\"table\",\
+        \"name\":\"events\",\"namespace\":\"analytics\\u001fraw\",\"warehouse-id\":\"w\",\
+        \"data\":{}}";
+
+    #[test]
+    fn a_lakekeeper_commit_names_its_table_in_the_catalog_the_bridge_names() {
+        let n = notification(
+            Some("catalog=lake"),
+            &axum::http::HeaderMap::new(),
+            LAKEKEEPER_COMMIT.as_bytes(),
+        );
+        assert_eq!(
+            n,
+            Ok(Notification::Table(TableRef::new(
+                "lake",
+                ["analytics", "raw"],
+                "events"
+            )))
+        );
+    }
+
+    #[test]
+    fn a_binary_mode_cloud_event_is_read_from_its_headers() {
+        let mut headers = axum::http::HeaderMap::new();
+        for (k, v) in [
+            ("ce-specversion", "1.0"),
+            ("ce-type", "updateTable"),
+            ("ce-tabular-type", "table"),
+            ("ce-name", "events"),
+            ("ce-namespace", "analytics"),
+        ] {
+            headers.insert(k, v.parse().unwrap());
+        }
+        assert_eq!(
+            notification(Some("catalog=lake"), &headers, b"{}"),
+            Ok(Notification::Table(TableRef::new(
+                "lake",
+                ["analytics"],
+                "events"
+            )))
+        );
+    }
+
+    #[test]
+    fn events_that_change_no_table_are_accepted_and_ignored() {
+        // Accepted rather than refused, so a bridge forwarding everything does
+        // not retry what was never Bergman's.
+        for (ty, tabular) in [
+            ("dropTable", "table"),
+            ("updateTable", "view"),
+            ("createWarehouse", ""),
+        ] {
+            let body = format!(
+                "{{\"specversion\":\"1.0\",\"type\":\"{ty}\",\"tabular-type\":\"{tabular}\",\
+                 \"name\":\"v\",\"namespace\":\"a\"}}"
+            );
+            assert_eq!(
+                notification(
+                    Some("catalog=lake"),
+                    &axum::http::HeaderMap::new(),
+                    body.as_bytes()
+                ),
+                Ok(Notification::Ignored),
+                "{ty}/{tabular}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cloud_event_without_a_catalog_is_refused_with_the_fix() {
+        let err = notification(
+            None,
+            &axum::http::HeaderMap::new(),
+            LAKEKEEPER_COMMIT.as_bytes(),
+        )
+        .unwrap_err();
+        assert!(err.contains("?catalog="), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_cloud_event_is_authenticated_before_it_is_parsed() {
+        // The same oracle the native shape is protected from: a malformed
+        // CloudEvent must not earn a 400 an unauthenticated caller can read.
+        let token = Some(EventToken::new("s3cret"));
+        assert_eq!(
+            post_body(token.clone(), None, "{\"specversion\":\"1.0\"}").await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            post_body(token, Some("Bearer s3cret"), "{\"specversion\":\"1.0\"}").await,
+            StatusCode::BAD_REQUEST,
+            "and once authenticated, it is told what is missing"
+        );
     }
 
     const GOOD_EVENT: &str = r#"{"catalog":"prod","namespace":["analytics"],"table":"events"}"#;

@@ -217,14 +217,6 @@ impl Daemon {
 
     /// Plan and run once, over whatever the trigger scoped it to.
     async fn cycle(&self, scope: &Scope) -> Result<RunReport> {
-        // Before reading anything. The catalog client exchanges its credential
-        // once at construction and never again, so a daemon holding a one-hour
-        // token would otherwise keep this cadence perfectly while failing to
-        // read a single table — see [`Bergman::refresh_credentials`]. One small
-        // form post per catalog per cycle, against a cycle that reads every
-        // table's manifests.
-        self.bergman.refresh_credentials().await;
-
         let plan = match scope {
             Scope::Everything => self.bergman.plan().await?,
             Scope::Matching(pattern) => self.bergman.plan_matching(pattern).await?,

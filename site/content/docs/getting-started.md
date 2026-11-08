@@ -3,13 +3,13 @@ title = "Getting started"
 description = "Install Bergman, point it at a catalog, and read what is wrong with your tables — before it writes anything."
 weight = 1
 +++
-The first two commands read only. That is deliberate: a maintenance tool earns
-write access by first showing you it understands your tables.
+The first two commands read only.
 
 ## Install
 
 ```bash
-cargo install bergman
+brew install hupe1980/tap/bergman   # macOS (Apple Silicon) and Linux
+cargo install bergman               # anywhere Rust builds
 ```
 
 Or as a container — distroless, non-root, statically linked, no shell:
@@ -20,11 +20,11 @@ docker run --rm \
   ghcr.io/hupe1980/bergman:latest inspect
 ```
 
-Or a static Linux binary from the
-[releases page](https://github.com/hupe1980/bergman/releases) — `x86_64` and
-`aarch64`, musl-linked, with a `.sha256` beside each archive.
+Or a binary from the [releases page](https://github.com/hupe1980/bergman/releases):
+static musl Linux for `x86_64` and `aarch64`, and macOS on Apple Silicon, each with
+a `.sha256` beside it.
 
-Or from source — Rust 1.94 or later:
+Or from source — Rust 1.95 or later:
 
 ```bash
 git clone https://github.com/hupe1980/bergman && cd bergman
@@ -48,8 +48,7 @@ warehouse = "s3://lake/warehouse"
 match = "prod.**"
 ```
 
-Check it without contacting anything — this works in CI on a machine holding no
-credentials:
+Check it offline — no catalog, no credentials, so it runs in CI:
 
 ```bash
 bergman policy lint
@@ -72,23 +71,16 @@ bergman inspect
  prod.finance.ledger          12      6.02 GiB   402 MiB / 2.90 GiB   —           4 / 6d      2
 ```
 
-Every number here comes from manifest metadata Iceberg already maintains — no
-data file is opened. That is what makes this cheap enough to run against
-thousands of tables.
+Every number comes from manifest metadata; no data file is opened.
 
-Four things to read in that output:
-
-- **`p50` far below your target** is the small-file problem. Half of `events`'
-  files are under 3.10 MiB against a 512 MiB default target.
-- **`p95` far *above* your target** is the opposite problem, and the one a mean
-  would hide. `ledger` looks calm at 12 files, but its largest are 2.90 GiB —
-  unsplittable by any reader, so one query task does all their work. A median
-  beside a 95th percentile shows both shapes; an average shows neither.
-- **`DELETES` with a percentage** is read amplification. 23% of `events_raw`'s
-  rows are named by delete files, and every query pays to apply them — even
-  though its file sizes are fine.
-- **`SNAPSHOTS` with an age** is metadata growth. 61 snapshots reaching back 34
-  days is 61 manifest lists every planning phase may touch.
+- **`p50` far below target** — small files. Half of `events`' files are under
+  3.10 MiB against the 512 MiB default target.
+- **`p95` far above target** — oversized files a mean would hide. `ledger`'s
+  largest are 2.90 GiB, so one query task does all their work.
+- **`DELETES` with a percentage** — read amplification: 23% of `events_raw`'s
+  rows are named by delete files, and every query pays to apply them.
+- **`SNAPSHOTS` with an age** — metadata growth: 61 manifest lists reaching back
+  34 days.
 
 ## Ask what maintenance would do
 
@@ -109,12 +101,10 @@ prod.analytics.events
 1 tables, 2 operations, 1.83 GiB to read
 ```
 
-Every operation carries the measurement that triggered it and the threshold it
-crossed. If a plan surprises you, [`policy explain`](@/docs/policies.md#provenance)
-shows where each threshold came from.
-
-It reads 412 files, not 480: the partition triggered the rewrite, but only the
-files a rewrite would [improve](@/docs/compaction.md#eligible) are read.
+Each operation names the measurement that triggered it and the threshold it
+crossed; [`policy explain`](@/docs/policies.md#provenance) shows where each
+threshold came from. Only the files a rewrite would
+[improve](@/docs/compaction.md#eligible) are read — 412, not 480.
 
 ## Run it
 
@@ -131,38 +121,32 @@ prod.analytics.events
 1 tables, 2 operations succeeded in 47s
 ```
 
-`run` builds the plan through exactly the same code `plan` does, then executes
-it. What you were shown is what happens.
-
-Both take `--table <glob>` to scope which tables are examined, and `--only` to
-scope which operations run:
+`run` builds the plan through the same code as `plan`, then executes it. Both
+take `--table <glob>` to scope which tables are examined and `--only` to scope
+which operations run:
 
 ```bash
 # Reclaim storage tonight; rewrite nothing.
 bergman run --only remove-orphans,expire-snapshots
 ```
 
-Any subset is safe: the per-table order is preserved, and dropping an operation
-only ever makes the others do less.
+Any subset is safe: per-table order is preserved.
 
 > [!NOTE]
-> `bergman run` exits `2` when any operation failed or was refused, so a broken
-> cron job does not look healthy to a scheduler that only reads exit codes.
+> `bergman run` exits `2` when any operation failed or was refused.
 
 ## What is on by default
 
-Almost nothing destructive:
-
-| Operation | Default | Why |
+| Operation | Default | Opt in |
 |---|---|---|
-| Snapshot expiration (metadata) | **on** | Unbounded snapshot growth is the most common Iceberg health problem, and this writes no data files |
-| Expiration file cleanup | off | Deletes files; opt in with `snapshots.delete_files` |
-| Orphan removal | off | Deletes files; opt in with `orphans.enabled`, and again with `mode = "delete"` |
-| Compaction | off | Rewrites data; never arrives from a rule that merely matched |
-| Manifest rewrite | off | Same |
+| Snapshot expiration (metadata) | **on** | — writes no data files |
+| Expiration file cleanup | off | `snapshots.delete_files` |
+| Orphan removal | off | `orphans.enabled`, then `mode = "delete"` |
+| Compaction | off | `compaction.enabled` |
+| Manifest rewrite | off | `manifests.rewrite` |
 
 ## Next
 
-- [Policies](@/docs/policies.md) — how a setting is resolved, and how to find out why
-- [Orphan files](@/docs/orphans.md) — read this before enabling deletion
-- [Status](@/docs/status.md) — what executes, and what is not built
+- [Policies](@/docs/policies.md) — how a setting is resolved, and why
+- [Orphan files](@/docs/orphans.md) — read before enabling deletion
+- [Status](@/docs/status.md) — what executes, and what is refused

@@ -8,7 +8,7 @@ use futures::stream::{self, StreamExt};
 use iceberg::Catalog;
 use uuid::Uuid;
 
-use crate::catalog::{CatalogConfig, CredentialRefresh};
+use crate::catalog::CatalogConfig;
 use crate::commit::TableCommitter;
 use crate::error::{Error, Result};
 use crate::health::TableHealth;
@@ -53,15 +53,14 @@ pub struct Bergman {
 #[derive(Debug)]
 struct ConnectedCatalog {
     config: CatalogConfig,
+    /// The read client. It and `committer` present one token from one source
+    /// (see [`crate::catalog::CatalogConnection`]).
     client: Arc<dyn Catalog>,
-    /// How to renew `client`'s bearer token, when it has one that expires.
-    ///
-    /// See [`crate::catalog::CredentialRefresh`] for why the read path needs
-    /// this and the commit path does not.
-    refresh: Option<Arc<dyn CredentialRefresh>>,
     /// Bergman's own commit path, for the operations `iceberg::Transaction`
     /// cannot express (see [`crate::commit`]).
     committer: Arc<dyn TableCommitter>,
+    /// The catalog's own maintenance policy, when it is a policy source.
+    policy: Option<Arc<crate::catalog::polaris::PolarisPolicies>>,
 }
 
 /// Which of a catalog's tables a plan covers.
@@ -147,12 +146,11 @@ impl BergmanBuilder {
         let mut catalogs = Vec::with_capacity(self.config.catalogs.len());
         for config in &self.config.catalogs {
             let connection = config.connect().await?;
-            let committer = config.committer().await?;
             catalogs.push(ConnectedCatalog {
                 config: config.clone(),
                 client: connection.client,
-                refresh: connection.refresh,
-                committer,
+                committer: connection.committer,
+                policy: connection.policy,
             });
         }
 
@@ -365,42 +363,6 @@ impl Bergman {
         Ok(plan)
     }
 
-    /// Renew every catalog client's bearer token, where it has one that expires.
-    ///
-    /// Reads nothing and writes nothing to any table; the only I/O is one
-    /// `OAuth2` exchange per catalog configured with a `credential`. A catalog
-    /// authenticating with a static `token`, or with nothing at all, is skipped.
-    ///
-    /// **A long-lived process should call this before each cycle**, as
-    /// [`crate::sched::Daemon`] does: the catalog client exchanges its
-    /// credential once at construction and never again, so a daemon holding a
-    /// one-hour token keeps its cadence perfectly and stops reading a single
-    /// table. A one-shot `bergman run` outlives no token.
-    ///
-    /// A catalog whose renewal fails is reported and skipped, not fatal —
-    /// upstream fetches the replacement before discarding the old token, so the
-    /// one in hand still works. Returns how many catalogs were renewed.
-    pub async fn refresh_credentials(&self) -> usize {
-        let mut renewed = 0;
-        for catalog in &self.catalogs {
-            let Some(refresh) = &catalog.refresh else {
-                continue;
-            };
-            match refresh.refresh().await {
-                Ok(()) => {
-                    renewed += 1;
-                    tracing::debug!(catalog = %catalog.config.name, "catalog credential renewed");
-                }
-                Err(e) => tracing::warn!(
-                    catalog = %catalog.config.name,
-                    error = %e,
-                    "catalog credential could not be renewed; continuing with the token in hand"
-                ),
-            }
-        }
-        renewed
-    }
-
     /// Execute a plan.
     ///
     /// The first method that writes anything.
@@ -492,7 +454,7 @@ impl Bergman {
             .ok_or_else(|| Error::config(format!("no catalog named {:?}", table.catalog)))?;
 
         let facts = match self.load(catalog, table).await {
-            Ok(loaded) => TableFacts::from_metadata(loaded.metadata()),
+            Ok(loaded) => self.facts(catalog, table, &loaded).await?,
             // Explaining a table that cannot be loaded is still useful: the
             // rule and defaults layers resolve without it, and saying so beats
             // refusing to answer.
@@ -754,7 +716,7 @@ impl Bergman {
         let table = self.load(catalog, table_ref).await?;
         let decision = self
             .policy
-            .decide(table_ref, &TableFacts::from_metadata(table.metadata()));
+            .decide(table_ref, &self.facts(catalog, table_ref, &table).await?);
 
         // The manifest target size decides which manifests count as
         // undersized, and it comes from the resolved policy — so a table judged
@@ -784,6 +746,26 @@ impl Bergman {
             .insert(table_ref.clone(), health.location.clone());
 
         Ok((health, decision))
+    }
+
+    /// Everything resolution reads about one table: its own metadata, and the
+    /// maintenance policy its catalog holds for it.
+    ///
+    /// One function for planning and for `policy explain`, so the answer an
+    /// operator is shown is the one the plan was made from. A catalog policy
+    /// that cannot be read is an error, and the table is reported rather than
+    /// maintained under the layers that remain.
+    async fn facts(
+        &self,
+        catalog: &ConnectedCatalog,
+        table_ref: &TableRef,
+        table: &iceberg::table::Table,
+    ) -> Result<TableFacts> {
+        let facts = TableFacts::from_metadata(table.metadata());
+        match &catalog.policy {
+            None => Ok(facts),
+            Some(source) => Ok(facts.with_catalog_policy(source.applicable(table_ref).await?)),
+        }
     }
 
     async fn load(

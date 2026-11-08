@@ -10,10 +10,10 @@
 //! does — `token`, `credential`, `oauth2-server-uri`, `scope` — so one
 //! configuration authenticates both.
 //!
-//! It also **refreshes**, which the catalog client does not (its source carries
-//! a `TODO: Support automatic token refreshing`). A one-shot `bergman run`
-//! never notices; a daemon holding a one-hour token notices an hour in, when
-//! every commit starts failing and reads keep working.
+//! It also **renews**, which `iceberg-catalog-rest` does not, and the read
+//! client presents this source's token too (see
+//! [`crate::catalog::CatalogConnection`]), so a daemon holding a one-hour token
+//! keeps working past the hour on both paths.
 
 use std::collections::HashMap;
 use std::time::Duration;

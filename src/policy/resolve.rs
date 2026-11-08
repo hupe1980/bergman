@@ -143,6 +143,10 @@ pub struct TableFacts {
     /// property its owner configured, and the only way anyone finds out is if
     /// somebody says so.
     pub unsupported_sort_fields: Vec<String>,
+    /// Maintenance policy the table's catalog holds for it, when the catalog is
+    /// configured as a policy source. Resolved below `bergman.toml` and above
+    /// the table's own properties (see [`super::catalog`]).
+    pub catalog: super::catalog::CatalogPolicy,
 }
 
 impl TableFacts {
@@ -210,7 +214,15 @@ impl TableFacts {
             properties: metadata.properties().clone(),
             sort_order,
             unsupported_sort_fields: unsupported,
+            catalog: Default::default(),
         }
+    }
+
+    /// The same facts, with the maintenance policy the catalog holds for the
+    /// table.
+    pub fn with_catalog_policy(mut self, policy: super::catalog::CatalogPolicy) -> Self {
+        self.catalog = policy;
+        self
     }
 }
 
@@ -225,6 +237,17 @@ pub enum Provenance {
     },
     /// The configuration's `[defaults]` said so.
     Defaults,
+    /// A maintenance policy the table's catalog holds said so.
+    CatalogPolicy {
+        /// The policy's name.
+        name: String,
+        /// Its type, e.g. `system.data-compaction`.
+        policy_type: String,
+        /// Whether the table inherited it from a parent.
+        inherited: bool,
+        /// The namespace it is attached to; empty for the catalog itself.
+        attached_at: String,
+    },
     /// The table's own Iceberg property said so.
     TableProperty {
         /// The property name, e.g. `write.target-file-size-bytes`.
@@ -248,6 +271,19 @@ impl std::fmt::Display for Provenance {
         match self {
             Provenance::Rule { pattern } => write!(f, "rule \"{pattern}\""),
             Provenance::Defaults => write!(f, "[defaults]"),
+            Provenance::CatalogPolicy {
+                name,
+                policy_type,
+                inherited,
+                attached_at,
+            } => {
+                write!(f, "catalog policy \"{name}\" ({policy_type}")?;
+                match (*inherited, attached_at.is_empty()) {
+                    (true, true) => f.write_str(", inherited from the catalog)"),
+                    (true, false) => write!(f, ", inherited from {attached_at})"),
+                    (false, _) => f.write_str(")"),
+                }
+            }
             Provenance::TableProperty { key } => write!(f, "table property {key}"),
             Provenance::TableSortOrder => f.write_str("the table's sort order"),
             Provenance::IcebergDefault => write!(f, "Iceberg default"),
@@ -286,7 +322,23 @@ impl Layers<'_> {
         }
     }
 
-    /// Resolve one setting through all four layers.
+    /// The first catalog policy that supplies this setting.
+    ///
+    /// Each layer carries only its own policy type's section, so at most one
+    /// can answer for any setting; walking them in order makes that a property
+    /// of the data rather than of this loop.
+    fn catalog_answer<T>(
+        &self,
+        pick: &impl Fn(&TableSettings) -> Option<T>,
+    ) -> Option<Resolved<T>> {
+        self.facts
+            .catalog
+            .layers
+            .iter()
+            .find_map(|layer| pick(&layer.settings).map(|v| Resolved::new(v, layer.from.clone())))
+    }
+
+    /// Resolve one setting through every layer.
     ///
     /// `pick` selects the field from a settings layer; `property` names the
     /// Iceberg property to consult and how to parse it; `fallback` is what
@@ -303,6 +355,9 @@ impl Layers<'_> {
         }
         if let Some(v) = pick(self.defaults) {
             return Resolved::new(v, Provenance::Defaults);
+        }
+        if let Some(v) = self.catalog_answer(&pick) {
+            return v;
         }
         if let Some((key, parse)) = property
             && let Some(raw) = self.facts.properties.get(key)
@@ -698,6 +753,7 @@ impl EffectivePolicy {
 /// failing over.
 fn warnings(facts: &TableFacts) -> Vec<String> {
     let mut warnings = unparseable_properties(&facts.properties);
+    warnings.extend(facts.catalog.notes.iter().cloned());
     if !facts.unsupported_sort_fields.is_empty() {
         warnings.push(format!(
             "the table's sort order includes {}, which Bergman cannot reproduce in a \
@@ -720,7 +776,10 @@ fn resolve_optional<T>(
     if let Some(v) = pick(l.rule) {
         return Some(Resolved::new(v, l.rule_provenance()));
     }
-    pick(l.defaults).map(|v| Resolved::new(v, Provenance::Defaults))
+    if let Some(v) = pick(l.defaults) {
+        return Some(Resolved::new(v, Provenance::Defaults));
+    }
+    l.catalog_answer(&pick)
 }
 
 /// Iceberg properties Bergman consults, and how each is parsed. Present but
@@ -765,6 +824,93 @@ fn unparseable_properties(properties: &HashMap<String, String>) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::policy::{Config, Decision, Policy, TableRef};
+
+    fn decide_with_catalog(toml: &str, props: &[(&str, &str)], content: &str) -> EffectivePolicy {
+        let config = Config::from_toml(toml).unwrap();
+        let policy = Policy::compile(&config).unwrap();
+        let facts = TableFacts {
+            properties: props
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ..Default::default()
+        }
+        .with_catalog_policy(crate::policy::catalog::from_polaris(&[
+            crate::policy::catalog::ApplicablePolicy {
+                policy_type: "system.data-compaction".into(),
+                name: "compaction-policy".into(),
+                inherited: true,
+                namespace: vec!["db".into()],
+                content: Some(content.into()),
+            },
+        ]));
+        match policy.decide(&TableRef::new("prod", ["db"], "t"), &facts) {
+            Decision::Maintain(e) => *e,
+            other => panic!("expected Maintain, got {other:?}"),
+        }
+    }
+
+    const CATALOG_COMPACTION: &str =
+        r#"{"enable":true,"config":{"target_file_size_bytes":268435456}}"#;
+
+    #[test]
+    fn catalog_policy_fills_what_bergman_toml_leaves_unset() {
+        // Nothing in bergman.toml says anything about compaction, and the
+        // table sets its own target. The catalog sits above the table and
+        // below the file, so it answers both questions.
+        let p = decide_with_catalog(
+            r#"
+            [[rules]]
+            match = "prod.db.t"
+            "#,
+            &[("write.target-file-size-bytes", "1048576")],
+            CATALOG_COMPACTION,
+        );
+        assert!(p.compaction.enabled.value);
+        assert_eq!(p.compaction.target_file_size.value, 268_435_456);
+        assert_eq!(
+            p.compaction.target_file_size.from.to_string(),
+            "catalog policy \"compaction-policy\" (system.data-compaction, inherited from db)"
+        );
+    }
+
+    #[test]
+    fn a_rule_and_defaults_win_over_catalog_policy() {
+        // The decided default: the operator's own file is the last word.
+        let p = decide_with_catalog(
+            r#"
+            [defaults.compaction]
+            target_file_size = 1048576
+            [[rules]]
+            match = "prod.db.t"
+            [rules.compaction]
+            enabled = false
+            "#,
+            &[],
+            CATALOG_COMPACTION,
+        );
+        assert!(!p.compaction.enabled.value);
+        assert!(matches!(p.compaction.enabled.from, Provenance::Rule { .. }));
+        assert_eq!(p.compaction.target_file_size.value, 1_048_576);
+        assert_eq!(p.compaction.target_file_size.from, Provenance::Defaults);
+    }
+
+    #[test]
+    fn catalog_notes_reach_the_warnings() {
+        let p = decide_with_catalog(
+            r#"
+            [[rules]]
+            match = "prod.db.t"
+            "#,
+            &[],
+            r#"{"enable":true,"config":{"zorder":"a"}}"#,
+        );
+        assert!(
+            p.warnings.iter().any(|w| w.contains("config.zorder")),
+            "{:?}",
+            p.warnings
+        );
+    }
 
     fn decide(toml: &str, props: &[(&str, &str)]) -> EffectivePolicy {
         let config = Config::from_toml(toml).unwrap();

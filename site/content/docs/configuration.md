@@ -3,12 +3,10 @@ title = "Configuration"
 description = "Every setting in bergman.toml: catalogs, defaults, rules and limits."
 weight = 4
 +++
-One TOML file. Every setting is optional — what a policy does not state falls
-through to the table's own Iceberg properties and then to the specification
-default, so this file says only what differs from what your tables already
-declare. See [Policies](@/docs/policies.md) for how that resolution works.
-
-Validate it offline, contacting nothing:
+One TOML file. Every setting is optional: what it leaves unset falls through to
+the [catalog's policy](#catalog-policy) when one is read, then the table's
+Iceberg properties, then the specification default — see
+[Policies](@/docs/policies.md#layering). Validate it offline:
 
 ```bash
 bergman policy lint
@@ -34,24 +32,39 @@ namespaces = ["analytics", "streaming.raw"]
 | Key | Required | Notes |
 |---|:--:|---|
 | `name` | ✅ | First segment of every table reference, and what rule patterns match against. **May not contain a dot** |
-| `kind` | | `rest` — the only protocol implemented, and the one that reaches Rustberg, Polaris, Lakekeeper, Nessie and Unity |
+| `kind` | | `rest`, the only protocol — it reaches Rustberg, Polaris, Lakekeeper, Nessie and Unity |
 | `uri` | ✅ | Catalog endpoint |
-| `warehouse` | | Required when the catalog serves several. Also used to check the right storage feature is compiled in |
-| `storage` | | `s3`/`gcs`/`azure`/`fs`/`memory`. Only a startup check — storage is resolved per path at read time, so one catalog may span schemes |
-| `token_env` | | The **name** of the environment variable holding the bearer token. Never the token: a credential in a config file is a credential in version control |
-| `namespaces` | | Restrict discovery instead of walking the whole catalog. Dotted, as in rule patterns. Turns an O(catalog) tree walk into an O(subtree) one |
-| `properties` | | Iceberg's own property names, so `s3.endpoint` means here what it means in Spark, Trino and PyIceberg |
+| `warehouse` | | Required when the catalog serves several; also checks the right storage feature is compiled in |
+| `storage` | | `s3`/`gcs`/`azure`/`fs`/`memory`. A startup check only — storage is resolved per path |
+| `token_env` | | The **name** of the environment variable holding the bearer token, never the token |
+| `namespaces` | | Restrict discovery to these subtrees. Dotted, as in rule patterns |
+| `properties` | | Iceberg property names (`s3.endpoint` means what it means in Spark, Trino and PyIceberg) |
+| `policy_source` | | `"polaris"` reads each table's Apache Polaris maintenance policy as a layer below this file. Off when absent — see [below](#catalog-policy) |
 
-Properties reach both clients: the catalog's file access and the object-store
-client orphan scanning needs.
+Properties reach both the catalog's file access and the object-store client
+orphan scanning uses. Prefer the provider chain or catalog-vended credentials
+over keys in `properties` — see [Operating](@/docs/operating.md#credentials).
 
-Prefer the provider chain (instance role, workload identity) or catalog-vended
-credentials over putting keys in `properties`. See [Operating](@/docs/operating.md#credentials).
+### Catalog policy {#catalog-policy}
+
+```toml
+[[catalogs]]
+name          = "prod"
+uri           = "https://polaris.example.com/api/catalog"
+warehouse     = "prod"
+policy_source = "polaris"
+```
+
+The catalog policy fills only what a matching rule and `[defaults]` leave unset.
+It never recruits a table no rule matches (use a catch-all rule to let Polaris
+drive everything) and never sets orphan `mode`. A table whose policy cannot be
+read is skipped that cycle, with the reason in the plan. Fields and mapping:
+[Policies](@/docs/policies.md#catalog-policy).
 
 ## `[defaults]` and `[[rules]]`
 
-The two carry identical setting blocks. `[defaults]` applies to every table a
-rule matches; a rule's own values override it.
+Identical setting blocks. `[defaults]` applies to every matched table; a rule's
+own values override it.
 
 ### `snapshots`
 
@@ -63,11 +76,7 @@ min_to_keep  = 3         # -> history.expire.min-snapshots-to-keep -> 1
 delete_files = false     # reclaim orphaned files during expiration
 ```
 
-`min_to_keep = 0` is refused at startup — expiring every snapshot would leave the
-table unreadable, and upstream would reject the commit anyway. Failing early
-means learning before a cycle runs.
-
-See [Snapshots](@/docs/snapshots.md).
+`min_to_keep = 0` is refused at startup. See [Snapshots](@/docs/snapshots.md).
 
 ### `orphans`
 
@@ -79,18 +88,11 @@ older_than   = "7d"       # hard floor of 24h
 min_interval = "24h"      # shortest gap between two scans of one table
 ```
 
-The blast-radius ceiling is **not** here: it lives in
-[`[limits]`](#limits) as `max_deletes_per_run`, because it governs every
-deletion Bergman performs — orphan removal and expiration's file cleanup alike,
-which share one deleter and therefore one safety model.
-
-`older_than` below 24 hours is refused at startup and again in the scanner. Read
+`older_than` below 24 hours is refused at startup and again in the scanner.
+`min_interval` applies within one process; a one-shot `bergman run` always
+scans — see [Cadence](@/docs/orphans.md#cadence). The blast-radius ceiling is
+[`limits.max_deletes_per_run`](#limits), shared by every deleter. Read
 [Orphan files](@/docs/orphans.md) before setting `mode = "delete"`.
-
-`min_interval` exists because this is the one operation whose cost cannot be
-judged from metadata: knowing whether a table has orphans means listing its
-whole location. It applies within one process — a one-shot `bergman run` always
-scans. See [Cadence](@/docs/orphans.md#cadence).
 
 ### `compaction`
 
@@ -115,18 +117,13 @@ min_file_age        = "1h"    # leave a partition alone until it settles
 Ratios outside 0–1 are refused at startup, as is an empty `sort` list and a
 `max_input_files` below 2.
 
-`max_group_bytes` and `max_input_files` bound a **file group**, which is the
-unit a rewrite commits at. A partition is bin-packed into as many groups as it
-needs, so a partition larger than memory is still compactable and one lost
-commit costs one group. See [File groups](@/docs/compaction.md#file-groups).
-
-`min_file_age` leaves a partition alone until its newest file has settled — the
-guard against fighting your own writer for the hot partition.
-
-`sort` orders rows globally within each file group. `max_sort_memory` is the
-executor's memory pool: the sort and the anti-join that applies equality deletes
-**spill to disk** when they reach it rather than failing. See
-[Compaction](@/docs/compaction.md#query-engine).
+`max_group_bytes` and `max_input_files` bound a **file group**, the unit a
+rewrite commits at; a partition is bin-packed into as many groups as it needs
+([File groups](@/docs/compaction.md#file-groups)). `min_file_age` leaves a
+partition alone until its newest file has settled. `sort` orders rows within
+each file group. `max_sort_memory` is the executor's memory pool; the sort and
+the equality-delete anti-join **spill to disk** at it
+([Compaction](@/docs/compaction.md#query-engine)).
 
 ### `manifests`
 
@@ -145,16 +142,11 @@ match    = "prod.streaming.**"
 schedule = "0 */2 * * *"
 ```
 
-Governs when evaluation runs, not whether anything executes — the health
-analyzer decides that. Both the five-field crontab form everyone writes and the
-six-field form with seconds are accepted; a five-field expression means "at
-second zero".
-
-Read by [`bergman daemon`](@/docs/operating.md#as-a-daemon), which wakes at the
-earliest schedule any rule declares and then evaluates **only the tables that
-rule matches** — so one aggressive cadence does not set the pace for the whole
-catalog. Under `bergman run` the cycle is driven by whatever scheduler invoked
-it, so `schedule` is inert; use `--table` to scope a run instead.
+When a table is evaluated, not whether anything runs — measurements decide
+that. Five-field crontab (at second zero) or six-field with seconds.
+[`bergman daemon`](@/docs/operating.md#as-a-daemon) wakes at the earliest due
+schedule and evaluates **only the tables that rule matches**. `bergman run`
+ignores `schedule`; scope it with `--table`.
 
 ### `skip`
 
@@ -164,8 +156,7 @@ match = "prod.tmp.**"
 skip  = true
 ```
 
-Cannot be combined with settings — both cannot apply, and silently preferring one
-would make the other a line that does nothing.
+Cannot be combined with settings; doing so is a configuration error.
 
 ## `[limits]`
 
@@ -180,77 +171,30 @@ maintenance_window        = "22:00-06:00 Europe/Berlin"
 operation_timeout         = "1h"           # optional; bounds unbounded waiting
 ```
 
-### Two units, deliberately
-
-`io_concurrency` and `compaction_parallelism` look alike and bound different
-things, which is why they are separate rather than one "parallelism" knob.
-
-`io_concurrency` bounds what is **latency-bound**: reading a table's manifests,
-and deleting files. Both are dominated by per-request round trips against object
-storage, so the useful number is far above the core count and has nothing to do
-with it. The manifest walk is two flat phases rather than a nested fan-out, so
-this is the number of outstanding requests and not a factor in one. Lower it when
-Bergman is embedded in a service whose HTTP connection pool it shares.
-
-`compaction_parallelism` bounds what is **CPU-bound**: the `target_partitions` of
-the DataFusion plan that applies equality deletes and sorts a file group. Absent
-means the machine's available parallelism. Set it to `1` in a container pinned to
-one core, or where maintenance must stay out of a co-tenant's way.
-
-Raising `compaction_parallelism` does **not** raise the memory ceiling.
-`compaction.max_sort_memory` does, and the spill pool is per session and shared
-across threads — so more threads means more spilling under pressure rather than
-more resident bytes.
-
-`max_deletes_per_run` caps how many files any single operation may delete —
-[orphan removal](@/docs/orphans.md) and
-[expiration's file cleanup](@/docs/snapshots.md) both. Nothing is lost by
-hitting it: what is withheld is reported and reclaimed by the next pass. What
-would be lost without it is the difference between an incident and a
-catastrophe. `0` is refused at startup.
-
-When the byte budget cannot cover everything, tables are ordered
-most-fragmented-first and the remainder is reported as **deferred**, never
-silently dropped — the run report names them, and the table's plan carries a
-note saying why.
-
-The ceiling is charged **per operation, not per table, and only to the
-operations that read data files** — which is [compaction](@/docs/compaction.md),
-and nothing else. Manifest rewriting, expiration and orphan removal touch no
-data file and cost the budget nothing.
-
-Both halves of that rule prevent the same failure: a table too fragmented to fit
-the budget must not also stop expiring snapshots and coalescing its manifests,
-growing its history and its planning cost without bound *because* it needed
-compaction.
-
-`maintenance_window` governs when work *begins*. A cycle already under way runs
-to completion: stopping mid-rewrite at the window's edge would leave files
-written and uncommitted, which is worse than finishing. Outside it, `run` does
-nothing and reports every planned table as deferred, and
-[`daemon`](@/docs/operating.md#as-a-daemon) sleeps to the edge rather than waking
-every interval to find it shut.
-
-**The timezone is mandatory.** A window in local time moves when a replica is
-scheduled in another region, and "not during business hours" must not move. It
-is parsed at startup, so a malformed one is a startup failure:
-
-```
-policy error: maintenance_window "22:00-06:00" has no timezone; write it as
-"22:00-06:00 Europe/Berlin". A window without one moves when a replica is
-scheduled in another region.
-```
-
-`operation_timeout` bounds unbounded *waiting*, not slow work. A commit has its
-own request timeout; a data read does not, so an object store that accepts a
-connection and never answers leaves a rewrite waiting forever — and with table
-concurrency bounded, a few of those stop the daemon maintaining anything.
-Cancelling is safe: maintenance is crash-only, so a rewrite killed part-way
-leaves files nothing references, and a commit is one atomic request.
-
-It is **absent by default** — the right value depends on the largest file group
-you rewrite, and a one-shot `bergman run` already has a deadline from cron or
-its orchestrator. This is for the daemon, which has none.
+- `io_concurrency` bounds **latency-bound** work — manifest reads and deletions —
+  as object-store requests in flight. Lower it when Bergman shares a service's
+  HTTP connection pool.
+- `compaction_parallelism` bounds **CPU-bound** work: the DataFusion
+  `target_partitions` of a rewrite. Absent means available parallelism. It does
+  not raise memory use; `compaction.max_sort_memory` is the ceiling, shared
+  across threads.
+- `max_deletes_per_run` caps the files any one operation deletes —
+  [orphan removal](@/docs/orphans.md) and
+  [expiration's file cleanup](@/docs/snapshots.md) alike. What is withheld is
+  reported and reclaimed by the next pass. `0` is refused at startup.
+- `max_rewrite_bytes_per_run` is charged per operation, and only to
+  [compaction](@/docs/compaction.md). When it cannot cover everything, tables
+  are ordered most-fragmented-first and the rest is reported as **deferred**.
+  Expiration, manifest rewriting and orphan removal never consume it, so a table
+  too fragmented to compact still keeps its history and manifests in check.
+- `maintenance_window` governs when work *begins*; a cycle under way finishes.
+  Outside it, `run` reports every planned table as deferred and
+  [`daemon`](@/docs/operating.md#as-a-daemon) sleeps to the window's edge. **The
+  timezone is mandatory** — `"22:00-06:00"` alone is a startup error.
+- `operation_timeout` bounds *waiting* — an object store that accepts a
+  connection and never answers. Cancelling is safe: an interrupted rewrite
+  leaves only unreferenced files, and a commit is one atomic request. Absent by
+  default; meant for the daemon.
 
 ## Global flags
 
@@ -261,11 +205,9 @@ its orchestrator. This is for the daemon, which has none.
 | `--audit-log` | `BERGMAN_AUDIT_LOG` | none |
 | `--log` | `BERGMAN_LOG` | `warn` |
 
-Logs go to stderr, so `--format json` on stdout stays machine-readable at any
-log level.
+Logs go to stderr, so `--format json` on stdout stays machine-readable.
 
 ## A complete example
 
 The repository ships [`bergman.example.toml`](https://github.com/hupe1980/bergman/blob/main/bergman.example.toml),
-which is annotated throughout and checked against the real parser by the test
-suite — so it cannot drift from the schema.
+annotated and checked against the parser by the test suite.

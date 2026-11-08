@@ -74,14 +74,6 @@ allow = [
 ]
 confidence-threshold = 0.9
 
-[[licenses.exceptions]]
-# The `ring` crate carries a compound licence whose OpenSSL-derived portion
-# has no SPDX identifier. It is ubiquitous in the rustls stack and the terms
-# are permissive; this is the standard exception rather than a judgement call
-# specific to Bergman.
-name = "ring"
-allow = ["OpenSSL"]
-
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"

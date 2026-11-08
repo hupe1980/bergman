@@ -160,6 +160,7 @@ mod tests {
             properties: HashMap::new(),
             token_env: None,
             namespaces,
+            policy_source: None,
         }
     }
 

@@ -132,7 +132,11 @@ fn a_rewrite_commits_the_snapshot_and_moves_the_branch_together() {
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use bergman::commit::{RestCommitter, TableCommitter};
+use bergman::commit::{Credential, RestCommitter, TableCommitter, TokenSource, http_client};
+
+fn reqwest_client() -> reqwest::Client {
+    http_client().expect("a client builds")
+}
 use bergman::obs::OperationContext;
 use bergman::plan::OperationKind;
 use bergman::policy::TableRef;
@@ -245,7 +249,8 @@ async fn a_commit_carries_the_run_id_a_governing_catalog_can_join_on() {
     // request id would appear in exactly one of the two and join nothing.
     let (uri, log) = fake_catalog().await;
 
-    let committer = RestCommitter::connect(&uri, None, &HashMap::new(), None)
+    let tokens = Arc::new(TokenSource::new(Credential::None, reqwest_client()));
+    let committer = RestCommitter::connect(&uri, None, tokens)
         .await
         .expect("the fake catalog describes itself");
 

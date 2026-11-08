@@ -63,30 +63,6 @@ async fn rewrite(
         .expect("manifest rewrite runs")
 }
 
-/// The same, without unwrapping — for the paths that must refuse.
-async fn try_rewrite(
-    fixture: &TestTable,
-    settings: &bergman::policy::EffectiveManifests,
-) -> bergman::Result<OperationResult> {
-    let table = fixture.table();
-    let table_ref = TableRef::new("prod", ["db"], "events");
-    let loader = fixture.loader();
-    let env = common::op_env(
-        &table,
-        &fixture.ident,
-        &loader,
-        fixture.committer.as_ref(),
-        OperationContext {
-            run_id: "test",
-            table: &table_ref,
-            kind: OperationKind::RewriteManifests,
-            matched_rule: "prod.db.events",
-            reason: "test",
-        },
-    );
-    manifests::run(&env, settings).await
-}
-
 /// Append each file in its own snapshot, so the table accumulates manifests.
 async fn append_separately(fixture: &TestTable, chunks: &[&[(i32, &str)]]) {
     for chunk in chunks {
@@ -251,38 +227,5 @@ async fn the_rewritten_table_is_still_readable_after_more_writes() {
             (3, "c".to_string()),
             (4, "d".to_string()),
         ]
-    );
-}
-
-#[tokio::test]
-async fn a_v3_table_is_refused_before_a_manifest_is_written() {
-    // Re-packing entries produces a snapshot like any other, so the same v3
-    // limit applies (see `compaction_end_to_end`). The refusal has to arrive
-    // before anything is written, or every cycle would leave a fresh set of
-    // Avro files under the table's metadata directory for the orphan scanner.
-    let fixture = TestTable::with_format(iceberg::spec::FormatVersion::V3).unwrap();
-    for i in 0..3 {
-        let file = fixture.write_data_file(&[(i, "x")]).await.unwrap();
-        fixture.append(vec![file]).await.unwrap();
-    }
-
-    let before_manifests = common::manifest_paths(&fixture.table())
-        .await
-        .unwrap()
-        .len();
-    let before_commits = fixture.committer.commit_count();
-
-    let err = try_rewrite(&fixture, &manifest_policy(EAGER))
-        .await
-        .expect_err("a v3 manifest rewrite must be refused");
-
-    assert!(err.to_string().contains("format v3"), "got: {err}");
-    assert_eq!(fixture.committer.commit_count(), before_commits);
-    assert_eq!(
-        common::manifest_paths(&fixture.table())
-            .await
-            .unwrap()
-            .len(),
-        before_manifests
     );
 }
