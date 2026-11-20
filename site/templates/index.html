@@ -196,6 +196,12 @@ skip  = true              # explicit exclusion beats implicit</code></pre>
   --audit-log /var/log/bergman.jsonl</code></pre>
       </article>
       <article class="shape">
+        <h3>Daemon</h3>
+        <p>Follows each rule's schedule and reacts to commit events. Ask it what it is doing, and what needs you, from anywhere.</p>
+<pre><code class="language-bash">bergman daemon --listen 0.0.0.0:9090
+bergman status --daemon http://bergman:9090</code></pre>
+      </article>
+      <article class="shape">
         <h3>Read-only first</h3>
         <p>Report health and plan work without writing anything — through the same code path <code>run</code> uses.</p>
 <pre><code class="language-bash">bergman inspect

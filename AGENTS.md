@@ -181,7 +181,7 @@ src/ops/      compact / expire / manifests / orphans
               delete.rs       the one deleter both destructive ops share
               reachability.rs what a table still needs — safety-critical
               store.rs        object listing, which FileIO does not offer
-src/sched/    daemon, cron triggers, event debounce
+src/sched/    daemon, cron triggers, event debounce, the /status board
 src/obs/      observer trait, audit log, metrics
 src/cli/      clap commands, human + JSON output
 ```

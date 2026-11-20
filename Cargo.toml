@@ -1,6 +1,6 @@
 [package]
 name = "bergman"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 authors = ["hupe1980"]
 description = "A Rust-native maintenance engine for Apache Iceberg — policy-driven compaction, snapshot expiration, and orphan cleanup with no JVM"
@@ -17,7 +17,7 @@ rust-version = "1.95"
 # Optional dependencies are `dep:` so the feature surface is exactly this list.
 # Embedders take `default-features = false` and add what they use.
 [features]
-default = ["cli", "catalog-rest", "compaction", "storage-all"]
+default = ["cli", "catalog-rest", "compaction", "storage-all", "metrics"]
 
 # The only operation that reads and writes data. DataFusion applies equality
 # deletes as a hash anti-join; without the feature there is no compaction.

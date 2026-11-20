@@ -443,3 +443,233 @@ fn table_with_provenance() -> Table {
 fn add(t: &mut Table, setting: &str, value: &str, from: &str) {
     t.add_row(vec![Cell::new(setting), Cell::new(value), Cell::new(from)]);
 }
+
+/// Render `bergman status`.
+#[cfg(feature = "metrics")]
+pub fn status(status: &crate::sched::DaemonStatus, format: Format) -> Result<()> {
+    if format == Format::Json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(status).unwrap_or_default()
+        );
+        return Ok(());
+    }
+    print!("{}", status_text(status, chrono::Utc::now()));
+    Ok(())
+}
+
+/// The text form of a daemon's status, as of `now`.
+///
+/// Ordered by what an operator came to find out: what needs them first, then
+/// what cannot apply, then what went fine. A daemon with nothing to say says so
+/// in one line rather than printing an empty frame.
+#[cfg(feature = "metrics")]
+fn status_text(s: &crate::sched::DaemonStatus, now: chrono::DateTime<chrono::Utc>) -> String {
+    use std::fmt::Write;
+
+    let ago =
+        |at: chrono::DateTime<chrono::Utc>| human_duration((now - at).to_std().unwrap_or_default());
+    let clock = |at: chrono::DateTime<chrono::Utc>| at.format("%H:%M UTC").to_string();
+
+    let mut out = String::new();
+    let _ = write!(
+        out,
+        "daemon up {}, {} finished",
+        ago(s.started_at),
+        super::plural(s.cycles as usize, "cycle")
+    );
+    match (&s.running, &s.next) {
+        (Some(r), _) => {
+            let _ = write!(
+                out,
+                "; cycle {} running ({}) for {}",
+                r.number,
+                r.trigger,
+                ago(r.since)
+            );
+        }
+        (None, Some(n)) => {
+            let wait = human_duration((n.at - now).to_std().unwrap_or_default());
+            let _ = write!(out, "; next at {} ({}, in {wait})", clock(n.at), n.trigger);
+        }
+        (None, None) => {}
+    }
+    out.push('\n');
+
+    if let Some(c) = &s.last_cycle {
+        let what = match (&c.error, &c.summary) {
+            (Some(e), _) => format!("FAILED: {e}"),
+            (None, Some(summary)) => summary.clone(),
+            (None, None) => String::new(),
+        };
+        let _ = writeln!(
+            out,
+            "last cycle {} ({}) at {}: {what}",
+            c.number,
+            c.trigger,
+            clock(c.finished_at)
+        );
+        if !c.deferred.is_empty() {
+            let names: Vec<String> = c.deferred.iter().map(ToString::to_string).collect();
+            let _ = writeln!(out, "deferred by the byte budget: {}", names.join(", "));
+        }
+    }
+
+    let attention: Vec<_> = s.tables.iter().filter(|t| t.needs_attention()).collect();
+    let noted: Vec<_> = s
+        .tables
+        .iter()
+        .filter(|t| !t.needs_attention() && !t.outcome.notes.is_empty())
+        .collect();
+    let rest: Vec<_> = s
+        .tables
+        .iter()
+        .filter(|t| !t.needs_attention() && t.outcome.notes.is_empty())
+        .collect();
+
+    for (heading, group) in [
+        ("needs attention", &attention),
+        ("cannot apply", &noted),
+        ("maintained", &rest),
+    ] {
+        if group.is_empty() {
+            continue;
+        }
+        let _ = writeln!(out, "\n{heading}");
+        for t in group.iter() {
+            let _ = writeln!(
+                out,
+                "  {}  (cycle {}, {})",
+                t.outcome.table,
+                t.cycle,
+                clock(t.at)
+            );
+            for note in &t.outcome.notes {
+                let _ = writeln!(out, "    note: {note}");
+            }
+            for op in &t.outcome.operations {
+                let (marker, detail) = match &op.result {
+                    OperationResult::Succeeded { detail } => ("ok", detail),
+                    OperationResult::NoOp { detail } => ("--", detail),
+                    OperationResult::Refused { reason } => ("XX", reason),
+                    OperationResult::Conflicted { detail } => ("<>", detail),
+                    OperationResult::Failed { error } => ("XX", error),
+                };
+                let _ = writeln!(out, "    [{marker}] {}: {detail}", op.kind);
+            }
+        }
+    }
+
+    out.push('\n');
+    if attention.is_empty() && s.last_cycle.as_ref().is_none_or(|c| c.error.is_none()) {
+        out.push_str(if s.cycles == 0 {
+            "No cycle has finished yet.\n"
+        } else {
+            "Nothing needs attention.\n"
+        });
+    } else {
+        let _ = writeln!(
+            out,
+            "{} need{} attention.",
+            super::plural(attention.len(), "table"),
+            if attention.len() == 1 { "s" } else { "" }
+        );
+    }
+    out
+}
+
+#[cfg(all(test, feature = "metrics"))]
+mod tests {
+    use super::*;
+    use crate::plan::{OperationKind, OperationOutcome, TableOutcome};
+    use crate::sched::{CycleRecord, DaemonStatus, TableStatus};
+
+    fn at(h: u32, m: u32) -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono::Utc.with_ymd_and_hms(2026, 11, 20, h, m, 0).unwrap()
+    }
+
+    fn entry(name: &str, result: OperationResult, notes: Vec<String>) -> TableStatus {
+        TableStatus {
+            cycle: 3,
+            at: at(9, 0),
+            outcome: TableOutcome {
+                table: TableRef::new("prod", ["db"], name),
+                matched_rule: "prod.**".into(),
+                notes,
+                operations: vec![OperationOutcome {
+                    kind: OperationKind::Compact,
+                    reason: "small files".into(),
+                    result,
+                    duration: std::time::Duration::ZERO,
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn what_needs_attention_is_printed_before_what_went_fine() {
+        // The table order on the board is alphabetical; the output must not
+        // be, or a refusal on `z` scrolls below a hundred healthy tables.
+        let status = DaemonStatus {
+            started_at: at(8, 0),
+            cycles: 3,
+            running: None,
+            next: None,
+            last_cycle: Some(CycleRecord {
+                number: 3,
+                trigger: "interval".into(),
+                finished_at: at(9, 0),
+                summary: Some("2 tables, 1 operations succeeded in 4s".into()),
+                error: None,
+                deferred: vec![],
+            }),
+            tables: vec![
+                entry(
+                    "a",
+                    OperationResult::Succeeded {
+                        detail: "12 files into 1".into(),
+                    },
+                    vec![],
+                ),
+                entry(
+                    "z",
+                    OperationResult::Refused {
+                        reason: "cross-spec rewrite".into(),
+                    },
+                    vec![],
+                ),
+            ],
+        };
+        let text = status_text(&status, at(9, 30));
+        let refused = text.find("cross-spec rewrite").expect(&text);
+        let fine = text.find("12 files into 1").expect(&text);
+        assert!(refused < fine, "{text}");
+        assert!(text.contains("needs attention\n  prod.db.z"), "{text}");
+        assert!(text.ends_with("1 table needs attention.\n"), "{text}");
+        assert!(status.needs_attention());
+    }
+
+    #[test]
+    fn a_failed_cycle_is_reported_even_with_no_table_in_trouble() {
+        let status = DaemonStatus {
+            started_at: at(8, 0),
+            cycles: 1,
+            running: None,
+            next: None,
+            last_cycle: Some(CycleRecord {
+                number: 1,
+                trigger: "interval".into(),
+                finished_at: at(8, 1),
+                summary: None,
+                error: Some("catalog unreachable".into()),
+                deferred: vec![],
+            }),
+            tables: vec![],
+        };
+        let text = status_text(&status, at(8, 2));
+        assert!(text.contains("FAILED: catalog unreachable"), "{text}");
+        assert!(!text.contains("Nothing needs attention"), "{text}");
+        assert!(status.needs_attention());
+    }
+}

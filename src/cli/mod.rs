@@ -187,6 +187,23 @@ enum Command {
         events_token_env: Option<String>,
     },
 
+    /// Ask a running daemon what it is doing, and what needs attention.
+    ///
+    /// Reads the daemon's `/status`; needs no configuration file and no
+    /// credentials, so it works from a laptop pointed at a pod. Exits 2 when
+    /// a table has a failed or refused operation, or the last cycle failed —
+    /// the same contract as `bergman run`, so a check can rely on it.
+    #[cfg(feature = "metrics")]
+    Status {
+        /// The daemon's `--listen` address.
+        #[arg(
+            long,
+            env = "BERGMAN_DAEMON_URL",
+            default_value = "http://127.0.0.1:9090"
+        )]
+        daemon: String,
+    },
+
     /// Policy inspection.
     #[command(subcommand)]
     Policy(PolicyCommand),
@@ -213,6 +230,17 @@ enum PolicyCommand {
 pub async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(&cli.log);
+
+    // Asking a daemon needs neither its configuration nor its credentials.
+    #[cfg(feature = "metrics")]
+    if let Command::Status { daemon } = &cli.command {
+        let status = fetch_status(daemon).await?;
+        render::status(&status, cli.format)?;
+        if status.needs_attention() {
+            std::process::exit(2);
+        }
+        return Ok(());
+    }
 
     let config = Config::from_path(&cli.config)?;
 
@@ -321,10 +349,17 @@ pub async fn main() -> Result<()> {
             #[cfg(feature = "metrics")]
             let server = listen.map(|addr| {
                 let metrics = Arc::clone(&metrics);
+                let status = daemon.status();
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        crate::obs::serve(addr, metrics, sender, event_token, shutdown_signal())
-                            .await
+                    if let Err(e) = crate::obs::serve(
+                        addr,
+                        metrics,
+                        status,
+                        sender,
+                        event_token,
+                        shutdown_signal(),
+                    )
+                    .await
                     {
                         eprintln!("bergman: {e}");
                     }
@@ -399,6 +434,8 @@ pub async fn main() -> Result<()> {
         }
 
         Command::Policy(PolicyCommand::Lint) => unreachable!("handled above"),
+        #[cfg(feature = "metrics")]
+        Command::Status { .. } => unreachable!("handled above"),
     }
 }
 
@@ -423,6 +460,27 @@ async fn plan_for(
         plan.retain_operations(&kinds);
     }
     Ok(plan)
+}
+
+/// Read a daemon's `/status`.
+#[cfg(feature = "metrics")]
+async fn fetch_status(daemon: &str) -> Result<crate::sched::DaemonStatus> {
+    let url = format!("{}/status", daemon.trim_end_matches('/'));
+    let unreachable = |e: reqwest::Error| {
+        Error::config(format!(
+            "cannot read {url}: {e} — is the daemon running with --listen?"
+        ))
+    };
+    reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(unreachable)?
+        .json()
+        .await
+        .map_err(unreachable)
 }
 
 fn lint(config: &Config, format: Format) -> Result<()> {
