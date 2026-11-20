@@ -11,9 +11,11 @@
 //! scanner reclaims. Restarting replans from the tables' current snapshots.
 
 mod event_stream;
+mod status;
 mod trigger;
 
 pub use event_stream::{EventStream, Events, channel};
+pub use status::{CycleRecord, DaemonStatus, NextCycle, RunningCycle, StatusBoard, TableStatus};
 pub use trigger::{Trigger, TriggerSet};
 
 use std::sync::Arc;
@@ -63,6 +65,7 @@ pub struct Daemon {
     bergman: Arc<Bergman>,
     config: DaemonConfig,
     triggers: TriggerSet,
+    status: StatusBoard,
 }
 
 impl Daemon {
@@ -73,7 +76,16 @@ impl Daemon {
             bergman,
             config,
             triggers,
+            status: StatusBoard::new(),
         })
+    }
+
+    /// What this daemon is doing, and what each table last said.
+    ///
+    /// A handle to the live board, not a copy: hand it to whatever serves
+    /// `/status` before calling [`Daemon::run`].
+    pub fn status(&self) -> StatusBoard {
+        self.status.clone()
     }
 
     /// The next moment any trigger fires, and which one.
@@ -152,6 +164,13 @@ impl Daemon {
                 }
                 None => delay,
             };
+            self.status.next_due(
+                chrono::Duration::from_std(delay)
+                    .ok()
+                    .and_then(|d| now.checked_add_signed(d))
+                    .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC),
+                &trigger,
+            );
 
             // What woke us decides what the cycle covers: a timer plans the
             // whole catalog, an event plans only what changed.
@@ -206,7 +225,14 @@ impl Daemon {
             };
 
             completed += 1;
+            self.status.started(completed, &trigger);
             let outcome = self.cycle(&scope).await;
+            self.status.finished(
+                completed,
+                &trigger,
+                &scope,
+                outcome.as_ref().map_err(ToString::to_string),
+            );
             on_cycle(Cycle {
                 number: completed,
                 trigger,

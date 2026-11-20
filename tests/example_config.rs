@@ -53,34 +53,24 @@ fn the_example_config_matches_the_tables_its_comments_describe() {
 
 #[test]
 fn the_readme_quick_start_config_parses() {
-    // The block a first-time user copies out of the README.
-    let config = Config::from_toml(
-        r#"
-        [[catalogs]]
-        name      = "prod"
-        uri       = "http://localhost:8181/catalog"
-        warehouse = "s3://lake/warehouse"
-        token_env = "BERGMAN_CATALOG_TOKEN"
+    // The block a first-time user copies out of the README, read from the
+    // README itself: a copy pasted here would keep passing after the README
+    // changed under it.
+    let readme = include_str!("../README.md");
+    let start = readme
+        .find("```toml\n")
+        .expect("the README has a TOML quick start")
+        + "```toml\n".len();
+    let end = start + readme[start..].find("```").expect("the block is closed");
 
-        [catalogs.properties]
-        "s3.region"   = "eu-central-1"
-        "s3.endpoint" = "https://s3.eu-central-1.amazonaws.com"
-
-        [defaults.snapshots]
-        max_age     = "7d"
-        min_to_keep = 3
-
-        [[rules]]
-        match = "prod.analytics.*"
-
-        [[rules]]
-        match = "prod.tmp.*"
-        skip  = true
-        "#,
-    )
-    .expect("the README quick-start config must parse");
-
+    let config =
+        Config::from_toml(&readme[start..end]).expect("the README quick-start config must parse");
     Policy::compile(&config).expect("the README quick-start config must compile");
+    assert_eq!(
+        config.catalogs.len(),
+        1,
+        "the block read is the quick start"
+    );
 }
 
 #[test]

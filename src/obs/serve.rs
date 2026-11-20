@@ -1,8 +1,9 @@
-//! Serving metrics and health over HTTP.
+//! Serving metrics, health and status over HTTP.
 //!
-//! Two handlers and no router extras. A maintenance engine's HTTP surface
-//! should be the smallest thing that a scrape and a liveness probe can talk to
-//! — anything more is a second product hiding inside the first.
+//! Read-only handlers and no router extras. A maintenance engine's HTTP surface
+//! should be the smallest thing that a scrape, a liveness probe and an operator
+//! asking "what needs me?" can talk to — anything more is a second product
+//! hiding inside the first.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -15,13 +16,23 @@ use axum::routing::get;
 
 use crate::error::{Error, Result};
 use crate::obs::Metrics;
+use crate::sched::StatusBoard;
 
-/// Build the router.
-pub fn router(metrics: Arc<Metrics>) -> Router {
+/// Build the router: `/metrics`, `/health` and `/status`.
+///
+/// `/status` names tables and carries the text of their refusals and errors —
+/// the same content the daemon prints to its own output, and nothing that
+/// causes work. Bind it where you would let someone read the daemon's logs.
+pub fn router(metrics: Arc<Metrics>, status: StatusBoard) -> Router {
     Router::new()
         .route("/metrics", get(scrape))
         .route("/health", get(health))
         .with_state(metrics)
+        .merge(
+            Router::new()
+                .route("/status", get(serve_status))
+                .with_state(status),
+        )
 }
 
 /// The token `POST /events` must present, when one is configured.
@@ -96,18 +107,15 @@ struct EventState {
 /// default, so the choice is made rather than inherited.
 pub fn router_with_events(
     metrics: Arc<Metrics>,
+    status: StatusBoard,
     events: crate::sched::Events,
     token: Option<EventToken>,
 ) -> Router {
-    Router::new()
-        .route("/metrics", get(scrape))
-        .route("/health", get(health))
-        .with_state(metrics)
-        .merge(
-            Router::new()
-                .route("/events", axum::routing::post(receive_event))
-                .with_state(EventState { events, token }),
-        )
+    router(metrics, status).merge(
+        Router::new()
+            .route("/events", axum::routing::post(receive_event))
+            .with_state(EventState { events, token }),
+    )
 }
 
 /// Bergman's own notification shape: which table changed.
@@ -289,12 +297,18 @@ async fn health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
+/// What the daemon is doing, and what each table last said, as JSON.
+async fn serve_status(State(status): State<StatusBoard>) -> impl IntoResponse {
+    axum::Json(status.snapshot())
+}
+
 /// Serve until `shutdown` resolves.
 ///
 /// With `events`, `/events` is served too.
 pub async fn serve(
     addr: SocketAddr,
     metrics: Arc<Metrics>,
+    status: StatusBoard,
     events: Option<crate::sched::Events>,
     token: Option<EventToken>,
     shutdown: impl Future<Output = ()> + Send + 'static,
@@ -317,12 +331,12 @@ pub async fn serve(
                      storage and rewrite data"
                 );
             }
-            tracing::info!(%addr, authenticated = token.is_some(), "serving /metrics, /health and /events");
-            router_with_events(metrics, events, token)
+            tracing::info!(%addr, authenticated = token.is_some(), "serving /metrics, /health, /status and /events");
+            router_with_events(metrics, status, events, token)
         }
         None => {
-            tracing::info!(%addr, "serving /metrics and /health");
-            router(metrics)
+            tracing::info!(%addr, "serving /metrics, /health and /status");
+            router(metrics, status)
         }
     };
 
@@ -344,7 +358,7 @@ mod tests {
         use axum::http::Request;
         use tower::ServiceExt;
 
-        let response = router(metrics)
+        let response = router(metrics, StatusBoard::new())
             .oneshot(
                 Request::builder()
                     .uri(path)
@@ -403,6 +417,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_is_the_live_board_on_both_routers() {
+        // The handle is shared, not copied: what the loop records after the
+        // server starts is what `/status` serves. And the router that also
+        // serves `/events` must not be the one that forgot `/status`.
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let board = StatusBoard::new();
+        let (sender, _stream) = crate::sched::channel(std::time::Duration::from_secs(1));
+        let routers = [
+            router(Arc::new(Metrics::new()), board.clone()),
+            router_with_events(Arc::new(Metrics::new()), board.clone(), sender, None),
+        ];
+        board.started(7, &crate::sched::Trigger::Interval);
+
+        for router in routers {
+            let response = router
+                .oneshot(Request::get("/status").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let status: crate::sched::DaemonStatus = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(status.running.map(|r| r.number), Some(7));
+        }
+    }
+
+    #[tokio::test]
     async fn health_reports_liveness_only() {
         let (status, body) = get_body("/health", Arc::new(Metrics::new())).await;
         assert_eq!(status, StatusCode::OK);
@@ -416,7 +461,7 @@ mod tests {
         use tower::ServiceExt;
 
         let (events, mut stream) = crate::sched::channel(std::time::Duration::from_millis(1));
-        let router = router_with_events(Arc::new(Metrics::new()), events, None);
+        let router = router_with_events(Arc::new(Metrics::new()), StatusBoard::new(), events, None);
 
         let response = router
             .oneshot(
@@ -554,7 +599,8 @@ mod tests {
         use tower::ServiceExt;
 
         let (events, _stream) = crate::sched::channel(std::time::Duration::from_millis(1));
-        let router = router_with_events(Arc::new(Metrics::new()), events, token);
+        let router =
+            router_with_events(Arc::new(Metrics::new()), StatusBoard::new(), events, token);
 
         let mut request = Request::builder()
             .method("POST")
@@ -660,7 +706,7 @@ mod tests {
         use axum::http::Request;
         use tower::ServiceExt;
 
-        let response = router(Arc::new(Metrics::new()))
+        let response = router(Arc::new(Metrics::new()), StatusBoard::new())
             .oneshot(
                 Request::builder()
                     .method("POST")

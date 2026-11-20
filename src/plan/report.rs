@@ -30,7 +30,7 @@ pub struct RunReport {
 }
 
 /// What happened to one table.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TableOutcome {
     /// Which table.
     pub table: TableRef,
@@ -49,7 +49,7 @@ pub struct TableOutcome {
 }
 
 /// What happened to one operation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OperationOutcome {
     /// Which operation.
     pub kind: OperationKind,

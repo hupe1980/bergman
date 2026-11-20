@@ -5,13 +5,28 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 Bergman is pre-1.0: **breaking changes land in minor versions**, each with a migration note.
 
-## [Unreleased]
+## [0.5.0] — 2026-11-20
+
+**Breaking:** `obs::router`, `obs::router_with_events` and `obs::serve` take a `sched::StatusBoard`
+— pass `daemon.status()`. `metrics` is a default feature; a library that wants neither `axum` nor
+`prometheus-client` sets `default-features = false`.
+
+### Added
+
+- **`bergman status`** asks a running daemon what it is doing and what needs attention, from the
+  new **`/status`** endpoint. No config or credentials needed; failures and refusals print first;
+  exits `2` when something needs attention. `Daemon::status()` exposes the same board to embedders.
+
+### Changed
+
+- `cargo install bergman` includes the daemon's HTTP surface and `bergman status`, like every
+  published binary.
 
 ### Security
 
-- `chrono`, `chrono-tz` and `humantime` are marked unmaintained (RUSTSEC-2026-0543, -0555, -0542),
-  with no patched version and no vulnerability. All three reach Bergman through arrow, datafusion,
-  iceberg and object_store, so they are ignored in `deny.toml` with that reason.
+- `chrono`, `chrono-tz` and `humantime` (RUSTSEC-2026-0543, -0555, -0542) are flagged unmaintained,
+  with no fix and no vulnerability. They reach Bergman through arrow, datafusion, iceberg and
+  object_store, and are ignored in `deny.toml` with that reason.
 
 ## [0.4.0] — 2026-11-08
 
@@ -185,6 +200,8 @@ Initial release. Table health analysis, snapshot expiration with file cleanup,
 orphan-file removal, manifest rewriting, and compaction with delete-file
 application — as one crate, one binary, and a library, on `iceberg-rust`.
 
+[0.5.0]: https://github.com/hupe1980/bergman/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/hupe1980/bergman/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/hupe1980/bergman/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/hupe1980/bergman/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/hupe1980/bergman/releases/tag/v0.1.0

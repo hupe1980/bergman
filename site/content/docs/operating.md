@@ -165,6 +165,43 @@ time. An unauthorized request gets a bare `401` before the body is examined.
 The daemon warns when `/events` is served without a token on an address that is
 neither loopback nor behind an authenticating mesh.
 
+### Asking it what it is doing
+
+A daemon started with `--listen` serves `/status`: the cycle in progress or the
+next one due, how the last cycle went, and the latest outcome for every table that
+had work or a note. `bergman status` reads it and puts what needs you first:
+
+```console
+$ bergman status --daemon http://bergman.maintenance:9090
+daemon up 3h, 14 cycles finished; next at 11:00 UTC (interval, in 18m)
+last cycle 14 (2 changed tables) at 10:41 UTC: 2 tables, 3 operations succeeded in 12s
+
+needs attention
+  prod.sales.orders  (cycle 12, 09:02 UTC)
+    [XX] remove-orphans: vetoed by observer
+
+maintained
+  prod.sales.events  (cycle 14, 10:41 UTC)
+    [ok] expire-snapshots: 8 snapshots expired
+
+1 table needs attention.
+```
+
+It needs no configuration file and no credentials, so it works from a laptop
+pointed at a pod (`BERGMAN_DAEMON_URL` sets the address), and `--format json`
+prints exactly what `/status` serves. It exits `2` when an operation failed or was
+refused, or the last cycle failed outright — the same contract as `bergman run` —
+so it doubles as a check.
+
+A table leaves the list only when a cycle that examined it had nothing to say. An
+event for one table, or a cycle the byte budget stopped short of it, leaves what
+an earlier cycle said in place, with the cycle that said it. The board lives in
+memory: a restarted daemon starts empty and fills in on its first cycle.
+
+`/status` names tables and carries the text of refusals and errors, the same
+content the daemon prints to its own output. It causes no work. Expose it where
+you would let someone read the daemon's logs.
+
 ### Windows
 
 With a `maintenance_window` set, the daemon sleeps to the window's edge.

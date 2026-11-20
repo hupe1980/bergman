@@ -18,7 +18,7 @@ cargo add bergman --no-default-features --features catalog-rest,storage-s3
 | `catalog-rest` | ✅ | The Iceberg REST catalog client |
 | `compaction` | ✅ | Data-file rewriting — **and DataFusion**, which applies equality deletes as a hash anti-join |
 | `storage-s3` / `-gcs` / `-azure` | ✅ via `storage-all` | Cloud object stores |
-| `metrics` | — | Prometheus metrics and the `/metrics` endpoint |
+| `metrics` | ✅ | Prometheus metrics and the daemon's HTTP surface: `/metrics`, `/health`, `/status`, `/events` |
 
 `compaction` is the only operation that reads and writes *data*, and the only
 one needing a query engine ([why](@/docs/compaction.md#query-engine)). For
