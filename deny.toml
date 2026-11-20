@@ -44,6 +44,24 @@ ignore = [
     # (recommended, and the one Bergman is designed for) does not reach this
     # code at all, and one using instance roles or IRSA does not either.
     { id = "RUSTSEC-2023-0071", reason = "rsa Marvin sidechannel; no fixed version; reached only via reqsign service-account signing for GCS/Azure" },
+
+    # `chrono`, `chrono-tz` and `humantime` are marked unmaintained, with no
+    # patched version and no vulnerability — maintenance signals, like `paste`.
+    #
+    # None of them can be removed from here. `chrono` is in the public API of
+    # arrow, parquet, datafusion, iceberg and object_store; `chrono-tz` arrives
+    # through arrow-array and datafusion-functions; `humantime` through
+    # object_store. Moving Bergman's own uses to another time crate would clear
+    # none of the three. The fix belongs upstream, in that stack's choice of
+    # time crate.
+    #
+    # The `humantime` advisory gives as its reason that the crate wraps chrono.
+    # Version 2.4.0 has no dependencies at all (`cargo tree -p humantime`), so
+    # it inherits nothing from chrono; it is ignored on the same footing as the
+    # other two, not because of that claim.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; no fixed version, no vulnerability; in the public API of arrow, datafusion and iceberg" },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz unmaintained; no fixed version, no vulnerability; pulled in by arrow-array and datafusion-functions" },
+    { id = "RUSTSEC-2026-0542", reason = "humantime unmaintained; no fixed version, no vulnerability; pulled in by object_store" },
 ]
 
 [licenses]

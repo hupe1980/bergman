@@ -5,6 +5,14 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 Bergman is pre-1.0: **breaking changes land in minor versions**, each with a migration note.
 
+## [Unreleased]
+
+### Security
+
+- `chrono`, `chrono-tz` and `humantime` are marked unmaintained (RUSTSEC-2026-0543, -0555, -0542),
+  with no patched version and no vulnerability. All three reach Bergman through arrow, datafusion,
+  iceberg and object_store, so they are ignored in `deny.toml` with that reason.
+
 ## [0.4.0] — 2026-11-08
 
 **Breaking:** MSRV **1.95**. `Bergman::refresh_credentials()` is removed — tokens renew on their
