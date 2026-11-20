@@ -15,19 +15,6 @@ yanked = "deny"
 # justification is not allowed to appear in this list: an ignore with no
 # argument is a suppressed alarm.
 ignore = [
-    # quick-xml 0.39, two denial-of-service advisories: quadratic attribute-name
-    # checking, and unbounded namespace-declaration allocation. Both need
-    # attacker-controlled XML.
-    #
-    # Cannot be updated from here: `opendal-core` pins `^0.39` and the fixes
-    # landed in 0.40. The only XML Bergman parses through it is an object
-    # store's own list-objects response, over TLS with verification on and no
-    # global switch to turn that off — so reaching this needs a compromised
-    # storage provider or a broken TLS chain, at which point a slow list is not
-    # the problem anyone has. Revisit when opendal bumps.
-    { id = "RUSTSEC-2026-0194", reason = "quick-xml DoS; only object-store list responses, behind verified TLS; pinned by opendal-core" },
-    { id = "RUSTSEC-2026-0195", reason = "quick-xml DoS; same exposure and same pin" },
-
     # `paste` is archived and unmaintained. It is a proc-macro used at build
     # time by `parquet`, has no runtime presence and no vulnerability — the
     # advisory is a maintenance signal, and the fix belongs upstream in arrow-rs.
